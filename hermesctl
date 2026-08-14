@@ -81,6 +81,16 @@ init_env() {
       set_env "$key" "$(randhex "${sizes[$key]}")"
     fi
   done
+
+  # Keep imported kubeconfigs mode 0600. For local Docker/Compose, the broker
+  # must use the host operator's numeric UID/GID to read the bind-mounted files.
+  if [[ -z "${HERMES_KUBERNETES_BROKER_UID:-}" ]]; then
+    set_env HERMES_KUBERNETES_BROKER_UID "$(id -u)"
+  fi
+  if [[ -z "${HERMES_KUBERNETES_BROKER_GID:-}" ]]; then
+    set_env HERMES_KUBERNETES_BROKER_GID "$(id -g)"
+  fi
+
   info "generated missing local secrets"
   echo "Review $ENV_FILE before exposing services."
 }
@@ -357,6 +367,16 @@ cmd_doctor() {
   done
   if command -v docker >/dev/null 2>&1 && [[ -f "$ENV_FILE" ]]; then
     if "${COMPOSE[@]}" config >/dev/null; then echo "[ok] docker compose config"; else echo "[fail] docker compose config"; fi
+    load_env
+    local host_uid host_gid broker_uid broker_gid
+    host_uid="$(id -u)"; host_gid="$(id -g)"
+    broker_uid="${HERMES_KUBERNETES_BROKER_UID:-}"
+    broker_gid="${HERMES_KUBERNETES_BROKER_GID:-}"
+    if [[ "$broker_uid" == "$host_uid" && "$broker_gid" == "$host_gid" ]]; then
+      echo "[ok] Kubernetes Broker UID/GID matches local kubeconfig owner (${host_uid}:${host_gid})"
+    else
+      echo "[warn] Kubernetes Broker UID/GID=${broker_uid:-unset}:${broker_gid:-unset}; local operator=${host_uid}:${host_gid}; run ./hermesctl init"
+    fi
   fi
 }
 

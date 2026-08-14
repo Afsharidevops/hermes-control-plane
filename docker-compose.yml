@@ -161,6 +161,9 @@ services:
     build:
       context: ./kubernetes-broker
     restart: unless-stopped
+    # Docker bind mounts preserve host ownership. Run the broker as the
+    # local operator UID/GID so mode-0600 kubeconfigs remain private/readable.
+    user: "${HERMES_KUBERNETES_BROKER_UID:-10023}:${HERMES_KUBERNETES_BROKER_GID:-10023}"
     ports:
       - "${KUBERNETES_BROKER_BIND_IP:-127.0.0.1}:${KUBERNETES_BROKER_PORT:-8830}:8830"
     environment:
