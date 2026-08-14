@@ -1,108 +1,143 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import os
-import sqlite3
 import time
 import uuid
-from contextlib import closing
+from contextlib import asynccontextmanager, closing
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
+from urllib.parse import urlparse
 
-from fastapi import FastAPI, Header, HTTPException
-from pydantic import BaseModel, Field
+import httpx
+from fastapi import FastAPI, Header, HTTPException, Query, Request
+from fastapi.responses import FileResponse
 
-VERSION = "0.5.10-alpha.1"
-DB_PATH = Path(os.getenv("HERMES_CONTROL_DB", "/data/control-plane.sqlite3"))
-ADMIN_TOKEN = os.getenv("HERMES_CONTROL_ADMIN_TOKEN", "")
+from . import db
+from .canonical import canonical_json, sha256_hex
+from .models import (
+    ApprovalDecision,
+    ChangeSetCreate,
+    CredentialRefCreate,
+    CredentialRefUpdate,
+    EnvironmentCreate,
+    EnvironmentUpdate,
+    IntegrationCreate,
+    IntegrationUpdate,
+    PreviewCreate,
+    RejectDecision,
+    TargetCreate,
+    TargetUpdate,
+)
+from .risk import approval_required, classify
+
+VERSION = "0.5.10-alpha.2"
+STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    db.init_db()
+    yield
+
 
 app = FastAPI(
     title="Hermes Control Plane API",
     version=VERSION,
-    description="v0.5.10 alpha management API foundation",
+    description="Management + safety core for Hermes Control Plane v0.5.10-alpha.2",
+    lifespan=lifespan,
 )
 
 
-def _db() -> sqlite3.Connection:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    return response
 
 
-def _init_db() -> None:
-    with closing(_db()) as conn:
-        conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS integrations (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL UNIQUE,
-                kind TEXT NOT NULL,
-                environment TEXT NOT NULL,
-                endpoint TEXT,
-                credential_ref TEXT,
-                connection_mode TEXT NOT NULL,
-                labels_json TEXT NOT NULL,
-                status TEXT NOT NULL,
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS changesets (
-                id TEXT PRIMARY KEY,
-                operation TEXT NOT NULL,
-                target_id TEXT NOT NULL,
-                requested_by TEXT NOT NULL,
-                source_channel TEXT NOT NULL,
-                risk TEXT NOT NULL,
-                parameters_json TEXT NOT NULL,
-                content_hash TEXT NOT NULL,
-                state TEXT NOT NULL,
-                created_at INTEGER NOT NULL
-            );
-            """
-        )
-        conn.commit()
-
-
-@app.on_event("startup")
-def startup() -> None:
-    _init_db()
+def _admin_token() -> str:
+    return os.getenv("HERMES_CONTROL_ADMIN_TOKEN", "")
 
 
 def _require_admin(authorization: str | None) -> None:
-    if not ADMIN_TOKEN:
+    token = _admin_token()
+    if not token:
         raise HTTPException(status_code=503, detail="HERMES_CONTROL_ADMIN_TOKEN is not configured")
-    if authorization != f"Bearer {ADMIN_TOKEN}":
+    if authorization != f"Bearer {token}":
         raise HTTPException(status_code=401, detail="invalid admin token")
 
 
-class IntegrationCreate(BaseModel):
-    name: str = Field(min_length=1, max_length=120)
-    kind: Literal["kubernetes", "docker", "swarm", "ssh", "github", "gitlab", "registry", "helm"]
-    environment: str = Field(default="default", min_length=1, max_length=80)
-    endpoint: str | None = None
-    credential_ref: str | None = None
-    connection_mode: Literal["direct", "agent"] = "direct"
-    labels: dict[str, str] = Field(default_factory=dict)
+def _row_json(row: Any, json_fields: dict[str, str]) -> dict[str, Any]:
+    item = dict(row)
+    for source, dest in json_fields.items():
+        raw = item.pop(source, None)
+        item[dest] = json.loads(raw or "{}")
+    return item
 
 
-class IntegrationUpdate(BaseModel):
-    environment: str | None = Field(default=None, min_length=1, max_length=80)
-    endpoint: str | None = None
-    credential_ref: str | None = None
-    connection_mode: Literal["direct", "agent"] | None = None
-    labels: dict[str, str] | None = None
-    status: Literal["configured", "disabled"] | None = None
+def _get_environment(conn, environment_id: str):
+    row = conn.execute("SELECT * FROM environments WHERE id=?", (environment_id,)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="environment not found")
+    return row
 
 
-class ChangeSetCreate(BaseModel):
-    operation: str = Field(min_length=1, max_length=160)
-    target_id: str = Field(min_length=1, max_length=160)
-    requested_by: str = Field(min_length=1, max_length=160)
-    source_channel: Literal["ui", "telegram", "api", "cli"] = "api"
-    risk: Literal["READ", "LOW", "MEDIUM", "HIGH", "CRITICAL"] = "MEDIUM"
-    parameters: dict[str, Any] = Field(default_factory=dict)
+def _get_credential_ref(conn, credential_ref: str | None):
+    if not credential_ref:
+        return None
+    row = conn.execute("SELECT * FROM credential_refs WHERE id=?", (credential_ref,)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="credential reference not found")
+    if row["status"] == "revoked":
+        raise HTTPException(status_code=409, detail="credential reference is revoked")
+    return row
+
+
+def _integration_dict(row: Any) -> dict[str, Any]:
+    item = _row_json(row, {"labels_json": "labels", "allowed_scope_json": "allowed_scope"})
+    item.pop("environment", None)  # legacy alpha.1 compatibility column
+    return item
+
+
+def _target_dict(row: Any) -> dict[str, Any]:
+    return _row_json(row, {"scope_json": "scope", "labels_json": "labels"})
+
+
+def _changeset_dict(row: Any) -> dict[str, Any]:
+    item = dict(row)
+    item["parameters"] = json.loads(item.pop("parameters_json") or "{}")
+    item["plan"] = json.loads(item.pop("plan_json") or "{}")
+    item["preview"] = json.loads(item.pop("preview_json") or "null")
+    item["approval_required"] = bool(item["approval_required"])
+    item["executable"] = False
+    item["execution_note"] = "alpha.2 intentionally has no privileged execute endpoint"
+    return item
+
+
+def _changeset(conn, changeset_id: str):
+    row = conn.execute("SELECT * FROM changesets WHERE id=?", (changeset_id,)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="changeset not found")
+    if row["expires_at"] and int(row["expires_at"]) < int(time.time()) and row["state"] not in {"REJECTED", "CANCELLED", "EXPIRED"}:
+        conn.execute("UPDATE changesets SET state='EXPIRED', updated_at=? WHERE id=?", (int(time.time()), changeset_id))
+        db.audit(conn, "changeset.expired", "system", "changeset", changeset_id, {"plan_hash": row["plan_hash"]})
+        conn.commit()
+        row = conn.execute("SELECT * FROM changesets WHERE id=?", (changeset_id,)).fetchone()
+    return row
+
+
+@app.get("/")
+def root() -> FileResponse:
+    return FileResponse(STATIC_DIR / "index.html")
+
+
+@app.get("/ui")
+def ui() -> FileResponse:
+    return FileResponse(STATIC_DIR / "index.html")
 
 
 @app.get("/health")
@@ -112,26 +147,150 @@ def health() -> dict[str, Any]:
 
 @app.get("/v1/system")
 def system() -> dict[str, Any]:
+    with closing(db.connect()) as conn:
+        counts = {
+            "environments": conn.execute("SELECT COUNT(*) FROM environments").fetchone()[0],
+            "integrations": conn.execute("SELECT COUNT(*) FROM integrations").fetchone()[0],
+            "targets": conn.execute("SELECT COUNT(*) FROM targets").fetchone()[0],
+            "credential_refs": conn.execute("SELECT COUNT(*) FROM credential_refs").fetchone()[0],
+            "changesets": conn.execute("SELECT COUNT(*) FROM changesets").fetchone()[0],
+        }
     return {
         "name": "Hermes Control Plane",
         "version": VERSION,
         "stage": "alpha",
         "runtime": os.getenv("HERMES_RUNTIME", "docker"),
-        "warning": "DevOps mutation authorization is not production-complete in alpha.1",
+        "capabilities": ["integration-registry", "target-registry", "credential-references", "changeset-planning", "risk-engine", "approval-binding", "audit"],
+        "execution_enabled": False,
+        "counts": counts,
     }
+
+
+@app.get("/v1/environments")
+def list_environments() -> list[dict[str, Any]]:
+    with closing(db.connect()) as conn:
+        rows = conn.execute("SELECT * FROM environments ORDER BY name").fetchall()
+    return [_row_json(row, {"labels_json": "labels"}) for row in rows]
+
+
+@app.post("/v1/environments", status_code=201)
+def create_environment(payload: EnvironmentCreate, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_admin(authorization)
+    slug = db.slugify(payload.slug or payload.name)
+    env_id = f"env_{uuid.uuid4().hex[:16]}"
+    now = int(time.time())
+    with closing(db.connect()) as conn:
+        try:
+            conn.execute(
+                "INSERT INTO environments (id,name,slug,risk_level,labels_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?)",
+                (env_id, payload.name, slug, payload.risk_level, json.dumps(payload.labels, sort_keys=True), now, now),
+            )
+            db.audit(conn, "environment.created", "admin", "environment", env_id, {"name": payload.name, "risk_level": payload.risk_level})
+            conn.commit()
+        except Exception as exc:
+            if "UNIQUE" in str(exc):
+                raise HTTPException(status_code=409, detail="environment name or slug already exists") from exc
+            raise
+    return {"id": env_id, "name": payload.name, "slug": slug, "risk_level": payload.risk_level, "labels": payload.labels, "created_at": now, "updated_at": now}
+
+
+@app.patch("/v1/environments/{environment_id}")
+def update_environment(environment_id: str, payload: EnvironmentUpdate, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_admin(authorization)
+    updates = payload.model_dump(exclude_unset=True)
+    if not updates:
+        raise HTTPException(status_code=400, detail="no fields supplied")
+    with closing(db.connect()) as conn:
+        _get_environment(conn, environment_id)
+        if "labels" in updates:
+            updates["labels_json"] = json.dumps(updates.pop("labels"), sort_keys=True)
+        updates["updated_at"] = int(time.time())
+        fields = list(updates)
+        conn.execute(f"UPDATE environments SET {', '.join(f'{f}=?' for f in fields)} WHERE id=?", (*[updates[f] for f in fields], environment_id))
+        db.audit(conn, "environment.updated", "admin", "environment", environment_id, {"fields": fields})
+        conn.commit()
+        row = conn.execute("SELECT * FROM environments WHERE id=?", (environment_id,)).fetchone()
+    return _row_json(row, {"labels_json": "labels"})
+
+
+@app.delete("/v1/environments/{environment_id}", status_code=204)
+def delete_environment(environment_id: str, authorization: str | None = Header(default=None)) -> None:
+    _require_admin(authorization)
+    with closing(db.connect()) as conn:
+        if conn.execute("SELECT 1 FROM integrations WHERE environment_id=? LIMIT 1", (environment_id,)).fetchone() or conn.execute("SELECT 1 FROM targets WHERE environment_id=? LIMIT 1", (environment_id,)).fetchone():
+            raise HTTPException(status_code=409, detail="environment is in use")
+        cur = conn.execute("DELETE FROM environments WHERE id=?", (environment_id,))
+        if not cur.rowcount:
+            raise HTTPException(status_code=404, detail="environment not found")
+        db.audit(conn, "environment.deleted", "admin", "environment", environment_id)
+        conn.commit()
+
+
+@app.get("/v1/credential-refs")
+def list_credential_refs() -> list[dict[str, Any]]:
+    with closing(db.connect()) as conn:
+        rows = conn.execute("SELECT * FROM credential_refs ORDER BY name").fetchall()
+    return [_row_json(row, {"metadata_json": "metadata"}) for row in rows]
+
+
+@app.post("/v1/credential-refs", status_code=201)
+def create_credential_ref(payload: CredentialRefCreate, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_admin(authorization)
+    cred_id = f"cred_{uuid.uuid4().hex[:16]}"
+    now = int(time.time())
+    with closing(db.connect()) as conn:
+        try:
+            conn.execute(
+                "INSERT INTO credential_refs (id,name,kind,provider,status,metadata_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)",
+                (cred_id, payload.name, payload.kind, payload.provider, "configured", json.dumps(payload.metadata, sort_keys=True), now, now),
+            )
+            db.audit(conn, "credential_ref.created", "admin", "credential_ref", cred_id, {"kind": payload.kind, "provider": payload.provider})
+            conn.commit()
+        except Exception as exc:
+            if "UNIQUE" in str(exc):
+                raise HTTPException(status_code=409, detail="credential reference name already exists") from exc
+            raise
+    return {"id": cred_id, **payload.model_dump(), "status": "configured", "created_at": now, "updated_at": now, "secret_material_stored": False}
+
+
+@app.patch("/v1/credential-refs/{credential_id}")
+def update_credential_ref(credential_id: str, payload: CredentialRefUpdate, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_admin(authorization)
+    updates = payload.model_dump(exclude_unset=True)
+    if not updates:
+        raise HTTPException(status_code=400, detail="no fields supplied")
+    with closing(db.connect()) as conn:
+        if not conn.execute("SELECT 1 FROM credential_refs WHERE id=?", (credential_id,)).fetchone():
+            raise HTTPException(status_code=404, detail="credential reference not found")
+        if "metadata" in updates:
+            updates["metadata_json"] = json.dumps(updates.pop("metadata"), sort_keys=True)
+        updates["updated_at"] = int(time.time())
+        fields = list(updates)
+        conn.execute(f"UPDATE credential_refs SET {', '.join(f'{f}=?' for f in fields)} WHERE id=?", (*[updates[f] for f in fields], credential_id))
+        db.audit(conn, "credential_ref.updated", "admin", "credential_ref", credential_id, {"fields": fields})
+        conn.commit()
+        row = conn.execute("SELECT * FROM credential_refs WHERE id=?", (credential_id,)).fetchone()
+    return _row_json(row, {"metadata_json": "metadata"})
+
+
+@app.delete("/v1/credential-refs/{credential_id}", status_code=204)
+def delete_credential_ref(credential_id: str, authorization: str | None = Header(default=None)) -> None:
+    _require_admin(authorization)
+    with closing(db.connect()) as conn:
+        if conn.execute("SELECT 1 FROM integrations WHERE credential_ref=? LIMIT 1", (credential_id,)).fetchone() or conn.execute("SELECT 1 FROM targets WHERE credential_ref=? LIMIT 1", (credential_id,)).fetchone():
+            raise HTTPException(status_code=409, detail="credential reference is in use")
+        cur = conn.execute("DELETE FROM credential_refs WHERE id=?", (credential_id,))
+        if not cur.rowcount:
+            raise HTTPException(status_code=404, detail="credential reference not found")
+        db.audit(conn, "credential_ref.deleted", "admin", "credential_ref", credential_id)
+        conn.commit()
 
 
 @app.get("/v1/integrations")
 def list_integrations() -> list[dict[str, Any]]:
-    with closing(_db()) as conn:
+    with closing(db.connect()) as conn:
         rows = conn.execute("SELECT * FROM integrations ORDER BY name").fetchall()
-    result = []
-    for row in rows:
-        item = dict(row)
-        item["labels"] = json.loads(item.pop("labels_json"))
-        # Credential IDs are references only. Raw secrets are never stored by this API.
-        result.append(item)
-    return result
+    return [_integration_dict(row) for row in rows]
 
 
 @app.post("/v1/integrations", status_code=201)
@@ -139,118 +298,337 @@ def create_integration(payload: IntegrationCreate, authorization: str | None = H
     _require_admin(authorization)
     now = int(time.time())
     integration_id = f"int_{uuid.uuid4().hex[:16]}"
-    with closing(_db()) as conn:
+    with closing(db.connect()) as conn:
+        env = _get_environment(conn, payload.environment_id)
+        _get_credential_ref(conn, payload.credential_ref)
         try:
             conn.execute(
                 """INSERT INTO integrations
-                (id,name,kind,environment,endpoint,credential_ref,connection_mode,labels_json,status,created_at,updated_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-                (
-                    integration_id,
-                    payload.name,
-                    payload.kind,
-                    payload.environment,
-                    payload.endpoint,
-                    payload.credential_ref,
-                    payload.connection_mode,
-                    json.dumps(payload.labels, sort_keys=True),
-                    "configured",
-                    now,
-                    now,
-                ),
+                (id,name,kind,environment,endpoint,credential_ref,connection_mode,labels_json,status,created_at,updated_at,environment_id,allowed_scope_json,health_status)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (integration_id, payload.name, payload.kind, env["name"], payload.endpoint, payload.credential_ref, payload.connection_mode,
+                 json.dumps(payload.labels, sort_keys=True), "configured", now, now, payload.environment_id,
+                 json.dumps(payload.allowed_scope, sort_keys=True), "UNKNOWN"),
             )
+            db.audit(conn, "integration.created", "admin", "integration", integration_id, {"kind": payload.kind, "environment_id": payload.environment_id})
             conn.commit()
-        except sqlite3.IntegrityError as exc:
-            raise HTTPException(status_code=409, detail="integration name already exists") from exc
-    return {"id": integration_id, **payload.model_dump(), "status": "configured"}
+        except Exception as exc:
+            if "UNIQUE" in str(exc):
+                raise HTTPException(status_code=409, detail="integration name already exists") from exc
+            raise
+        row = conn.execute("SELECT * FROM integrations WHERE id=?", (integration_id,)).fetchone()
+    return _integration_dict(row)
 
 
 @app.patch("/v1/integrations/{integration_id}")
-def update_integration(
-    integration_id: str,
-    payload: IntegrationUpdate,
-    authorization: str | None = Header(default=None),
-) -> dict[str, Any]:
+def update_integration(integration_id: str, payload: IntegrationUpdate, authorization: str | None = Header(default=None)) -> dict[str, Any]:
     _require_admin(authorization)
     updates = payload.model_dump(exclude_unset=True)
     if not updates:
         raise HTTPException(status_code=400, detail="no fields supplied")
-    with closing(_db()) as conn:
-        row = conn.execute("SELECT * FROM integrations WHERE id = ?", (integration_id,)).fetchone()
-        if row is None:
+    with closing(db.connect()) as conn:
+        if not conn.execute("SELECT 1 FROM integrations WHERE id=?", (integration_id,)).fetchone():
             raise HTTPException(status_code=404, detail="integration not found")
-        current = dict(row)
+        if "environment_id" in updates:
+            env = _get_environment(conn, updates["environment_id"])
+            updates["environment"] = env["name"]
+        if "credential_ref" in updates:
+            _get_credential_ref(conn, updates["credential_ref"])
         if "labels" in updates:
             updates["labels_json"] = json.dumps(updates.pop("labels"), sort_keys=True)
+        if "allowed_scope" in updates:
+            updates["allowed_scope_json"] = json.dumps(updates.pop("allowed_scope"), sort_keys=True)
         updates["updated_at"] = int(time.time())
-        allowed = {"environment", "endpoint", "credential_ref", "connection_mode", "labels_json", "status", "updated_at"}
-        fields = [k for k in updates if k in allowed]
-        values = [updates[k] for k in fields]
-        conn.execute(
-            f"UPDATE integrations SET {', '.join(f'{k} = ?' for k in fields)} WHERE id = ?",
-            (*values, integration_id),
-        )
+        fields = list(updates)
+        conn.execute(f"UPDATE integrations SET {', '.join(f'{f}=?' for f in fields)} WHERE id=?", (*[updates[f] for f in fields], integration_id))
+        db.audit(conn, "integration.updated", "admin", "integration", integration_id, {"fields": fields})
         conn.commit()
-        updated = conn.execute("SELECT * FROM integrations WHERE id = ?", (integration_id,)).fetchone()
-    item = dict(updated)
-    item["labels"] = json.loads(item.pop("labels_json"))
-    return item
+        row = conn.execute("SELECT * FROM integrations WHERE id=?", (integration_id,)).fetchone()
+    return _integration_dict(row)
 
 
 @app.delete("/v1/integrations/{integration_id}", status_code=204)
 def delete_integration(integration_id: str, authorization: str | None = Header(default=None)) -> None:
     _require_admin(authorization)
-    with closing(_db()) as conn:
-        cur = conn.execute("DELETE FROM integrations WHERE id = ?", (integration_id,))
+    with closing(db.connect()) as conn:
+        if conn.execute("SELECT 1 FROM targets WHERE integration_id=? LIMIT 1", (integration_id,)).fetchone():
+            raise HTTPException(status_code=409, detail="integration has targets")
+        cur = conn.execute("DELETE FROM integrations WHERE id=?", (integration_id,))
+        if not cur.rowcount:
+            raise HTTPException(status_code=404, detail="integration not found")
+        db.audit(conn, "integration.deleted", "admin", "integration", integration_id)
         conn.commit()
-    if cur.rowcount == 0:
-        raise HTTPException(status_code=404, detail="integration not found")
+
+
+@app.post("/v1/integrations/{integration_id}/health")
+async def test_integration_health(integration_id: str, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_admin(authorization)
+    with closing(db.connect()) as conn:
+        row = conn.execute("SELECT * FROM integrations WHERE id=?", (integration_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="integration not found")
+        endpoint = row["endpoint"]
+    if not endpoint:
+        raise HTTPException(status_code=400, detail="integration has no endpoint")
+    parsed = urlparse(endpoint)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise HTTPException(status_code=400, detail="health testing currently supports only http/https endpoints")
+
+    status = "UNHEALTHY"
+    detail = "connection failed"
+    code = None
+    try:
+        timeout = float(os.getenv("HERMES_HEALTH_TIMEOUT_SECONDS", "5"))
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
+            response = await client.get(endpoint, headers={"User-Agent": f"hermes-control-plane/{VERSION}"})
+            code = response.status_code
+            status = "HEALTHY" if 200 <= code < 500 else "UNHEALTHY"
+            detail = f"HTTP {code}"
+    except Exception as exc:
+        detail = f"{type(exc).__name__}: {str(exc)[:240]}"
+
+    now = int(time.time())
+    with closing(db.connect()) as conn:
+        conn.execute("UPDATE integrations SET health_status=?,last_health_at=?,last_health_detail=?,updated_at=? WHERE id=?", (status, now, detail, now, integration_id))
+        db.audit(conn, "integration.health", "admin", "integration", integration_id, {"status": status, "detail": detail, "http_status": code})
+        conn.commit()
+    return {"integration_id": integration_id, "status": status, "detail": detail, "http_status": code, "tested_at": now, "credential_used": False}
+
+
+@app.get("/v1/targets")
+def list_targets() -> list[dict[str, Any]]:
+    with closing(db.connect()) as conn:
+        rows = conn.execute("SELECT * FROM targets ORDER BY name").fetchall()
+    return [_target_dict(row) for row in rows]
+
+
+@app.post("/v1/targets", status_code=201)
+def create_target(payload: TargetCreate, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_admin(authorization)
+    target_id = f"tgt_{uuid.uuid4().hex[:16]}"
+    now = int(time.time())
+    with closing(db.connect()) as conn:
+        _get_environment(conn, payload.environment_id)
+        _get_credential_ref(conn, payload.credential_ref)
+        if payload.integration_id and not conn.execute("SELECT 1 FROM integrations WHERE id=?", (payload.integration_id,)).fetchone():
+            raise HTTPException(status_code=404, detail="integration not found")
+        try:
+            conn.execute(
+                """INSERT INTO targets
+                (id,name,kind,environment_id,integration_id,credential_ref,connection_mode,address,scope_json,labels_json,status,created_at,updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (target_id, payload.name, payload.kind, payload.environment_id, payload.integration_id, payload.credential_ref,
+                 payload.connection_mode, payload.address, json.dumps(payload.scope, sort_keys=True), json.dumps(payload.labels, sort_keys=True),
+                 "configured", now, now),
+            )
+            db.audit(conn, "target.created", "admin", "target", target_id, {"kind": payload.kind, "environment_id": payload.environment_id})
+            conn.commit()
+        except Exception as exc:
+            if "UNIQUE" in str(exc):
+                raise HTTPException(status_code=409, detail="target name already exists") from exc
+            raise
+        row = conn.execute("SELECT * FROM targets WHERE id=?", (target_id,)).fetchone()
+    return _target_dict(row)
+
+
+@app.patch("/v1/targets/{target_id}")
+def update_target(target_id: str, payload: TargetUpdate, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_admin(authorization)
+    updates = payload.model_dump(exclude_unset=True)
+    if not updates:
+        raise HTTPException(status_code=400, detail="no fields supplied")
+    with closing(db.connect()) as conn:
+        if not conn.execute("SELECT 1 FROM targets WHERE id=?", (target_id,)).fetchone():
+            raise HTTPException(status_code=404, detail="target not found")
+        if "environment_id" in updates:
+            _get_environment(conn, updates["environment_id"])
+        if "credential_ref" in updates:
+            _get_credential_ref(conn, updates["credential_ref"])
+        if "integration_id" in updates and updates["integration_id"] and not conn.execute("SELECT 1 FROM integrations WHERE id=?", (updates["integration_id"],)).fetchone():
+            raise HTTPException(status_code=404, detail="integration not found")
+        if "scope" in updates:
+            updates["scope_json"] = json.dumps(updates.pop("scope"), sort_keys=True)
+        if "labels" in updates:
+            updates["labels_json"] = json.dumps(updates.pop("labels"), sort_keys=True)
+        updates["updated_at"] = int(time.time())
+        fields = list(updates)
+        conn.execute(f"UPDATE targets SET {', '.join(f'{f}=?' for f in fields)} WHERE id=?", (*[updates[f] for f in fields], target_id))
+        db.audit(conn, "target.updated", "admin", "target", target_id, {"fields": fields})
+        conn.commit()
+        row = conn.execute("SELECT * FROM targets WHERE id=?", (target_id,)).fetchone()
+    return _target_dict(row)
+
+
+@app.delete("/v1/targets/{target_id}", status_code=204)
+def delete_target(target_id: str, authorization: str | None = Header(default=None)) -> None:
+    _require_admin(authorization)
+    with closing(db.connect()) as conn:
+        if conn.execute("SELECT 1 FROM changesets WHERE target_id=? AND state NOT IN ('REJECTED','CANCELLED','EXPIRED') LIMIT 1", (target_id,)).fetchone():
+            raise HTTPException(status_code=409, detail="target has active ChangeSets")
+        cur = conn.execute("DELETE FROM targets WHERE id=?", (target_id,))
+        if not cur.rowcount:
+            raise HTTPException(status_code=404, detail="target not found")
+        db.audit(conn, "target.deleted", "admin", "target", target_id)
+        conn.commit()
 
 
 @app.get("/v1/changesets")
-def list_changesets() -> list[dict[str, Any]]:
-    with closing(_db()) as conn:
-        rows = conn.execute("SELECT * FROM changesets ORDER BY created_at DESC LIMIT 200").fetchall()
-    out = []
-    for row in rows:
-        item = dict(row)
-        item["parameters"] = json.loads(item.pop("parameters_json"))
-        out.append(item)
-    return out
+def list_changesets(limit: int = Query(default=200, ge=1, le=1000)) -> list[dict[str, Any]]:
+    with closing(db.connect()) as conn:
+        rows = conn.execute("SELECT * FROM changesets ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
+    return [_changeset_dict(row) for row in rows]
+
+
+@app.get("/v1/changesets/{changeset_id}")
+def get_changeset(changeset_id: str) -> dict[str, Any]:
+    with closing(db.connect()) as conn:
+        row = _changeset(conn, changeset_id)
+    return _changeset_dict(row)
 
 
 @app.post("/v1/changesets", status_code=201)
 def create_changeset(payload: ChangeSetCreate, authorization: str | None = Header(default=None)) -> dict[str, Any]:
     _require_admin(authorization)
-    canonical = json.dumps(payload.model_dump(), sort_keys=True, separators=(",", ":"))
-    content_hash = hashlib.sha256(canonical.encode()).hexdigest()
-    changeset_id = f"chg_{uuid.uuid4().hex[:16]}"
     created_at = int(time.time())
-    with closing(_db()) as conn:
+    expires_at = created_at + payload.ttl_seconds
+    changeset_id = f"chg_{uuid.uuid4().hex[:16]}"
+    risk = classify(payload.operation)
+    plan = {
+        "schema_version": 1,
+        "operation": payload.operation,
+        "adapter": payload.adapter,
+        "target_id": payload.target_id,
+        "source_revision": payload.source_revision,
+        "parameters": payload.parameters,
+        "policy_generation": payload.policy_generation,
+    }
+    plan_json = canonical_json(plan)
+    plan_hash = sha256_hex(plan)
+    with closing(db.connect()) as conn:
+        if not conn.execute("SELECT 1 FROM targets WHERE id=?", (payload.target_id,)).fetchone():
+            raise HTTPException(status_code=404, detail="target not found")
         conn.execute(
             """INSERT INTO changesets
-            (id,operation,target_id,requested_by,source_channel,risk,parameters_json,content_hash,state,created_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?)""",
-            (
-                changeset_id,
-                payload.operation,
-                payload.target_id,
-                payload.requested_by,
-                payload.source_channel,
-                payload.risk,
-                json.dumps(payload.parameters, sort_keys=True),
-                content_hash,
-                "PLANNED",
-                created_at,
-            ),
+            (id,operation,target_id,requested_by,source_channel,risk,parameters_json,content_hash,state,created_at,adapter,source_revision,plan_json,plan_hash,preview_json,approval_required,policy_generation,expires_at,updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (changeset_id, payload.operation, payload.target_id, payload.requested_by, payload.source_channel, risk,
+             json.dumps(payload.parameters, sort_keys=True), plan_hash, "PLANNED", created_at, payload.adapter, payload.source_revision,
+             plan_json, plan_hash, None, int(approval_required(risk)), payload.policy_generation, expires_at, created_at),
         )
+        db.audit(conn, "changeset.created", payload.requested_by, "changeset", changeset_id, {"plan_hash": plan_hash, "risk": risk})
         conn.commit()
-    return {
-        "id": changeset_id,
-        **payload.model_dump(),
-        "content_hash": content_hash,
-        "state": "PLANNED",
-        "created_at": created_at,
-        "executable": False,
-        "note": "alpha.1 creates immutable plan records only; execution binding is planned for alpha.3",
-    }
+        row = conn.execute("SELECT * FROM changesets WHERE id=?", (changeset_id,)).fetchone()
+    return _changeset_dict(row)
+
+
+@app.post("/v1/changesets/{changeset_id}/preview")
+def preview_changeset(changeset_id: str, payload: PreviewCreate, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_admin(authorization)
+    now = int(time.time())
+    with closing(db.connect()) as conn:
+        row = _changeset(conn, changeset_id)
+        if row["state"] not in {"PLANNED", "PREVIEWED"}:
+            raise HTTPException(status_code=409, detail=f"cannot preview ChangeSet in state {row['state']}")
+        preview = {"summary": payload.summary, "details": payload.details, "generated_at": now, "source": "planner"}
+        conn.execute("UPDATE changesets SET preview_json=?,state='PREVIEWED',updated_at=? WHERE id=?", (json.dumps(preview, sort_keys=True), now, changeset_id))
+        db.audit(conn, "changeset.previewed", "planner", "changeset", changeset_id, {"plan_hash": row["plan_hash"]})
+        conn.commit()
+        updated = conn.execute("SELECT * FROM changesets WHERE id=?", (changeset_id,)).fetchone()
+    return _changeset_dict(updated)
+
+
+@app.post("/v1/changesets/{changeset_id}/request-approval")
+def request_approval(changeset_id: str, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_admin(authorization)
+    now = int(time.time())
+    with closing(db.connect()) as conn:
+        row = _changeset(conn, changeset_id)
+        if not row["approval_required"]:
+            raise HTTPException(status_code=409, detail="risk engine does not require approval for this ChangeSet")
+        if row["state"] != "PREVIEWED":
+            raise HTTPException(status_code=409, detail="ChangeSet must be PREVIEWED before approval is requested")
+        conn.execute("UPDATE changesets SET state='AWAITING_APPROVAL',updated_at=? WHERE id=?", (now, changeset_id))
+        db.audit(conn, "changeset.approval_requested", row["requested_by"], "changeset", changeset_id, {"plan_hash": row["plan_hash"], "risk": row["risk"]})
+        conn.commit()
+        updated = conn.execute("SELECT * FROM changesets WHERE id=?", (changeset_id,)).fetchone()
+    return _changeset_dict(updated)
+
+
+@app.post("/v1/changesets/{changeset_id}/approve", status_code=201)
+def approve_changeset(changeset_id: str, payload: ApprovalDecision, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_admin(authorization)
+    now = int(time.time())
+    with closing(db.connect()) as conn:
+        row = _changeset(conn, changeset_id)
+        if row["state"] != "AWAITING_APPROVAL":
+            raise HTTPException(status_code=409, detail="ChangeSet is not awaiting approval")
+        if payload.plan_hash != row["plan_hash"]:
+            raise HTTPException(status_code=409, detail="approval hash does not match current ChangeSet plan")
+        if row["risk"] in {"HIGH", "CRITICAL"} and payload.approver == row["requested_by"]:
+            raise HTTPException(status_code=403, detail="requester cannot self-approve HIGH/CRITICAL ChangeSets")
+        approval_id = f"apr_{uuid.uuid4().hex[:16]}"
+        expires_at = min(now + payload.ttl_seconds, int(row["expires_at"] or now + payload.ttl_seconds))
+        conn.execute(
+            "INSERT INTO approvals (id,changeset_id,plan_hash,approver,status,issued_at,expires_at,decided_at) VALUES (?,?,?,?,?,?,?,?)",
+            (approval_id, changeset_id, row["plan_hash"], payload.approver, "APPROVED", now, expires_at, now),
+        )
+        conn.execute("UPDATE changesets SET state='APPROVED',updated_at=? WHERE id=?", (now, changeset_id))
+        db.audit(conn, "changeset.approved", payload.approver, "changeset", changeset_id, {"approval_id": approval_id, "plan_hash": row["plan_hash"], "expires_at": expires_at})
+        conn.commit()
+    return {"id": approval_id, "changeset_id": changeset_id, "plan_hash": payload.plan_hash, "approver": payload.approver, "status": "APPROVED", "issued_at": now, "expires_at": expires_at, "execution_enabled": False}
+
+
+@app.post("/v1/changesets/{changeset_id}/reject")
+def reject_changeset(changeset_id: str, payload: RejectDecision, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_admin(authorization)
+    now = int(time.time())
+    with closing(db.connect()) as conn:
+        row = _changeset(conn, changeset_id)
+        if row["state"] in {"REJECTED", "CANCELLED", "EXPIRED"}:
+            raise HTTPException(status_code=409, detail=f"ChangeSet already terminal: {row['state']}")
+        conn.execute("UPDATE changesets SET state='REJECTED',updated_at=? WHERE id=?", (now, changeset_id))
+        conn.execute("UPDATE approvals SET status='REJECTED',decided_at=?,reason=? WHERE changeset_id=? AND status='APPROVED'", (now, payload.reason, changeset_id))
+        db.audit(conn, "changeset.rejected", payload.actor, "changeset", changeset_id, {"reason": payload.reason, "plan_hash": row["plan_hash"]})
+        conn.commit()
+        updated = conn.execute("SELECT * FROM changesets WHERE id=?", (changeset_id,)).fetchone()
+    return _changeset_dict(updated)
+
+
+@app.post("/v1/changesets/{changeset_id}/cancel")
+def cancel_changeset(changeset_id: str, payload: RejectDecision, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_admin(authorization)
+    now = int(time.time())
+    with closing(db.connect()) as conn:
+        row = _changeset(conn, changeset_id)
+        if row["state"] in {"REJECTED", "CANCELLED", "EXPIRED"}:
+            raise HTTPException(status_code=409, detail=f"ChangeSet already terminal: {row['state']}")
+        conn.execute("UPDATE changesets SET state='CANCELLED',updated_at=? WHERE id=?", (now, changeset_id))
+        conn.execute("UPDATE approvals SET status='CANCELLED',decided_at=?,reason=? WHERE changeset_id=? AND status='APPROVED'", (now, payload.reason, changeset_id))
+        db.audit(conn, "changeset.cancelled", payload.actor, "changeset", changeset_id, {"reason": payload.reason, "plan_hash": row["plan_hash"]})
+        conn.commit()
+        updated = conn.execute("SELECT * FROM changesets WHERE id=?", (changeset_id,)).fetchone()
+    return _changeset_dict(updated)
+
+
+@app.get("/v1/changesets/{changeset_id}/approvals")
+def list_approvals(changeset_id: str) -> list[dict[str, Any]]:
+    with closing(db.connect()) as conn:
+        if not conn.execute("SELECT 1 FROM changesets WHERE id=?", (changeset_id,)).fetchone():
+            raise HTTPException(status_code=404, detail="changeset not found")
+        rows = conn.execute("SELECT * FROM approvals WHERE changeset_id=? ORDER BY issued_at DESC", (changeset_id,)).fetchall()
+    return [dict(row) for row in rows]
+
+
+@app.get("/v1/audit")
+def list_audit(limit: int = Query(default=200, ge=1, le=2000), subject_id: str | None = None) -> list[dict[str, Any]]:
+    with closing(db.connect()) as conn:
+        if subject_id:
+            rows = conn.execute("SELECT * FROM audit_events WHERE subject_id=? ORDER BY id DESC LIMIT ?", (subject_id, limit)).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM audit_events ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+    out = []
+    for row in rows:
+        item = dict(row)
+        item["payload"] = json.loads(item.pop("payload_json") or "{}")
+        out.append(item)
+    return out

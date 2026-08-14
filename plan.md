@@ -2,7 +2,7 @@
 
 **Target:** `0.5.10`
 
-**Initial development release:** `0.5.10-alpha.1`
+**Current development release:** `0.5.10-alpha.2`
 
 **Project:** `hermes-control-plane`
 
@@ -500,7 +500,6 @@ Baseline classes:
 
 - `READ`
 - `LOW`
-- `MEDIUM`
 - `HIGH`
 - `CRITICAL`
 
@@ -509,7 +508,7 @@ Baseline behavior:
 | Operation | Default risk | Default decision |
 |---|---:|---|
 | list pods / logs / Git read | READ | allow |
-| staging restart | MEDIUM | confirm/policy |
+| staging restart | LOW | confirm/policy |
 | production scale | HIGH | approval |
 | Helm production upgrade | HIGH | approval |
 | resource delete | HIGH | approval |
@@ -574,7 +573,9 @@ The alpha repository includes the bootstrap/router subset and expands this comma
 
 ## 19. Release phases
 
-### 0.5.10-alpha.1 — repository foundation
+The roadmap is intentionally compressed so development can move faster while preserving the security order: the management and ChangeSet safety core must land before privileged adapters.
+
+### 0.5.10-alpha.1 — repository foundation ✅
 
 - new monorepo
 - migrate Smart Router
@@ -589,37 +590,35 @@ The alpha repository includes the bootstrap/router subset and expands this comma
 - GitHub CI foundation
 - architecture/security plan
 
-### 0.5.10-alpha.2 — integration registry
+### 0.5.10-alpha.2 — management + safety core
 
-- persistent integration metadata
-- environment/target model
-- CRUD API
-- Operations Center integration pages
-- credential references
-- health testing
-
-### 0.5.10-alpha.3 — ChangeSet engine
-
-- typed plans
+- persistent Environment, Integration and Target registries
+- CRUD API and starter Operations Center management UI
+- credential references (metadata only; no raw secret storage in the Control Plane API)
+- integration health-test foundation
+- typed ChangeSet plan envelope
 - canonical JSON serialization
 - SHA-256 ChangeSet hashes
 - risk engine
-- preview store
-- execution state machine
-- approval binding
-- audit events
+- preview store and safety state transitions
+- approval request/approve/reject/cancel flow
+- approval binding to exact plan hash
+- HIGH/CRITICAL self-approval prevention
+- expiry and append-oriented audit events
+- migration/backfill from the alpha.1 SQLite schema
+- privileged execution remains disabled
 
-### 0.5.10-alpha.4 — Kubernetes + Helm
+### 0.5.10-beta.1 — feature-complete DevOps adapters
 
-- direct kubeconfig connection
+Kubernetes + Helm:
+- direct kubeconfig connection through the credential boundary
 - agent Kubernetes connection
 - Kubernetes discovery
-- manifest dry-run/diff/apply
+- manifest server dry-run/diff/apply
 - Helm plan/install/upgrade/rollback
 - namespace/resource policy
 
-### 0.5.10-beta.1 — Git + application deployments
-
+Git + applications:
 - GitHub integration
 - GitLab integration
 - Application registry
@@ -627,25 +626,32 @@ The alpha repository includes the bootstrap/router subset and expands this comma
 - deployment verification
 - rollback metadata
 
-### 0.5.10-beta.2 — Docker/Compose/Swarm + SSH UI
-
-- Compose plans/execution
+Docker/Swarm + SSH:
+- Docker and Compose plans/execution
 - Swarm stack/service operations
 - SSH UI CRUD
 - target-level policy
 - agent capability enforcement
 
-### 0.5.10-rc.1 — hardening
+ChatOps:
+- Telegram planning/status
+- dedicated Telegram approval binding
+- ChangeSet-driven execution and verification
+
+### 0.5.10-rc.1 — production hardening
 
 - threat-model review
-- credential rotation
-- agent revocation
+- real credential service/secret backend and rotation
+- agent enrollment, identity, replay protection and revocation
+- policy generation invalidation
+- two-person critical approval support
 - backup/restore
 - audit retention/export
 - HA tests
 - Docker-to-Kubernetes migration tests
-- upgrade tests
-- security documentation
+- upgrade/rollback tests
+- failure-injection/network-loss tests
+- security/operator documentation
 
 ### 0.5.10 — stable
 

@@ -6,12 +6,20 @@ ROOT="$ROOT" python3 - <<'PY'
 from pathlib import Path
 import os
 root=Path(os.environ['ROOT'])
-for f in ['plan.md','README.md','docker-compose.yml','charts/hermes-control-plane/Chart.yaml']:
+for f in ['plan.md','README.md','HANDOVER.md','docker-compose.yml','charts/hermes-control-plane/Chart.yaml','docs/ALPHA2.md']:
     p=root/f
     if not p.exists() or not p.read_text().strip():
         raise SystemExit(f'missing/empty: {p}')
 print('foundation files: ok')
 PY
+if PYTHONPATH="$ROOT/control-plane/src" python3 - <<'PY' >/dev/null 2>&1
+import fastapi, httpx, pytest
+PY
+then
+  PYTHONPATH="$ROOT/control-plane/src" python3 -m pytest -q "$ROOT/control-plane/tests"
+else
+  echo "control-plane tests: skipped locally (install control-plane/requirements-dev.txt); CI runs them"
+fi
 if command -v docker >/dev/null 2>&1 && [[ -f "$ROOT/.env" ]]; then
   docker compose --project-directory "$ROOT" --env-file "$ROOT/.env" config >/dev/null
   echo "docker compose config: ok"

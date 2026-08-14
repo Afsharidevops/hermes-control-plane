@@ -18,14 +18,18 @@ for spec in \
   "hermes-control-plane-execution-broker:execution-broker" \
   "hermes-control-plane-node-agent:node-agent"; do
   name="${spec%%:*}"; dir="${spec#*:}"
+  tags=(-t "${NS}/${name}:${VERSION}")
+  # Keep prereleases away from :latest. Stable x.y.z versions may update latest.
+  if [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    tags+=(-t "${NS}/${name}:latest")
+  fi
   echo "==> building/pushing ${NS}/${name}:${VERSION} (${PLATFORMS})"
   docker buildx build \
     --platform "$PLATFORMS" \
     --pull \
     --provenance=true \
     --sbom=true \
-    -t "${NS}/${name}:${VERSION}" \
-    -t "${NS}/${name}:latest" \
+    "${tags[@]}" \
     --push \
     "$ROOT/$dir"
 done

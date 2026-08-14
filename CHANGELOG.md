@@ -1,17 +1,26 @@
 # Changelog
 
-- Isolated all Docker Hub image repositories under the `hermes-control-plane-*` prefix to prevent collisions with `hermes-linux-stack`.
+## 0.5.10-alpha.2
 
-## 0.5.10-alpha.1 — 2026-08-14
+- merged Integration Registry and ChangeSet milestones into one Management + Safety Core release
+- added persistent Environment, Integration, Target and credential-reference registries
+- added alpha.1 SQLite schema migration/backfill
+- added starter Operations Center management UI at `/ui`
+- added HTTP/HTTPS integration health-test foundation
+- added deterministic canonical ChangeSet plan serialization and SHA-256 hashes
+- added automatic READ/LOW/HIGH/CRITICAL risk classification
+- added ChangeSet preview, expiry and state management
+- added approval request/approve/reject/cancel flows bound to the exact plan hash
+- blocked HIGH/CRITICAL requester self-approval
+- added append-oriented audit events
+- added Control Plane API tests to CI
+- changed Docker publishing to GitHub Actions: `edge`/`sha-*` on main, semver tags on releases, `latest` only for stable versions
+- kept privileged DevOps execution disabled pending beta adapters
 
-- Created the Hermes Control Plane monorepo foundation.
-- Migrated Hermes Smart Router v0.5.9 source as the Operations Center/routing base.
-- Migrated Hermes Execution Broker v0.1.3 source as the isolated execution base.
-- Added runtime-selectable 9router/OmniRoute gateway with neutral Hermes model aliases.
-- Added streaming OpenAI-compatible proxy support in the router gateway.
-- Added Control Plane API foundation with integration metadata CRUD and immutable non-executable ChangeSet plan records.
-- Added Node Agent foundation with execution disabled by default.
-- Added unified Docker Compose deployment and `hermesctl` bootstrap/router commands.
-- Added Kubernetes Helm chart foundation with router selection, generated/preservable bootstrap Secrets, optional persistence and optional Ingress.
-- Added multi-platform Docker Hub build/push scripts and GitHub Actions workflows.
-- Added `plan.md` defining the v0.5.10 DevOps control-plane roadmap and security invariants.
+## 0.5.10-alpha.1
+
+- created Hermes Control Plane monorepo foundation
+- migrated Smart Router and Execution Broker foundations
+- added runtime-selectable 9router/OmniRoute gateway
+- added Docker Compose and initial Helm deployment
+- introduced isolated `hermes-control-plane-*` Docker image naming

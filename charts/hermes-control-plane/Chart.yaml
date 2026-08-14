@@ -1,6 +1,6 @@
 apiVersion: v2
 name: hermes-control-plane
-description: Hermes Control Plane v0.5.10 alpha foundation
+description: Hermes Control Plane management and safety core
 type: application
-version: 0.5.10-alpha.1
-appVersion: "0.5.10-alpha.1"
+version: 0.5.10-alpha.2
+appVersion: "0.5.10-alpha.2"
