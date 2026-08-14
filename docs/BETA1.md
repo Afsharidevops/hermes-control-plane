@@ -69,3 +69,8 @@ The beta slice does not yet implement Telegram approval, Git/GitLab, Docker/Comp
 ## Kubernetes deployment of the Control Plane
 
 The Helm chart deploys Kubernetes Broker with service-account token automount disabled by default. For direct kubeconfig mode, mount an existing Kubernetes Secret with credential files and create matching metadata references. In-cluster management should use a dedicated least-privilege ServiceAccount; broad RBAC is intentionally not created automatically.
+
+
+## Batch A — Kubernetes + Helm completion
+
+The beta branch now includes guarded Kubernetes apply/update, delete preview/execution, captured before-state, signed live-state preconditions, generated rollback ChangeSets, workload rollout verification, Helm release preconditions, install/upgrade verification, rollback, and rollback-to-uninstall for first installs. These are development capabilities on `dev/0.5.10-beta.1`; they do not create an additional public version.

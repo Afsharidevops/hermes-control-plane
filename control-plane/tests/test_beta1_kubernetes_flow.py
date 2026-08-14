@@ -149,3 +149,61 @@ def test_live_preview_validation_failure_is_terminal(client: TestClient, monkeyp
     stored = client.get(f"/v1/changesets/{chg['id']}").json()
     assert stored["state"] == "PREVIEW_FAILED"
     assert stored["preview"]["details"]["detail"] == "invalid Helm chart reference"
+
+
+
+def test_generate_kubernetes_rollback_plan_from_execution_before_state(client: TestClient, monkeypatch):
+    target = setup_target(client)
+    old_manifest = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: demo\n  namespace: default\ndata:\n  value: one\n"
+
+    async def fake_post(path, payload):
+        if path == "/v1/preview":
+            return {"summary": "preview", "kind": "kubernetes-manifest", "live_state_hash": "b" * 64}
+        if path == "/v1/execute":
+            return {
+                "operation": "kubernetes.manifest.apply",
+                "before_state": {
+                    "hash": "b" * 64,
+                    "resources": [{
+                        "resource": {"apiVersion": "v1", "kind": "ConfigMap", "name": "demo", "namespace": "default"},
+                        "exists": True,
+                        "manifest": old_manifest,
+                    }],
+                },
+                "result": {"returncode": 0, "output": "configmap/demo"},
+                "verification": {"converged": True},
+            }
+        raise AssertionError(path)
+
+    monkeypatch.setattr(cp.kubernetes_broker, "post", fake_post)
+    monkeypatch.setenv("HERMES_EXECUTION_ENABLED", "true")
+    chg = client.post("/v1/changesets", headers=AUTH, json={
+        "operation": "kubernetes.manifest.apply",
+        "adapter": "kubernetes",
+        "target_id": target["id"],
+        "requested_by": "ui:requester",
+        "parameters": {"namespace": "default", "manifest": "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: demo\n  namespace: default\ndata:\n  value: two\n"},
+    }).json()
+    assert client.post(f"/v1/changesets/{chg['id']}/preview-live", headers=AUTH).status_code == 200
+    assert client.post(f"/v1/changesets/{chg['id']}/request-approval", headers=AUTH).status_code == 200
+    assert client.post(f"/v1/changesets/{chg['id']}/approve", headers=AUTH, json={"approver": "ui:approver", "plan_hash": chg["plan_hash"]}).status_code == 201
+    executed = client.post(f"/v1/changesets/{chg['id']}/execute", headers=AUTH, json={"actor": "ui:executor"})
+    assert executed.status_code == 200
+
+    rollback = client.post(
+        f"/v1/changesets/{chg['id']}/rollback-plan",
+        headers=AUTH,
+        json={"requested_by": "ui:requester", "source_channel": "ui"},
+    )
+    assert rollback.status_code == 201, rollback.text
+    body = rollback.json()
+    assert body["operation"] == "kubernetes.manifest.rollback"
+    assert body["state"] == "PLANNED"
+    assert body["parameters"]["source_changeset_id"] == chg["id"]
+    assert body["parameters"]["actions"][0]["action"] == "apply"
+    assert "value: one" in body["parameters"]["actions"][0]["manifest"]
+
+
+def test_helm_uninstall_is_high_risk():
+    from hermes_control_plane.risk import classify
+    assert classify("helm.uninstall") == "HIGH"

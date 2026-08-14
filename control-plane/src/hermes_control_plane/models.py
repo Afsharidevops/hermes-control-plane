@@ -113,3 +113,9 @@ class RejectDecision(StrictModel):
 class ExecuteDecision(StrictModel):
     actor: str = Field(min_length=1, max_length=160)
 
+
+
+class RollbackPlanCreate(StrictModel):
+    requested_by: str = Field(min_length=1, max_length=160)
+    source_channel: Literal["ui", "telegram", "api", "cli"] = "api"
+    ttl_seconds: int = Field(default=900, ge=60, le=86400)

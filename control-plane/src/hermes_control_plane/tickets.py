@@ -13,7 +13,13 @@ def execution_key() -> str:
     return os.getenv("HERMES_EXECUTION_HMAC_KEY", "")
 
 
-def issue_ticket(changeset_id: str, plan_hash: str, plan: dict[str, Any], ttl_seconds: int = 120) -> tuple[dict[str, Any], str]:
+def issue_ticket(
+    changeset_id: str,
+    plan_hash: str,
+    plan: dict[str, Any],
+    ttl_seconds: int = 120,
+    preconditions: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], str]:
     key = execution_key()
     if not key:
         raise RuntimeError("HERMES_EXECUTION_HMAC_KEY is not configured")
@@ -22,6 +28,7 @@ def issue_ticket(changeset_id: str, plan_hash: str, plan: dict[str, Any], ttl_se
         "changeset_id": changeset_id,
         "plan_hash": plan_hash,
         "plan": plan,
+        "preconditions": preconditions or {},
         "issued_at": now,
         "expires_at": now + ttl_seconds,
     }

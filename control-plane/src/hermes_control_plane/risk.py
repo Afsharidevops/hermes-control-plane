@@ -12,7 +12,7 @@ _CRITICAL_MARKERS = (
     "docker.privileged", "host.mount", "host_root", "force-push", "force_push",
 )
 _HIGH_MARKERS = (
-    ".delete", ".remove", ".apply", ".install", ".upgrade", ".rollback", ".scale", ".restart",
+    ".delete", ".remove", ".apply", ".install", ".uninstall", ".upgrade", ".rollback", ".scale", ".restart",
     ".deploy", ".merge", ".push", "compose.down", "swarm.", "ingress.",
 )
 

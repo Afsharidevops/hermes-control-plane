@@ -29,6 +29,7 @@ from .models import (
     IntegrationUpdate,
     PreviewCreate,
     RejectDecision,
+    RollbackPlanCreate,
     TargetCreate,
     TargetUpdate,
 )
@@ -216,7 +217,7 @@ def system() -> dict[str, Any]:
         "version": VERSION,
         "stage": "beta-dev",
         "runtime": os.getenv("HERMES_RUNTIME", "docker"),
-        "capabilities": ["integration-registry", "target-registry", "credential-references", "changeset-planning", "risk-engine", "approval-binding", "audit", "kubernetes-discovery", "kubernetes-server-dry-run", "helm-server-dry-run", "signed-execution-tickets"],
+        "capabilities": ["integration-registry", "target-registry", "credential-references", "changeset-planning", "risk-engine", "approval-binding", "audit", "kubernetes-discovery", "kubernetes-server-dry-run", "kubernetes-guarded-delete", "kubernetes-rollback", "kubernetes-rollout-verification", "helm-server-dry-run", "helm-rollback", "signed-execution-tickets"],
         "execution_enabled": os.getenv("HERMES_EXECUTION_ENABLED", "false").lower() == "true",
         "counts": counts,
     }
@@ -545,40 +546,150 @@ def get_changeset(changeset_id: str) -> dict[str, Any]:
     return _changeset_dict(row)
 
 
+def _insert_changeset(
+    conn,
+    *,
+    operation: str,
+    adapter: str,
+    target_id: str,
+    requested_by: str,
+    source_channel: str,
+    source_revision: str | None,
+    parameters: dict[str, Any],
+    policy_generation: int,
+    ttl_seconds: int,
+) -> Any:
+    created_at = int(time.time())
+    expires_at = created_at + ttl_seconds
+    changeset_id = f"chg_{uuid.uuid4().hex[:16]}"
+    risk = classify(operation)
+    target_snapshot = _target_snapshot(conn, target_id)
+    if target_snapshot["status"] != "configured":
+        raise HTTPException(status_code=409, detail="target is disabled")
+    plan = {
+        "schema_version": 2,
+        "operation": operation,
+        "adapter": adapter,
+        "target_id": target_id,
+        "source_revision": source_revision,
+        "parameters": parameters,
+        "policy_generation": policy_generation,
+        "target_snapshot": target_snapshot,
+    }
+    plan_json = canonical_json(plan)
+    plan_hash = sha256_hex(plan)
+    conn.execute(
+        """INSERT INTO changesets
+        (id,operation,target_id,requested_by,source_channel,risk,parameters_json,content_hash,state,created_at,adapter,source_revision,plan_json,plan_hash,preview_json,approval_required,policy_generation,expires_at,updated_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (changeset_id, operation, target_id, requested_by, source_channel, risk,
+         json.dumps(parameters, sort_keys=True), plan_hash, "PLANNED", created_at, adapter, source_revision,
+         plan_json, plan_hash, None, int(approval_required(risk)), policy_generation, expires_at, created_at),
+    )
+    db.audit(conn, "changeset.created", requested_by, "changeset", changeset_id, {"plan_hash": plan_hash, "risk": risk})
+    return conn.execute("SELECT * FROM changesets WHERE id=?", (changeset_id,)).fetchone()
+
+
 @app.post("/v1/changesets", status_code=201)
 def create_changeset(payload: ChangeSetCreate, authorization: str | None = Header(default=None)) -> dict[str, Any]:
     _require_admin(authorization)
-    created_at = int(time.time())
-    expires_at = created_at + payload.ttl_seconds
-    changeset_id = f"chg_{uuid.uuid4().hex[:16]}"
-    risk = classify(payload.operation)
     with closing(db.connect()) as conn:
-        target_snapshot = _target_snapshot(conn, payload.target_id)
-        if target_snapshot["status"] != "configured":
-            raise HTTPException(status_code=409, detail="target is disabled")
-        plan = {
-            "schema_version": 2,
-            "operation": payload.operation,
-            "adapter": payload.adapter,
-            "target_id": payload.target_id,
-            "source_revision": payload.source_revision,
-            "parameters": payload.parameters,
-            "policy_generation": payload.policy_generation,
-            "target_snapshot": target_snapshot,
-        }
-        plan_json = canonical_json(plan)
-        plan_hash = sha256_hex(plan)
-        conn.execute(
-            """INSERT INTO changesets
-            (id,operation,target_id,requested_by,source_channel,risk,parameters_json,content_hash,state,created_at,adapter,source_revision,plan_json,plan_hash,preview_json,approval_required,policy_generation,expires_at,updated_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (changeset_id, payload.operation, payload.target_id, payload.requested_by, payload.source_channel, risk,
-             json.dumps(payload.parameters, sort_keys=True), plan_hash, "PLANNED", created_at, payload.adapter, payload.source_revision,
-             plan_json, plan_hash, None, int(approval_required(risk)), payload.policy_generation, expires_at, created_at),
+        row = _insert_changeset(
+            conn,
+            operation=payload.operation,
+            adapter=payload.adapter,
+            target_id=payload.target_id,
+            requested_by=payload.requested_by,
+            source_channel=payload.source_channel,
+            source_revision=payload.source_revision,
+            parameters=payload.parameters,
+            policy_generation=payload.policy_generation,
+            ttl_seconds=payload.ttl_seconds,
         )
-        db.audit(conn, "changeset.created", payload.requested_by, "changeset", changeset_id, {"plan_hash": plan_hash, "risk": risk})
         conn.commit()
-        row = conn.execute("SELECT * FROM changesets WHERE id=?", (changeset_id,)).fetchone()
+    return _changeset_dict(row)
+
+
+@app.post("/v1/changesets/{changeset_id}/rollback-plan", status_code=201)
+def create_rollback_plan(
+    changeset_id: str,
+    payload: RollbackPlanCreate,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    _require_admin(authorization)
+    with closing(db.connect()) as conn:
+        source = _changeset(conn, changeset_id)
+        if source["state"] != "EXECUTED":
+            raise HTTPException(status_code=409, detail="rollback can only be generated from an EXECUTED ChangeSet")
+        execution = json.loads(source["execution_json"] or "null") or {}
+        original = json.loads(source["plan_json"] or "{}")
+        original_params = original.get("parameters") or {}
+        operation = str(source["operation"] or "")
+
+        if operation in {"kubernetes.manifest.apply", "kubernetes.manifest.delete", "kubernetes.manifest.rollback"}:
+            before_state = execution.get("before_state")
+            if not isinstance(before_state, dict) or not before_state.get("resources"):
+                raise HTTPException(status_code=409, detail="executed ChangeSet has no captured Kubernetes before-state")
+            actions = []
+            for item in before_state.get("resources") or []:
+                ref = item.get("resource") or {}
+                if item.get("exists"):
+                    manifest = item.get("manifest")
+                    if not manifest:
+                        raise HTTPException(status_code=409, detail="captured rollback state is incomplete")
+                    actions.append({"action": "apply", "resource": ref, "manifest": manifest})
+                else:
+                    actions.append({"action": "delete", "resource": ref})
+            rb_operation = "kubernetes.manifest.rollback"
+            rb_adapter = "kubernetes"
+            rb_params = {
+                "namespace": original_params.get("namespace", "default"),
+                "source_changeset_id": changeset_id,
+                "actions": actions,
+            }
+        elif operation in {"helm.install", "helm.upgrade", "helm.rollback"}:
+            before = execution.get("before_release") or {}
+            release = original_params.get("release")
+            namespace = original_params.get("namespace", "default")
+            if before.get("exists") and int(before.get("revision") or 0) >= 1:
+                rb_operation = "helm.rollback"
+                rb_adapter = "helm"
+                rb_params = {
+                    "release": release,
+                    "namespace": namespace,
+                    "revision": int(before["revision"]),
+                    "source_changeset_id": changeset_id,
+                }
+            elif not before.get("exists"):
+                rb_operation = "helm.uninstall"
+                rb_adapter = "helm"
+                rb_params = {
+                    "release": release,
+                    "namespace": namespace,
+                    "source_changeset_id": changeset_id,
+                }
+            else:
+                raise HTTPException(status_code=409, detail="executed Helm ChangeSet has no usable previous release revision")
+        else:
+            raise HTTPException(status_code=422, detail=f"rollback is not implemented for {operation}")
+
+        row = _insert_changeset(
+            conn,
+            operation=rb_operation,
+            adapter=rb_adapter,
+            target_id=source["target_id"],
+            requested_by=payload.requested_by,
+            source_channel=payload.source_channel,
+            source_revision=None,
+            parameters=rb_params,
+            policy_generation=int(source["policy_generation"] or 1),
+            ttl_seconds=payload.ttl_seconds,
+        )
+        db.audit(conn, "changeset.rollback_planned", payload.requested_by, "changeset", row["id"], {
+            "source_changeset_id": changeset_id,
+            "plan_hash": row["plan_hash"],
+        })
+        conn.commit()
     return _changeset_dict(row)
 
 
@@ -759,8 +870,19 @@ async def execute_changeset(changeset_id: str, payload: ExecuteDecision, authori
             approval = conn.execute("SELECT * FROM approvals WHERE changeset_id=? AND plan_hash=? AND status='APPROVED' ORDER BY issued_at DESC LIMIT 1", (changeset_id, row["plan_hash"])).fetchone()
             if not approval or int(approval["expires_at"]) < now:
                 raise HTTPException(status_code=409, detail="no valid approval is bound to this exact plan hash")
+        preview_details = (preview.get("details") or {}) if isinstance(preview, dict) else {}
+        preconditions = {}
+        if preview_details.get("live_state_hash"):
+            preconditions["live_state_hash"] = preview_details["live_state_hash"]
+        if preview_details.get("release_snapshot_hash"):
+            preconditions["release_snapshot_hash"] = preview_details["release_snapshot_hash"]
         try:
-            ticket, signature = issue_ticket(changeset_id, row["plan_hash"], plan)
+            ticket, signature = issue_ticket(
+                changeset_id,
+                row["plan_hash"],
+                plan,
+                preconditions=preconditions,
+            )
         except RuntimeError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
         conn.execute("UPDATE changesets SET state='EXECUTING',updated_at=? WHERE id=?", (now, changeset_id))

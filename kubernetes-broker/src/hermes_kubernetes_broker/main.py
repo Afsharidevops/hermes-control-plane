@@ -232,6 +232,81 @@ def _manifest_docs(manifest: str) -> list[dict[str, Any]]:
     return docs
 
 
+def _resource_ref(doc: dict[str, Any], default_namespace: str) -> dict[str, Any]:
+    metadata = doc.get("metadata") or {}
+    name = str(metadata.get("name") or "")
+    kind = str(doc.get("kind") or "")
+    api_version = str(doc.get("apiVersion") or "")
+    if not name or not NAME_RE.fullmatch(name.lower()):
+        raise HTTPException(422, f"invalid resource name for {kind or 'resource'}")
+    namespace = None if kind == "Namespace" else _namespace(metadata.get("namespace") or default_namespace)
+    return {"apiVersion": api_version, "kind": kind, "name": name, "namespace": namespace}
+
+
+def _normalized_live_manifest(raw: str) -> dict[str, Any] | None:
+    if not raw.strip():
+        return None
+    try:
+        doc = yaml.safe_load(raw)
+    except yaml.YAMLError as exc:
+        raise HTTPException(502, f"could not normalize live Kubernetes object: {exc}") from exc
+    if not isinstance(doc, dict):
+        return None
+    doc.pop("status", None)
+    metadata = doc.get("metadata") or {}
+    for key in ("managedFields", "resourceVersion", "uid", "creationTimestamp", "generation", "selfLink"):
+        metadata.pop(key, None)
+    doc["metadata"] = metadata
+    return doc
+
+
+def _get_live_resource(snapshot: dict[str, Any], ref: dict[str, Any]) -> dict[str, Any]:
+    args = ["kubectl", "get", str(ref["kind"]), str(ref["name"])]
+    if ref.get("namespace"):
+        args += ["-n", str(ref["namespace"])]
+    args += ["--ignore-not-found", "-o", "yaml"]
+    result = _run(args, snapshot)
+    raw = result["output"].strip()
+    normalized = _normalized_live_manifest(raw)
+    rollback_manifest = yaml.safe_dump(normalized, sort_keys=False).strip() if normalized else None
+    return {
+        "resource": ref,
+        "exists": bool(raw),
+        "manifest": rollback_manifest,
+        "normalized": normalized,
+    }
+
+
+def _capture_live_state(snapshot: dict[str, Any], refs: list[dict[str, Any]]) -> dict[str, Any]:
+    resources = [_get_live_resource(snapshot, ref) for ref in refs]
+    normalized = [
+        {"resource": x["resource"], "exists": x["exists"], "manifest": x["normalized"]}
+        for x in resources
+    ]
+    return {"resources": resources, "hash": sha256_hex(normalized)}
+
+
+def _manifest_refs(docs: list[dict[str, Any]], namespace: str) -> list[dict[str, Any]]:
+    return [_resource_ref(doc, namespace) for doc in docs]
+
+
+def _assert_live_precondition(snapshot: dict[str, Any], refs: list[dict[str, Any]], expected: str | None) -> dict[str, Any]:
+    state = _capture_live_state(snapshot, refs)
+    if expected and not hmac.compare_digest(state["hash"], expected):
+        raise HTTPException(409, "live Kubernetes state changed after preview; create and approve a new ChangeSet")
+    return state
+
+
+def _delete_dry_run(snapshot: dict[str, Any], refs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    results = []
+    for ref in refs:
+        args = ["kubectl", "delete", str(ref["kind"]), str(ref["name"]), "--dry-run=server"]
+        if ref.get("namespace"):
+            args += ["-n", str(ref["namespace"])]
+        results.append({"resource": ref, "result": _run(args, snapshot)})
+    return results
+
+
 def _manifest_preview(plan: dict[str, Any]) -> dict[str, Any]:
     snapshot = _target(plan)
     params = plan.get("parameters") or {}
@@ -240,6 +315,8 @@ def _manifest_preview(plan: dict[str, Any]) -> dict[str, Any]:
     namespace = _namespace(params.get("namespace"))
     _enforce_namespace(snapshot, namespace)
     _enforce_manifest_scope(snapshot, docs, namespace)
+    refs = _manifest_refs(docs, namespace)
+    before = _capture_live_state(snapshot, refs)
     dry = _run([
         "kubectl", "apply", "--server-side", "--dry-run=server", "--field-manager=hermes-control-plane",
         "-n", namespace, "-f", "-", "-o", "yaml"
@@ -247,15 +324,107 @@ def _manifest_preview(plan: dict[str, Any]) -> dict[str, Any]:
     diff = _run([
         "kubectl", "diff", "--server-side", "--field-manager=hermes-control-plane", "-n", namespace, "-f", "-"
     ], snapshot, manifest, allowed_codes={0, 1})
-    resources = [{"apiVersion": d.get("apiVersion"), "kind": d.get("kind"), "name": (d.get("metadata") or {}).get("name"), "namespace": (d.get("metadata") or {}).get("namespace", namespace)} for d in docs]
     return {
         "kind": "kubernetes-manifest",
-        "summary": f"Server-side dry-run passed for {len(resources)} resource(s) in namespace {namespace}",
-        "resources": resources,
+        "summary": f"Server-side dry-run passed for {len(refs)} resource(s) in namespace {namespace}",
+        "resources": refs,
+        "before_state": before,
+        "live_state_hash": before["hash"],
         "dry_run": dry,
         "diff": diff,
         "secret_output_suppressed": True,
     }
+
+
+def _manifest_delete_preview(plan: dict[str, Any]) -> dict[str, Any]:
+    snapshot = _target(plan)
+    params = plan.get("parameters") or {}
+    manifest = str(params.get("manifest") or "")
+    docs = _manifest_docs(manifest)
+    namespace = _namespace(params.get("namespace"))
+    _enforce_namespace(snapshot, namespace)
+    _enforce_manifest_scope(snapshot, docs, namespace)
+    refs = _manifest_refs(docs, namespace)
+    before = _capture_live_state(snapshot, refs)
+    missing = [x["resource"] for x in before["resources"] if not x["exists"]]
+    if missing:
+        raise HTTPException(409, {"message": "delete target does not exist", "resources": missing})
+    dry = _delete_dry_run(snapshot, refs)
+    return {
+        "kind": "kubernetes-delete",
+        "summary": f"Server-side delete dry-run passed for {len(refs)} resource(s)",
+        "resources": refs,
+        "before_state": before,
+        "live_state_hash": before["hash"],
+        "dry_run": dry,
+        "secret_output_suppressed": True,
+    }
+
+
+def _rollback_actions(plan: dict[str, Any]) -> tuple[dict[str, Any], str, list[dict[str, Any]], list[dict[str, Any]]]:
+    snapshot = _target(plan)
+    params = plan.get("parameters") or {}
+    namespace = _namespace(params.get("namespace"))
+    _enforce_namespace(snapshot, namespace)
+    actions = params.get("actions") or []
+    if not isinstance(actions, list) or not actions:
+        raise HTTPException(422, "rollback actions are missing")
+    validated = []
+    refs = []
+    for action in actions:
+        if not isinstance(action, dict) or action.get("action") not in {"apply", "delete"}:
+            raise HTTPException(422, "invalid rollback action")
+        if action["action"] == "apply":
+            manifest = str(action.get("manifest") or "")
+            docs = _manifest_docs(manifest)
+            _enforce_manifest_scope(snapshot, docs, namespace)
+            if len(docs) != 1:
+                raise HTTPException(422, "each rollback apply action must contain exactly one resource")
+            ref = _resource_ref(docs[0], namespace)
+            validated.append({"action": "apply", "resource": ref, "manifest": manifest})
+            refs.append(ref)
+        else:
+            ref = action.get("resource") or {}
+            kind = str(ref.get("kind") or "")
+            name = str(ref.get("name") or "")
+            if kind in DENIED_KINDS or kind not in SAFE_MANIFEST_KINDS:
+                raise HTTPException(403, f"{kind or 'unknown kind'} is not eligible for rollback delete")
+            fake = {"apiVersion": ref.get("apiVersion") or "v1", "kind": kind, "metadata": {"name": name}}
+            if ref.get("namespace"):
+                fake["metadata"]["namespace"] = ref["namespace"]
+            _enforce_manifest_scope(snapshot, [fake], namespace)
+            safe_ref = _resource_ref(fake, namespace)
+            validated.append({"action": "delete", "resource": safe_ref})
+            refs.append(safe_ref)
+    return snapshot, namespace, validated, refs
+
+
+def _manifest_rollback_preview(plan: dict[str, Any]) -> dict[str, Any]:
+    snapshot, namespace, actions, refs = _rollback_actions(plan)
+    current = _capture_live_state(snapshot, refs)
+    previews = []
+    for action in actions:
+        if action["action"] == "apply":
+            manifest = action["manifest"]
+            dry = _run([
+                "kubectl", "apply", "--server-side", "--dry-run=server", "--field-manager=hermes-control-plane",
+                "-n", namespace, "-f", "-", "-o", "yaml"
+            ], snapshot, manifest)
+            diff = _run([
+                "kubectl", "diff", "--server-side", "--field-manager=hermes-control-plane", "-n", namespace, "-f", "-"
+            ], snapshot, manifest, allowed_codes={0, 1})
+            previews.append({"action": "apply", "resource": action["resource"], "dry_run": dry, "diff": diff})
+        else:
+            previews.extend({"action": "delete", **x} for x in _delete_dry_run(snapshot, [action["resource"]]))
+    return {
+        "kind": "kubernetes-rollback",
+        "summary": f"Rollback preview passed for {len(actions)} resource action(s)",
+        "actions": previews,
+        "live_state": current,
+        "live_state_hash": current["hash"],
+        "secret_output_suppressed": True,
+    }
+
 
 
 def _helm_values_file(values_yaml: str):
@@ -282,11 +451,53 @@ def _helm_base(params: dict[str, Any]) -> tuple[str, str, str, list[str]]:
     return release, chart, namespace, args
 
 
+def _parsed_json(result: dict[str, Any], fallback: Any) -> Any:
+    try:
+        return json.loads(result.get("output") or "")
+    except (json.JSONDecodeError, TypeError):
+        return fallback
+
+
+def _helm_release_snapshot(snapshot: dict[str, Any], release: str, namespace: str) -> dict[str, Any]:
+    listed = _run(["helm", "list", "--namespace", namespace, "--filter", f"^{re.escape(release)}$", "-o", "json"], snapshot)
+    items = _parsed_json(listed, [])
+    if not isinstance(items, list) or not items:
+        return {"exists": False, "release": release, "namespace": namespace, "revision": None}
+    status_result = _run(["helm", "status", release, "--namespace", namespace, "-o", "json"], snapshot)
+    status = _parsed_json(status_result, {"raw": status_result.get("output", "")})
+    revision = None
+    try:
+        revision = int((items[0] or {}).get("revision") or 0) or None
+    except (TypeError, ValueError):
+        pass
+    return {"exists": True, "release": release, "namespace": namespace, "revision": revision, "status": status}
+
+
+def _helm_snapshot_hash(value: dict[str, Any]) -> str:
+    # Status may contain timestamps. Bind approval to stable release identity/revision/status.
+    stable = {
+        "exists": value.get("exists"),
+        "release": value.get("release"),
+        "namespace": value.get("namespace"),
+        "revision": value.get("revision"),
+        "status": ((value.get("status") or {}).get("info") or {}).get("status") if isinstance(value.get("status"), dict) else None,
+    }
+    return sha256_hex(stable)
+
+
+def _assert_helm_precondition(snapshot: dict[str, Any], release: str, namespace: str, expected: str | None) -> dict[str, Any]:
+    current = _helm_release_snapshot(snapshot, release, namespace)
+    if expected and not hmac.compare_digest(_helm_snapshot_hash(current), expected):
+        raise HTTPException(409, "Helm release changed after preview; create and approve a new ChangeSet")
+    return current
+
+
 def _helm_preview(plan: dict[str, Any]) -> dict[str, Any]:
     snapshot = _target(plan)
     params = plan.get("parameters") or {}
     release, chart, namespace, args = _helm_base(params)
     _enforce_namespace(snapshot, namespace)
+    before = _helm_release_snapshot(snapshot, release, namespace)
     values_path = None
     try:
         values_yaml = str(params.get("values_yaml") or "")
@@ -302,6 +513,8 @@ def _helm_preview(plan: dict[str, Any]) -> dict[str, Any]:
             "release": release,
             "chart": chart,
             "namespace": namespace,
+            "release_snapshot": before,
+            "release_snapshot_hash": _helm_snapshot_hash(before),
             "dry_run": result,
             "secret_output_suppressed": True,
         }
@@ -310,28 +523,73 @@ def _helm_preview(plan: dict[str, Any]) -> dict[str, Any]:
             values_path.unlink(missing_ok=True)
 
 
+def _helm_rollback_preview(plan: dict[str, Any]) -> dict[str, Any]:
+    snapshot = _target(plan)
+    p = plan.get("parameters") or {}
+    release = _release(p.get("release"))
+    namespace = _namespace(p.get("namespace"))
+    revision = int(p.get("revision") or 0)
+    _enforce_namespace(snapshot, namespace)
+    if revision < 1:
+        raise HTTPException(422, "rollback revision must be >= 1")
+    before = _helm_release_snapshot(snapshot, release, namespace)
+    if not before.get("exists"):
+        raise HTTPException(409, "Helm release does not exist")
+    history_result = _run(["helm", "history", release, "--namespace", namespace, "-o", "json"], snapshot)
+    history = _parsed_json(history_result, [])
+    revisions = {int(x.get("revision") or 0) for x in history if isinstance(x, dict)} if isinstance(history, list) else set()
+    if revision not in revisions:
+        raise HTTPException(409, f"Helm revision {revision} does not exist for release {release}")
+    return {
+        "kind": "helm-rollback",
+        "summary": f"Rollback plan for {release} to revision {revision}",
+        "history": history,
+        "release_snapshot": before,
+        "release_snapshot_hash": _helm_snapshot_hash(before),
+        "secret_output_suppressed": True,
+    }
+
+
+def _helm_uninstall_preview(plan: dict[str, Any]) -> dict[str, Any]:
+    snapshot = _target(plan)
+    p = plan.get("parameters") or {}
+    release = _release(p.get("release"))
+    namespace = _namespace(p.get("namespace"))
+    _enforce_namespace(snapshot, namespace)
+    before = _helm_release_snapshot(snapshot, release, namespace)
+    if not before.get("exists"):
+        raise HTTPException(409, "Helm release does not exist")
+    return {
+        "kind": "helm-uninstall",
+        "summary": f"Helm uninstall plan for release {release} in namespace {namespace}",
+        "release_snapshot": before,
+        "release_snapshot_hash": _helm_snapshot_hash(before),
+        "secret_output_suppressed": True,
+    }
+
+
+
 def preview(plan: dict[str, Any]) -> dict[str, Any]:
     operation = str(plan.get("operation") or "")
     if sha256_hex(plan) != str(plan.get("plan_hash", sha256_hex(plan))):
-        # plan_hash is normally external; this branch only guards callers that embed one.
         raise HTTPException(409, "embedded plan hash mismatch")
     if operation == "kubernetes.manifest.apply":
         return _manifest_preview(plan)
+    if operation == "kubernetes.manifest.delete":
+        return _manifest_delete_preview(plan)
+    if operation == "kubernetes.manifest.rollback":
+        return _manifest_rollback_preview(plan)
     if operation in {"helm.install", "helm.upgrade"}:
         return _helm_preview(plan)
     if operation == "helm.rollback":
-        snapshot = _target(plan)
-        p = plan.get("parameters") or {}
-        release = _release(p.get("release")); namespace = _namespace(p.get("namespace")); revision = int(p.get("revision") or 0)
-        _enforce_namespace(snapshot, namespace)
-        if revision < 1:
-            raise HTTPException(422, "rollback revision must be >= 1")
-        history = _run(["helm", "history", release, "--namespace", namespace, "-o", "json"], snapshot)
-        return {"kind": "helm-rollback", "summary": f"Rollback plan for {release} to revision {revision}", "history": history, "secret_output_suppressed": True}
+        return _helm_rollback_preview(plan)
+    if operation == "helm.uninstall":
+        return _helm_uninstall_preview(plan)
     raise HTTPException(422, f"unsupported beta.1 operation: {operation}")
 
 
-def _verify_ticket(ticket: dict[str, Any], signature: str) -> dict[str, Any]:
+
+def _verify_ticket(ticket: dict[str, Any], signature: str) -> tuple[dict[str, Any], dict[str, Any]]:
     if not EXECUTION_KEY:
         raise HTTPException(503, "execution signing key not configured")
     expected = hmac.new(EXECUTION_KEY.encode(), canonical_json(ticket).encode(), hashlib.sha256).hexdigest()
@@ -348,10 +606,59 @@ def _verify_ticket(ticket: dict[str, Any], signature: str) -> dict[str, Any]:
         raise HTTPException(422, "execution ticket has no plan")
     if sha256_hex(plan) != ticket.get("plan_hash"):
         raise HTTPException(409, "execution ticket plan hash mismatch")
-    return plan
+    preconditions = ticket.get("preconditions") or {}
+    if not isinstance(preconditions, dict):
+        raise HTTPException(422, "execution ticket preconditions are invalid")
+    return plan, preconditions
 
 
-def _execute_plan(plan: dict[str, Any]) -> dict[str, Any]:
+def _verify_workload_rollouts(snapshot: dict[str, Any], refs: list[dict[str, Any]], timeout: str) -> list[dict[str, Any]]:
+    checks = []
+    for ref in refs:
+        kind = str(ref.get("kind") or "")
+        name = str(ref.get("name") or "")
+        namespace = ref.get("namespace")
+        if kind in {"Deployment", "StatefulSet", "DaemonSet"}:
+            args = ["kubectl", "rollout", "status", f"{kind.lower()}/{name}", f"--timeout={timeout}"]
+            if namespace:
+                args += ["-n", str(namespace)]
+            checks.append({"resource": ref, "result": _run(args, snapshot, timeout=max(COMMAND_TIMEOUT, 360))})
+        elif kind == "Job":
+            args = ["kubectl", "wait", "--for=condition=complete", f"job/{name}", f"--timeout={timeout}"]
+            if namespace:
+                args += ["-n", str(namespace)]
+            checks.append({"resource": ref, "result": _run(args, snapshot, timeout=max(COMMAND_TIMEOUT, 360))})
+    return checks
+
+
+def _apply_manifest(snapshot: dict[str, Any], manifest: str, namespace: str, docs: list[dict[str, Any]]) -> tuple[dict[str, Any], dict[str, Any]]:
+    result = _run(
+        ["kubectl", "apply", "--server-side", "--field-manager=hermes-control-plane", "-n", namespace, "-f", "-", "-o", "name"],
+        snapshot,
+        manifest,
+        timeout=max(COMMAND_TIMEOUT, 120),
+    )
+    convergence = _run(
+        ["kubectl", "diff", "--server-side", "--field-manager=hermes-control-plane", "-n", namespace, "-f", "-"],
+        snapshot,
+        manifest,
+        timeout=max(COMMAND_TIMEOUT, 120),
+        allowed_codes={0},
+    )
+    refs = _manifest_refs(docs, namespace)
+    rollout_timeout = "5m"
+    rollouts = _verify_workload_rollouts(snapshot, refs, rollout_timeout)
+    return result, {
+        "converged": True,
+        "method": "kubectl-diff",
+        "diff": convergence,
+        "resources": refs,
+        "rollouts": rollouts,
+    }
+
+
+def _execute_plan(plan: dict[str, Any], preconditions: dict[str, Any] | None = None) -> dict[str, Any]:
+    preconditions = preconditions or {}
     snapshot = _target(plan)
     operation = str(plan.get("operation") or "")
     params = plan.get("parameters") or {}
@@ -361,78 +668,108 @@ def _execute_plan(plan: dict[str, Any]) -> dict[str, Any]:
         ns = _namespace(params.get("namespace"))
         _enforce_namespace(snapshot, ns)
         _enforce_manifest_scope(snapshot, docs, ns)
-        result = _run(
-            [
-                "kubectl", "apply",
-                "--server-side",
-                "--field-manager=hermes-control-plane",
-                "-n", ns,
-                "-f", "-",
-                "-o", "name",
-            ],
-            snapshot,
-            manifest,
-            timeout=max(COMMAND_TIMEOUT, 120),
-        )
+        refs = _manifest_refs(docs, ns)
+        before = _assert_live_precondition(snapshot, refs, preconditions.get("live_state_hash"))
+        result, verification = _apply_manifest(snapshot, manifest, ns, docs)
+        return {"operation": operation, "before_state": before, "result": result, "verification": verification}
 
-        # Post-apply convergence verification:
-        # kubectl diff returns 0 only when live state matches the exact
-        # approved manifest. A remaining diff makes execution fail.
-        convergence = _run(
-            [
-                "kubectl", "diff",
-                "--server-side",
-                "--field-manager=hermes-control-plane",
-                "-n", ns,
-                "-f", "-",
-            ],
-            snapshot,
-            manifest,
-            timeout=max(COMMAND_TIMEOUT, 120),
-            allowed_codes={0},
-        )
+    if operation == "kubernetes.manifest.delete":
+        manifest = str(params.get("manifest") or "")
+        docs = _manifest_docs(manifest)
+        ns = _namespace(params.get("namespace"))
+        _enforce_namespace(snapshot, ns)
+        _enforce_manifest_scope(snapshot, docs, ns)
+        refs = _manifest_refs(docs, ns)
+        before = _assert_live_precondition(snapshot, refs, preconditions.get("live_state_hash"))
+        if any(not x["exists"] for x in before["resources"]):
+            raise HTTPException(409, "one or more delete targets disappeared after preview")
+        results = []
+        for ref in refs:
+            args = ["kubectl", "delete", str(ref["kind"]), str(ref["name"]), "--wait=true", "--timeout=2m"]
+            if ref.get("namespace"):
+                args += ["-n", str(ref["namespace"])]
+            results.append({"resource": ref, "result": _run(args, snapshot, timeout=max(COMMAND_TIMEOUT, 180))})
+        after = _capture_live_state(snapshot, refs)
+        if any(x["exists"] for x in after["resources"]):
+            raise HTTPException(502, "delete verification failed; one or more resources still exist")
+        return {"operation": operation, "before_state": before, "result": results, "verification": {"deleted": True, "resources": refs}}
 
-        resources = [
-            {
-                "apiVersion": doc.get("apiVersion"),
-                "kind": doc.get("kind"),
-                "name": (doc.get("metadata") or {}).get("name"),
-                "namespace": (doc.get("metadata") or {}).get("namespace", ns),
-            }
-            for doc in docs
-        ]
+    if operation == "kubernetes.manifest.rollback":
+        snapshot, ns, actions, refs = _rollback_actions(plan)
+        before = _assert_live_precondition(snapshot, refs, preconditions.get("live_state_hash"))
+        results = []
+        for action in actions:
+            if action["action"] == "apply":
+                manifest = action["manifest"]
+                docs = _manifest_docs(manifest)
+                result, verification = _apply_manifest(snapshot, manifest, ns, docs)
+                results.append({"action": "apply", "resource": action["resource"], "result": result, "verification": verification})
+            else:
+                ref = action["resource"]
+                live = _get_live_resource(snapshot, ref)
+                if live["exists"]:
+                    args = ["kubectl", "delete", str(ref["kind"]), str(ref["name"]), "--wait=true", "--timeout=2m"]
+                    if ref.get("namespace"):
+                        args += ["-n", str(ref["namespace"])]
+                    result = _run(args, snapshot, timeout=max(COMMAND_TIMEOUT, 180))
+                else:
+                    result = {"returncode": 0, "output": "already absent", "duration": 0.0}
+                results.append({"action": "delete", "resource": ref, "result": result})
+        return {"operation": operation, "before_state": before, "result": results, "verification": {"rollback_completed": True, "resources": refs}}
 
-        return {
-            "operation": operation,
-            "result": result,
-            "verification": {
-                "converged": True,
-                "method": "kubectl-diff",
-                "diff": convergence,
-                "resources": resources,
-            },
-        }
     if operation in {"helm.install", "helm.upgrade"}:
         release, chart, namespace, args = _helm_base(params)
         _enforce_namespace(snapshot, namespace)
+        before = _assert_helm_precondition(snapshot, release, namespace, preconditions.get("release_snapshot_hash"))
         values_path = None
         try:
             values_yaml = str(params.get("values_yaml") or "")
             if values_yaml:
-                values_path = _helm_values_file(values_yaml); args += ["-f", str(values_path)]
+                values_path = _helm_values_file(values_yaml)
+                args += ["-f", str(values_path)]
             args += ["--wait", "--timeout", str(params.get("timeout", "5m"))]
             result = _run(args, snapshot, timeout=max(COMMAND_TIMEOUT, 360))
-            status = _run(["helm", "status", release, "--namespace", namespace, "-o", "json"], snapshot)
-            return {"operation": operation, "result": result, "verification": status}
+            status_result = _run(["helm", "status", release, "--namespace", namespace, "-o", "json"], snapshot)
+            status = _parsed_json(status_result, {"raw": status_result.get("output", "")})
+            state = str(((status.get("info") or {}).get("status") if isinstance(status, dict) else "") or "").lower()
+            if state and state != "deployed":
+                raise HTTPException(502, f"Helm release verification returned status {state}")
+            history_result = _run(["helm", "history", release, "--namespace", namespace, "-o", "json"], snapshot)
+            return {
+                "operation": operation,
+                "before_release": before,
+                "result": result,
+                "verification": {"status": status, "history": _parsed_json(history_result, [])},
+            }
         finally:
-            if values_path: values_path.unlink(missing_ok=True)
+            if values_path:
+                values_path.unlink(missing_ok=True)
+
     if operation == "helm.rollback":
-        release = _release(params.get("release")); namespace = _namespace(params.get("namespace")); revision = int(params.get("revision") or 0)
+        release = _release(params.get("release"))
+        namespace = _namespace(params.get("namespace"))
+        revision = int(params.get("revision") or 0)
         _enforce_namespace(snapshot, namespace)
-        if revision < 1: raise HTTPException(422, "rollback revision must be >= 1")
+        if revision < 1:
+            raise HTTPException(422, "rollback revision must be >= 1")
+        before = _assert_helm_precondition(snapshot, release, namespace, preconditions.get("release_snapshot_hash"))
         result = _run(["helm", "rollback", release, str(revision), "--namespace", namespace, "--wait"], snapshot, timeout=max(COMMAND_TIMEOUT, 360))
-        status = _run(["helm", "status", release, "--namespace", namespace, "-o", "json"], snapshot)
-        return {"operation": operation, "result": result, "verification": status}
+        status_result = _run(["helm", "status", release, "--namespace", namespace, "-o", "json"], snapshot)
+        return {"operation": operation, "before_release": before, "result": result, "verification": {"status": _parsed_json(status_result, {})}}
+
+    if operation == "helm.uninstall":
+        release = _release(params.get("release"))
+        namespace = _namespace(params.get("namespace"))
+        _enforce_namespace(snapshot, namespace)
+        before = _assert_helm_precondition(snapshot, release, namespace, preconditions.get("release_snapshot_hash"))
+        if not before.get("exists"):
+            raise HTTPException(409, "Helm release disappeared after preview")
+        result = _run(["helm", "uninstall", release, "--namespace", namespace, "--wait", "--timeout", "5m"], snapshot, timeout=max(COMMAND_TIMEOUT, 360))
+        after = _helm_release_snapshot(snapshot, release, namespace)
+        if after.get("exists"):
+            raise HTTPException(502, "Helm uninstall verification failed; release still exists")
+        return {"operation": operation, "before_release": before, "result": result, "verification": {"uninstalled": True}}
+
     raise HTTPException(422, f"unsupported beta.1 operation: {operation}")
 
 
@@ -502,5 +839,5 @@ def execute(payload: ExecuteRequest, authorization: str | None = Header(default=
     _require_token(authorization)
     if not EXECUTION_ENABLED:
         raise HTTPException(403, "Kubernetes execution is disabled; enable HERMES_KUBERNETES_EXECUTION_ENABLED only after policy review")
-    plan = _verify_ticket(payload.ticket, payload.signature)
-    return _execute_plan(plan)
+    plan, preconditions = _verify_ticket(payload.ticket, payload.signature)
+    return _execute_plan(plan, preconditions)
