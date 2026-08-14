@@ -7,11 +7,15 @@ import pytest
 from fastapi.testclient import TestClient
 
 os.environ["HERMES_CONTROL_ADMIN_TOKEN"] = "test-admin"
+os.environ["HERMES_BOT_SERVICE_TOKEN"] = "test-bot"
+os.environ["HERMES_APPROVAL_BOT_TOKEN"] = "test-approval"
 
 from hermes_control_plane import db  # noqa: E402
 from hermes_control_plane.main import app  # noqa: E402
 
 AUTH = {"Authorization": "Bearer test-admin"}
+BOT_AUTH = {"Authorization": "Bearer test-bot"}
+APPROVAL_AUTH = {"Authorization": "Bearer test-approval"}
 
 
 @pytest.fixture()
@@ -89,7 +93,7 @@ def test_changeset_hash_risk_preview_and_approval_binding(client: TestClient):
         "source_revision": "git:deadbeef",
         "parameters": {"namespace": "apps", "deployment": "api", "replicas": 5},
     }
-    r = client.post("/v1/changesets", headers=AUTH, json=payload)
+    r = client.post("/v1/changesets", headers=BOT_AUTH, json=payload)
     assert r.status_code == 201, r.text
     chg = r.json()
     assert chg["risk"] == "HIGH"
@@ -97,21 +101,21 @@ def test_changeset_hash_risk_preview_and_approval_binding(client: TestClient):
     assert len(chg["plan_hash"]) == 64
     assert chg["executable"] is False
 
-    preview = client.post(f"/v1/changesets/{chg['id']}/preview", headers=AUTH, json={"summary": "Scale api 3 -> 5", "details": {"creates": 0, "updates": 1, "deletes": 0}})
+    preview = client.post(f"/v1/changesets/{chg['id']}/preview", headers=BOT_AUTH, json={"summary": "Scale api 3 -> 5", "details": {"creates": 0, "updates": 1, "deletes": 0}})
     assert preview.status_code == 200
     assert preview.json()["state"] == "PREVIEWED"
 
-    req = client.post(f"/v1/changesets/{chg['id']}/request-approval", headers=AUTH)
+    req = client.post(f"/v1/changesets/{chg['id']}/request-approval", headers=BOT_AUTH)
     assert req.status_code == 200
     assert req.json()["state"] == "AWAITING_APPROVAL"
 
-    bad_hash = client.post(f"/v1/changesets/{chg['id']}/approve", headers=AUTH, json={"approver": "telegram:2002", "plan_hash": "0" * 64})
+    bad_hash = client.post(f"/v1/changesets/{chg['id']}/approve", headers=APPROVAL_AUTH, json={"approver": "telegram:2002", "plan_hash": "0" * 64})
     assert bad_hash.status_code == 409
 
-    self_approval = client.post(f"/v1/changesets/{chg['id']}/approve", headers=AUTH, json={"approver": "telegram:1001", "plan_hash": chg["plan_hash"]})
+    self_approval = client.post(f"/v1/changesets/{chg['id']}/approve", headers=APPROVAL_AUTH, json={"approver": "telegram:1001", "plan_hash": chg["plan_hash"]})
     assert self_approval.status_code == 403
 
-    ok = client.post(f"/v1/changesets/{chg['id']}/approve", headers=AUTH, json={"approver": "telegram:2002", "plan_hash": chg["plan_hash"]})
+    ok = client.post(f"/v1/changesets/{chg['id']}/approve", headers=APPROVAL_AUTH, json={"approver": "telegram:2002", "plan_hash": chg["plan_hash"]})
     assert ok.status_code == 201, ok.text
     assert ok.json()["execution_enabled"] is False
 

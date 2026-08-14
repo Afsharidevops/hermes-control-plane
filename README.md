@@ -2,7 +2,7 @@
 
 Hermes Control Plane is a self-hosted, AI-assisted DevOps control plane designed to run on a Docker/VM installation or Kubernetes while keeping privileged credentials and infrastructure execution outside the LLM trust boundary.
 
-> Current development version: **0.5.10-beta.1-dev.1 — Kubernetes + Helm vertical slice**. Kubernetes/Helm execution exists behind the alpha.2 ChangeSet/approval boundary but remains disabled by default.
+> Current development branch: **0.5.10-beta.1** (not yet tagged). Kubernetes/Helm mutations are bot-only, exact-hash approved, broker-executed, and disabled by default.
 
 ## What is included
 
@@ -32,7 +32,7 @@ Alpha.2 management/safety core (retained):
 - expiry and audit events
 - alpha.1 SQLite migration/backfill
 
-Beta.1 dev.1 adds:
+Beta.1 work currently includes:
 
 - dedicated Kubernetes Broker with kubectl 1.36.x and Helm 4.x tooling
 - Kubernetes discovery and server-side manifest dry-run/diff
@@ -41,7 +41,10 @@ Beta.1 dev.1 adds:
 - ChangeSet target snapshots and drift invalidation
 - signed short-lived exact-plan execution tickets
 - Kubernetes/Helm execution opt-in (off by default)
-- Kubernetes-specific Operations Center views
+- Kubernetes observability/configuration views; infrastructure mutation controls are intentionally absent from the UI
+- bot-only Kubernetes/Helm ChangeSet authorization with separate Approval Bot identity
+- Hermes `control-plane-chatops` plugin restricted to allow-listed interactive Telegram users
+- readiness-aware `hermesctl execution` and `wait` helpers
 - `hermesctl kubeconfig`, `version`, and `upgrade` commands
 
 See `docs/BETA1.md`, `docs/ALPHA2.md`, `plan.md`, `SECURITY.md`, and `HANDOVER.md`.
@@ -49,22 +52,19 @@ See `docs/BETA1.md`, `docs/ALPHA2.md`, `plan.md`, `SECURITY.md`, and `HANDOVER.m
 ## Architecture
 
 ```text
-Web / Telegram / API
-        |
-Hermes Control Plane
-  registries / ChangeSets / risk / audit
-        |
-    Smart Router
-        |
-  Router Gateway
-    /       \
-9router   OmniRoute
+Web UI (configure/observe)        Hermes Telegram Bot (mutations)
+           |                                 |
+           +----------> Hermes Control Plane <---------- Approval Bot
+                         registries / ChangeSets
+                         risk / exact-hash approval / audit
+                                   |
+                         signed one-time execution ticket
+                                   |
+                            Broker or Node Agent
+                                   |
+                   Kubernetes / Helm / Docker / Swarm / SSH / Git
 
-approved ChangeSet (beta+)
-        |
-Broker or Node Agent
-        |
-Kubernetes / Helm / Docker / Swarm / SSH / Git
+Hermes -> Smart Router -> Router Gateway -> 9router / OmniRoute
 ```
 
 ## Quick start — Docker
@@ -147,7 +147,7 @@ The Kubernetes Broker re-enforces target scope (`namespace_allowlist`/`namespace
 Manual fallback build/publish remains available:
 
 ```bash
-IMAGE_NAMESPACE=afsharidevops VERSION=0.5.10-beta.1-dev.1 ./scripts/push-images.sh
+IMAGE_NAMESPACE=afsharidevops VERSION=0.5.10-beta.1 ./scripts/push-images.sh
 ```
 
 ## Verify

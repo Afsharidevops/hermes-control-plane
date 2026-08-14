@@ -2,13 +2,13 @@
 
 **Target:** `0.5.10`
 
-**Current development release:** `0.5.10-beta.1-dev.1`
+**Current development release:** `0.5.10-beta.1`
 
 **Project:** `hermes-control-plane`
 
 ## 1. Vision
 
-Hermes Control Plane evolves the Hermes Linux Stack into a self-hosted AI-assisted DevOps control plane. Operators should be able to manage infrastructure from the Operations Center UI, Telegram ChatOps, API, and CLI while keeping credentials and privileged execution outside the LLM trust boundary.
+Hermes Control Plane evolves the Hermes Linux Stack into a self-hosted AI-assisted DevOps control plane. The Operations Center UI configures and observes infrastructure; Kubernetes/Helm and future privileged infrastructure mutations originate from Hermes Bot, with HIGH/CRITICAL approval delegated to a separate Approval Bot identity. Credentials and privileged execution remain outside the LLM trust boundary.
 
 The platform must run in either of two forms without changing the product model:
 

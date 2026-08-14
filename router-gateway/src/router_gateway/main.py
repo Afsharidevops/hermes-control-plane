@@ -10,7 +10,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from starlette.responses import StreamingResponse
 from pydantic import BaseModel
 
-VERSION = "0.5.10-beta.1-dev.1"
+VERSION = "0.5.10-beta.1"
 STATE_FILE = Path(os.getenv("ROUTER_GATEWAY_STATE_FILE", "/data/router.json"))
 ADMIN_TOKEN = os.getenv("ROUTER_GATEWAY_ADMIN_TOKEN", "")
 DEFAULT_PROVIDER = os.getenv("HERMES_ROUTER_PROVIDER", "nine-router")

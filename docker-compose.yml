@@ -73,7 +73,7 @@ services:
       start_period: 40s
 
   router-gateway:
-    image: ${IMAGE_NAMESPACE:-afsharidevops}/hermes-control-plane-router-gateway:${VERSION:-0.5.10-beta.1-dev.1}
+    image: ${IMAGE_NAMESPACE:-afsharidevops}/hermes-control-plane-router-gateway:${VERSION:-0.5.10-beta.1}
     build:
       context: ./router-gateway
     restart: unless-stopped
@@ -106,7 +106,7 @@ services:
     networks: [app-net]
 
   smart-router:
-    image: ${IMAGE_NAMESPACE:-afsharidevops}/hermes-control-plane-smart-router:${VERSION:-0.5.10-beta.1-dev.1}
+    image: ${IMAGE_NAMESPACE:-afsharidevops}/hermes-control-plane-smart-router:${VERSION:-0.5.10-beta.1}
     build:
       context: ./smart-router
     restart: unless-stopped
@@ -157,8 +157,7 @@ services:
 
 
   kubernetes-broker:
-    user: "${HERMES_KUBERNETES_BROKER_UID:-10023}:${HERMES_KUBERNETES_BROKER_GID:-10023}"
-    image: ${IMAGE_NAMESPACE:-afsharidevops}/hermes-control-plane-kubernetes-broker:${VERSION:-0.5.10-beta.1-dev.1}
+    image: ${IMAGE_NAMESPACE:-afsharidevops}/hermes-control-plane-kubernetes-broker:${VERSION:-0.5.10-beta.1}
     build:
       context: ./kubernetes-broker
     restart: unless-stopped
@@ -180,7 +179,7 @@ services:
     cap_drop: ["ALL"]
 
   control-plane:
-    image: ${IMAGE_NAMESPACE:-afsharidevops}/hermes-control-plane-api:${VERSION:-0.5.10-beta.1-dev.1}
+    image: ${IMAGE_NAMESPACE:-afsharidevops}/hermes-control-plane-api:${VERSION:-0.5.10-beta.1}
     build:
       context: ./control-plane
     restart: unless-stopped
@@ -189,6 +188,8 @@ services:
     environment:
       HERMES_RUNTIME: docker
       HERMES_CONTROL_ADMIN_TOKEN: ${HERMES_CONTROL_ADMIN_TOKEN}
+      HERMES_BOT_SERVICE_TOKEN: ${HERMES_BOT_SERVICE_TOKEN}
+      HERMES_APPROVAL_BOT_TOKEN: ${HERMES_APPROVAL_BOT_TOKEN}
       HERMES_CONTROL_DB: /data/control-plane.sqlite3
       HERMES_KUBERNETES_BROKER_URL: http://kubernetes-broker:8830
       HERMES_KUBERNETES_BROKER_TOKEN: ${HERMES_KUBERNETES_BROKER_TOKEN}
@@ -216,6 +217,7 @@ services:
       - hermes-data:/opt/data
       - ./plugins/stack-package-policy:/opt/data/plugins/stack-package-policy:ro
       - ./plugins/stack-execution-policy:/opt/data/plugins/stack-execution-policy:ro
+      - ./plugins/control-plane-chatops:/opt/data/plugins/control-plane-chatops:ro
     environment:
       HERMES_HOME: /opt/data
       HERMES_DASHBOARD: ${HERMES_DASHBOARD:-0}
@@ -223,13 +225,16 @@ services:
       HERMES_GID: ${HERMES_GID:-10000}
       HERMES_DISABLE_LAZY_INSTALLS: "1"
       EXECUTION_FEATURES: ""
+      HERMES_CONTROL_PLANE_URL: http://control-plane:8800
+      HERMES_BOT_SERVICE_TOKEN: ${HERMES_BOT_SERVICE_TOKEN}
+      HERMES_CONTROL_PLANE_BOT_USERS: ${HERMES_CONTROL_PLANE_BOT_USERS:-}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     networks: [app-net]
 
   node-agent:
     profiles: ["node-agent"]
-    image: ${IMAGE_NAMESPACE:-afsharidevops}/hermes-control-plane-node-agent:${VERSION:-0.5.10-beta.1-dev.1}
+    image: ${IMAGE_NAMESPACE:-afsharidevops}/hermes-control-plane-node-agent:${VERSION:-0.5.10-beta.1}
     build:
       context: ./node-agent
     restart: unless-stopped

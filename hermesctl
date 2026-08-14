@@ -51,19 +51,10 @@ init_env() {
     info "created .env"
   fi
   load_env
-
-  # Docker bind mounts preserve host ownership. Run the Kubernetes Broker
-  # as the invoking non-root user so imported mode-0600 kubeconfigs remain
-  # readable without making credential material world-readable.
-  if [[ -z "${HERMES_KUBERNETES_BROKER_UID:-}" ]]; then
-    set_env HERMES_KUBERNETES_BROKER_UID "$(id -u)"
-  fi
-  if [[ -z "${HERMES_KUBERNETES_BROKER_GID:-}" ]]; then
-    set_env HERMES_KUBERNETES_BROKER_GID "$(id -g)"
-  fi
-
   declare -A sizes=(
     [HERMES_CONTROL_ADMIN_TOKEN]=32
+    [HERMES_BOT_SERVICE_TOKEN]=32
+    [HERMES_APPROVAL_BOT_TOKEN]=32
     [HERMES_KUBERNETES_BROKER_TOKEN]=32
     [HERMES_EXECUTION_HMAC_KEY]=32
     [ROUTER_GATEWAY_ADMIN_TOKEN]=32
@@ -135,7 +126,25 @@ cmd_up() {
     fi
     sleep 1
   done
+  cmd_wait 90
   "${COMPOSE[@]}" ps
+}
+
+cmd_wait() {
+  need curl
+  load_env
+  local timeout="${1:-60}" elapsed=0
+  info "waiting for Control Plane and Kubernetes Broker health"
+  while (( elapsed < timeout )); do
+    if curl -fsS "http://${CONTROL_PLANE_BIND_IP:-127.0.0.1}:${CONTROL_PLANE_PORT:-8800}/health" >/dev/null 2>&1 \
+       && curl -fsS "http://${KUBERNETES_BROKER_BIND_IP:-127.0.0.1}:${KUBERNETES_BROKER_PORT:-8830}/health" >/dev/null 2>&1; then
+      echo "Control Plane and Kubernetes Broker are ready."
+      return 0
+    fi
+    sleep 1
+    elapsed=$((elapsed+1))
+  done
+  fail "services did not become healthy within ${timeout}s"
 }
 
 cmd_down() {
@@ -281,6 +290,59 @@ cmd_kubeconfig_remove() {
   echo "Removed $id"
 }
 
+cmd_execution() {
+  need docker
+  local action="${1:-status}"
+  load_env
+  case "$action" in
+    status)
+      echo "HERMES_EXECUTION_ENABLED=${HERMES_EXECUTION_ENABLED:-false}"
+      echo "HERMES_KUBERNETES_EXECUTION_ENABLED=${HERMES_KUBERNETES_EXECUTION_ENABLED:-false}"
+      ;;
+    enable|disable)
+      local value=false
+      [[ "$action" == "enable" ]] && value=true
+      set_env HERMES_EXECUTION_ENABLED "$value"
+      set_env HERMES_KUBERNETES_EXECUTION_ENABLED "$value"
+      load_env
+      info "execution ${action}d; recreating Control Plane and Kubernetes Broker"
+      "${COMPOSE[@]}" up -d --force-recreate control-plane kubernetes-broker
+      cmd_wait 90
+      cmd_execution status
+      ;;
+    *) fail "usage: ./hermesctl execution enable|disable|status" ;;
+  esac
+}
+
+cmd_bot() {
+  need python3
+  local action="${1:-status}" value="${2:-}"
+  load_env
+  case "$action" in
+    status)
+      [[ -n "${HERMES_BOT_SERVICE_TOKEN:-}" && "${HERMES_BOT_SERVICE_TOKEN:-}" != "CHANGE_ME" ]] && echo "Hermes Bot service identity: configured" || echo "Hermes Bot service identity: missing"
+      [[ -n "${HERMES_APPROVAL_BOT_TOKEN:-}" && "${HERMES_APPROVAL_BOT_TOKEN:-}" != "CHANGE_ME" ]] && echo "Approval Bot service identity: configured" || echo "Approval Bot service identity: missing"
+      echo "Telegram mutation users: ${HERMES_CONTROL_PLANE_BOT_USERS:-<none>}"
+      ;;
+    allow)
+      [[ "$value" =~ ^[0-9]+$ ]] || fail "usage: ./hermesctl bot allow <numeric-telegram-user-id>"
+      local merged
+      merged="$(python3 - "${HERMES_CONTROL_PLANE_BOT_USERS:-}" "$value" <<'PYBOT'
+import sys
+existing=[x.strip() for x in sys.argv[1].replace(',', '\n').splitlines() if x.strip()]
+value=sys.argv[2]
+if value not in existing: existing.append(value)
+print(','.join(existing))
+PYBOT
+)"
+      set_env HERMES_CONTROL_PLANE_BOT_USERS "$merged"
+      echo "Allowed Telegram user $value for Hermes Control Plane mutation requests."
+      echo "Recreate Hermes with: docker compose --env-file .env --profile hermes up -d --force-recreate hermes"
+      ;;
+    *) fail "usage: ./hermesctl bot allow <telegram-user-id>|status" ;;
+  esac
+}
+
 cmd_doctor() {
   need python3
   echo "Hermes Control Plane doctor"
@@ -308,6 +370,11 @@ Commands:
   up --pull                    Pull published images and start without local builds
   down                         Stop the stack
   status                       Show Compose and service health
+  wait [seconds]               Wait until Control Plane and Kubernetes Broker are ready
+  execution enable|disable     Toggle mutation execution and wait for readiness
+  execution status             Show execution gates
+  bot allow <telegram-id>      Allow a numeric Telegram user to request bot-only mutations
+  bot status                   Show bot service identity/allowlist status (never tokens)
   doctor                       Check local prerequisites/config
   router list                  Show configured router health and active provider
   router set nine-router       Start/select 9router
@@ -326,6 +393,9 @@ case "${1:-}" in
   up) cmd_up "${2:-}" ;;
   down) cmd_down ;;
   status) cmd_status ;;
+  wait) cmd_wait "${2:-60}" ;;
+  execution) cmd_execution "${2:-status}" ;;
+  bot) cmd_bot "${2:-status}" "${3:-}" ;;
   doctor) cmd_doctor ;;
   version) cmd_version "${2:-show}" "${3:-}" ;;
   upgrade) cmd_upgrade "${2:-}" ;;
