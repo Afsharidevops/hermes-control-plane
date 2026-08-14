@@ -125,14 +125,24 @@ profiles_for_up() {
   printf '%s\n' "${profiles[@]}"
 }
 
+hermes_cli_run() {
+  # Run the Hermes CLI without the image's s6/gateway entrypoint. This is
+  # critical for Telegram: a normal `docker compose run hermes ...` starts a
+  # second gateway and creates a competing getUpdates poller.
+  "${COMPOSE[@]}" --profile hermes run --rm --no-deps -T \
+    --entrypoint /opt/hermes/.venv/bin/hermes \
+    -e TELEGRAM_BOT_TOKEN= \
+    -e TELEGRAM_ALLOWED_USERS= \
+    hermes "$@"
+}
+
 ensure_chatops_plugin() {
   need docker
   load_env
   info "ensuring Hermes Control Plane ChatOps plugin is enabled"
-  # The official Hermes plugin loader scans $HERMES_HOME/plugins, but user
-  # plugins are opt-in. Enable the bind-mounted plugin before gateway startup.
-  if ! "${COMPOSE[@]}" --profile hermes run --rm --no-deps -T \
-      hermes plugins enable control-plane-chatops >/dev/null; then
+  # The plugin lives in persistent /opt/data/plugins and is opt-in. Use the
+  # CLI-only entrypoint so enabling it never launches a transient gateway.
+  if ! hermes_cli_run plugins enable control-plane-chatops >/dev/null; then
     fail "could not enable control-plane-chatops plugin; run ./hermesctl bot check"
   fi
 }
@@ -431,8 +441,24 @@ PYBOT
         echo "[fail] control-plane-chatops plugin mount missing"
         return 1
       fi
-      "${COMPOSE[@]}" --profile hermes exec -T hermes sh -lc \
-        'HERMES_PLUGINS_DEBUG=1 hermes plugins list 2>&1 | grep -i -C2 "control-plane-chatops" || true'
+      local plugin_line
+      plugin_line="$(hermes_cli_run plugins list 2>&1 | grep -i "control-plane-chatops" | head -1 || true)"
+      if [[ -n "$plugin_line" ]]; then
+        echo "[ok] plugin discovered: $plugin_line"
+      else
+        echo "[fail] plugin is mounted but Hermes does not discover it"
+        echo "Run: HERMES_PLUGINS_DEBUG=1 ./hermesctl bot check"
+        return 1
+      fi
+      if grep -qE '^[[:space:]]*-[[:space:]]*control-plane-chatops[[:space:]]*$' <(
+          "${COMPOSE[@]}" --profile hermes exec -T hermes sh -lc \
+            "sed -n '/^plugins:/,/^[^[:space:]]/p' /opt/data/config.yaml 2>/dev/null" || true
+        ); then
+        echo "[ok] plugin is present in plugins.enabled"
+      else
+        echo "[warn] could not prove plugin enabled from config.yaml; re-running enable"
+        ensure_chatops_plugin
+      fi
       ;;
     *) fail "usage: ./hermesctl bot allow <telegram-user-id>|telegram|status|check" ;;
   esac

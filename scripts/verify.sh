@@ -23,6 +23,8 @@ for marker in [
         raise SystemExit(f'missing compose wiring: {marker}')
 if 'plugins enable control-plane-chatops' not in ctl:
     raise SystemExit('hermesctl does not auto-enable ChatOps plugin')
+if '--entrypoint /opt/hermes/.venv/bin/hermes' not in ctl:
+    raise SystemExit('Hermes plugin CLI helper does not bypass gateway entrypoint')
 if "'dev/**'" not in workflow:
     raise SystemExit('validate workflow does not cover dev/** pushes')
 print('foundation files: ok')

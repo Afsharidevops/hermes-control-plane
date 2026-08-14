@@ -46,6 +46,7 @@ jobs:
           for item in required:
               assert item in compose, item
           assert "plugins enable control-plane-chatops" in ctl
+          assert "--entrypoint /opt/hermes/.venv/bin/hermes" in ctl
           assert "HERMES_KUBERNETES_BROKER_UID" in compose
           print("bot/credential wiring: ok")
           PY

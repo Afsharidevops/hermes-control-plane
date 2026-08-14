@@ -78,3 +78,11 @@ The plugin contains only the Control Plane bot-service token. It has no kubeconf
 HIGH/CRITICAL changes cannot be approved with either the UI admin token or Hermes Bot token. Approval requires the separate Approval Bot service identity and the exact current `plan_hash`.
 
 Telegram Approval Bot transport wiring remains a beta.1 integration task; the service-identity and API boundary are already enforced by the Control Plane.
+
+
+## Single Telegram poller invariant
+
+Only the long-running `hermes` service may poll Telegram. Administrative
+`hermes plugins ...` commands are executed with a CLI-only Docker entrypoint so
+they never start a second gateway. A Telegram HTTP 409 `getUpdates` conflict is
+therefore treated as a deployment/runtime conflict, not as normal operation.
