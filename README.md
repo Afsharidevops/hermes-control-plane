@@ -2,7 +2,7 @@
 
 Hermes Control Plane is a self-hosted, AI-assisted DevOps control plane designed to run on a Docker/VM installation or Kubernetes while keeping privileged credentials and infrastructure execution outside the LLM trust boundary.
 
-> Current version: **0.5.10-alpha.2 — Management + Safety Core**. Privileged Kubernetes/Docker/Git/SSH mutation remains disabled until the beta adapters are bound to this release's ChangeSet/approval contract.
+> Current development branch: **0.5.10-beta.1** (not yet tagged). Kubernetes/Helm mutations are bot-only, exact-hash approved, broker-executed, and disabled by default.
 
 ## What is included
 
@@ -16,7 +16,7 @@ Foundation:
 - Kubernetes Helm chart
 - automatic multi-architecture Docker Hub publishing from GitHub Actions
 
-Alpha.2 management/safety core:
+Alpha.2 management/safety core (retained):
 
 - Environment Registry
 - Integration Registry
@@ -32,27 +32,39 @@ Alpha.2 management/safety core:
 - expiry and audit events
 - alpha.1 SQLite migration/backfill
 
-See `docs/ALPHA2.md`, `plan.md`, `SECURITY.md`, and `HANDOVER.md`.
+Beta.1 work currently includes:
+
+- dedicated Kubernetes Broker with kubectl 1.36.x and Helm 4.x tooling
+- Kubernetes discovery and server-side manifest dry-run/diff
+- Helm install/upgrade dry-run and rollback planning
+- kubeconfig reference + local file fingerprint boundary for Docker/VM
+- ChangeSet target snapshots and drift invalidation
+- signed short-lived exact-plan execution tickets
+- Kubernetes/Helm execution opt-in (off by default)
+- Kubernetes observability/configuration views; infrastructure mutation controls are intentionally absent from the UI
+- bot-only Kubernetes/Helm ChangeSet authorization with separate Approval Bot identity
+- Hermes `control-plane-chatops` plugin restricted to allow-listed interactive Telegram users
+- readiness-aware `hermesctl execution` and `wait` helpers
+- `hermesctl kubeconfig`, `version`, and `upgrade` commands
+
+See `docs/BETA1.md`, `docs/ALPHA2.md`, `plan.md`, `SECURITY.md`, and `HANDOVER.md`.
 
 ## Architecture
 
 ```text
-Web / Telegram / API
-        |
-Hermes Control Plane
-  registries / ChangeSets / risk / audit
-        |
-    Smart Router
-        |
-  Router Gateway
-    /       \
-9router   OmniRoute
+Web UI (configure/observe)        Hermes Telegram Bot (mutations)
+           |                                 |
+           +----------> Hermes Control Plane <---------- Approval Bot
+                         registries / ChangeSets
+                         risk / exact-hash approval / audit
+                                   |
+                         signed one-time execution ticket
+                                   |
+                            Broker or Node Agent
+                                   |
+                   Kubernetes / Helm / Docker / Swarm / SSH / Git
 
-approved ChangeSet (beta+)
-        |
-Broker or Node Agent
-        |
-Kubernetes / Helm / Docker / Swarm / SSH / Git
+Hermes -> Smart Router -> Router Gateway -> 9router / OmniRoute
 ```
 
 ## Quick start — Docker
@@ -64,7 +76,7 @@ cp .env.example .env
 ./hermesctl status
 ```
 
-Open the alpha.2 management UI locally:
+Open the Operations Center locally:
 
 ```text
 http://127.0.0.1:8800/ui
@@ -99,6 +111,17 @@ helm upgrade --install hermes-control-plane ./charts/hermes-control-plane \
 
 Review and replace all placeholder secrets before exposing any service.
 
+## Kubernetes target bootstrap on Docker/VM
+
+After the stack is running, import kubeconfig material locally without sending it through the Control Plane API:
+
+```bash
+./hermesctl kubeconfig import production ~/.kube/config
+./hermesctl kubeconfig list
+```
+
+Create the Kubernetes target in `/ui`, then use **Discover** before creating a manifest or Helm ChangeSet. Keep execution disabled until testing on a non-production cluster.
+
 ## CI / Docker Hub
 
 The repository uses these GitHub settings:
@@ -114,6 +137,9 @@ Project-owned Docker Hub repositories are isolated from `hermes-linux-stack`:
 - `hermes-control-plane-router-gateway`
 - `hermes-control-plane-smart-router`
 - `hermes-control-plane-execution-broker`
+- `hermes-control-plane-kubernetes-broker`
+
+The Kubernetes Broker re-enforces target scope (`namespace_allowlist`/`namespace_denylist`, optional kind allow/deny lists, and cluster-scoped permission) immediately before preview and execution.
 - `hermes-control-plane-node-agent`
 
 9router, OmniRoute, and Hermes Agent are upstream images and are not rebuilt here.
@@ -121,7 +147,7 @@ Project-owned Docker Hub repositories are isolated from `hermes-linux-stack`:
 Manual fallback build/publish remains available:
 
 ```bash
-IMAGE_NAMESPACE=afsharidevops VERSION=0.5.10-alpha.2 ./scripts/push-images.sh
+IMAGE_NAMESPACE=afsharidevops VERSION=0.5.10-beta.1 ./scripts/push-images.sh
 ```
 
 ## Verify
@@ -130,8 +156,10 @@ IMAGE_NAMESPACE=afsharidevops VERSION=0.5.10-alpha.2 ./scripts/push-images.sh
 ./scripts/verify.sh
 ```
 
-CI additionally runs the alpha.2 Control Plane tests, Compose validation, and Helm lint.
+CI runs the Control Plane safety/beta flow tests, Kubernetes Broker policy/ticket tests, Compose validation, and Helm lint.
 
 ## Security status
 
-The Control Plane API does not store raw credential material and has no privileged execute endpoint in alpha.2. Read `SECURITY.md` before exposing the stack or building beta adapters.
+The Control Plane API does not accept raw kubeconfig material. Kubernetes/Helm mutation requires live broker preview plus the exact approved ChangeSet and is disabled by default. Read `SECURITY.md` before enabling execution.
+
+9router and OmniRoute Router Gateway API credentials are provisioned automatically by `./hermesctl up`; no dashboard key copy/paste is required.

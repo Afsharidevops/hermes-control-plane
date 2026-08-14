@@ -2,6 +2,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SHELL_VERSION_OVERRIDE="${VERSION-}"
+SHELL_NAMESPACE_OVERRIDE="${IMAGE_NAMESPACE-}"
 ENV_FILE="$ROOT/.env"
 COMPOSE=(docker compose --project-directory "$ROOT" --env-file "$ENV_FILE")
 
@@ -51,6 +53,10 @@ init_env() {
   load_env
   declare -A sizes=(
     [HERMES_CONTROL_ADMIN_TOKEN]=32
+    [HERMES_BOT_SERVICE_TOKEN]=32
+    [HERMES_APPROVAL_BOT_TOKEN]=32
+    [HERMES_KUBERNETES_BROKER_TOKEN]=32
+    [HERMES_EXECUTION_HMAC_KEY]=32
     [ROUTER_GATEWAY_ADMIN_TOKEN]=32
     [SMART_ROUTER_HMAC_SECRET]=32
     [SMART_ROUTER_CLIENT_API_KEY]=32
@@ -75,6 +81,35 @@ init_env() {
       set_env "$key" "$(randhex "${sizes[$key]}")"
     fi
   done
+
+  # Keep imported kubeconfigs mode 0600. For local Docker/Compose, the broker
+  # must use the host operator's numeric UID/GID to read the bind-mounted files.
+  if [[ -z "${HERMES_KUBERNETES_BROKER_UID:-}" ]]; then
+    set_env HERMES_KUBERNETES_BROKER_UID "$(id -u)"
+  fi
+  if [[ -z "${HERMES_KUBERNETES_BROKER_GID:-}" ]]; then
+    set_env HERMES_KUBERNETES_BROKER_GID "$(id -g)"
+  fi
+
+  # Any identity trusted to request Control Plane mutations must also be able
+  # to reach the upstream Hermes Telegram gateway. Preserve any other Telegram
+  # users while adding the Control Plane mutation allowlist.
+  local telegram_users
+  telegram_users="$(python3 - "${TELEGRAM_ALLOWED_USERS:-}" "${HERMES_CONTROL_PLANE_BOT_USERS:-}" <<'PYTG'
+import sys
+out=[]
+for raw in sys.argv[1:]:
+    for item in raw.replace(',', '\n').splitlines():
+        item=item.strip()
+        if item and item.isdigit() and item not in out:
+            out.append(item)
+print(','.join(out))
+PYTG
+)"
+  if [[ -n "$telegram_users" ]]; then
+    set_env TELEGRAM_ALLOWED_USERS "$telegram_users"
+  fi
+
   info "generated missing local secrets"
   echo "Review $ENV_FILE before exposing services."
 }
@@ -90,6 +125,407 @@ profiles_for_up() {
   printf '%s\n' "${profiles[@]}"
 }
 
+hermes_cli_run() {
+  # Run the Hermes CLI without the image's s6/gateway entrypoint. This is
+  # critical for Telegram: a normal `docker compose run hermes ...` starts a
+  # second gateway and creates a competing getUpdates poller.
+  "${COMPOSE[@]}" --profile hermes run --rm --no-deps -T \
+    --entrypoint /opt/hermes/.venv/bin/hermes \
+    -e TELEGRAM_BOT_TOKEN= \
+    -e TELEGRAM_ALLOWED_USERS= \
+    hermes "$@"
+}
+
+hermes_python_run() {
+  "${COMPOSE[@]}" --profile hermes run --rm --no-deps -T \
+    --entrypoint /opt/hermes/.venv/bin/python \
+    -e TELEGRAM_BOT_TOKEN= \
+    -e TELEGRAM_ALLOWED_USERS= \
+    hermes "$@"
+}
+
+ensure_hermes_router_model() {
+  need docker
+  load_env
+  info "synchronizing Hermes model endpoint with internal Smart Router"
+  hermes_python_run - <<'PYMODEL'
+from pathlib import Path
+import os, shutil, time, yaml
+path=Path('/opt/data/config.yaml')
+data={}
+if path.exists():
+    loaded=yaml.safe_load(path.read_text())
+    if isinstance(loaded,dict): data=loaded
+old=data.get('model')
+model=dict(old) if isinstance(old,dict) else {}
+desired={
+    'provider':'custom',
+    'default':os.environ.get('HERMES_MODEL','auto') or 'auto',
+    'base_url':'http://smart-router:8080/v1',
+    'api_mode':'chat_completions',
+}
+changed=False
+for k,v in desired.items():
+    if model.get(k)!=v:
+        model[k]=v; changed=True
+# Keep the routing client secret only in the process environment.
+if model.get('api_key'):
+    model['api_key']=''; changed=True
+if data.get('model')!=model:
+    data['model']=model; changed=True
+if changed:
+    if path.exists():
+        shutil.copy2(path,path.with_name(f'config.yaml.pre-hcp-model-{int(time.time())}.bak'))
+    path.write_text(yaml.safe_dump(data,sort_keys=False))
+    print('Hermes model configuration updated: Smart Router + model=auto')
+else:
+    print('Hermes model configuration already synchronized.')
+PYMODEL
+}
+
+ensure_chatops_plugin() {
+  need docker
+  load_env
+  info "ensuring Hermes Control Plane ChatOps plugin is enabled"
+  # The plugin lives in persistent /opt/data/plugins and is opt-in. Use the
+  # CLI-only entrypoint so enabling it never launches a transient gateway.
+  if ! hermes_cli_run plugins enable control-plane-chatops >/dev/null; then
+    fail "could not enable control-plane-chatops plugin; run ./hermesctl bot check"
+  fi
+}
+
+omniroute_host_url() {
+  printf 'http://%s:%s' "${OMNIROUTE_PROVISION_HOST:-127.0.0.1}" "${OMNIROUTE_PORT:-20228}"
+}
+
+omniroute_api_host_url() {
+  printf 'http://%s:%s' "${OMNIROUTE_PROVISION_HOST:-127.0.0.1}" "${OMNIROUTE_API_PORT:-20229}"
+}
+
+wait_omniroute() {
+  need curl
+  local timeout="${1:-75}" elapsed=0 base
+  base="$(omniroute_host_url)"
+  while (( elapsed < timeout )); do
+    if curl -fsS "${base}/api/monitoring/health" >/dev/null 2>&1 \
+       || curl -fsS "${base}/api/init" >/dev/null 2>&1 \
+       || curl -fsS "${base}/" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+    elapsed=$((elapsed+1))
+  done
+  return 1
+}
+
+omniroute_key_http_status() {
+  need curl
+  local key="${1:-}" base code
+  [[ -n "$key" ]] || { printf '000'; return 0; }
+  base="$(omniroute_api_host_url)"
+  code="$(curl -sS --compressed -o /dev/null -w '%{http_code}' \
+    -H "Authorization: Bearer ${key}" \
+    "${base}/v1/models" 2>/dev/null || true)"
+  printf '%s' "${code:-000}"
+}
+
+omniroute_key_valid() {
+  [[ "$(omniroute_key_http_status "${1:-}")" == "200" ]]
+}
+
+ensure_omniroute_api_key() {
+  need curl
+  need python3
+  load_env
+
+  if [[ "${OMNIROUTE_AUTO_PROVISION_API_KEY:-true}" != "true" ]]; then
+    [[ -n "${OMNIROUTE_UPSTREAM_API_KEY:-}" ]] \
+      || fail "OmniRoute automatic API-key provisioning is disabled and OMNIROUTE_UPSTREAM_API_KEY is empty"
+    omniroute_key_valid "${OMNIROUTE_UPSTREAM_API_KEY}" \
+      || fail "configured OmniRoute Router Gateway API key is not accepted"
+    echo "[ok] OmniRoute Router Gateway API key is configured"
+    return 0
+  fi
+
+  # If we already hold a managed key, wait for OmniRoute to be ready BEFORE
+  # deciding whether it is valid. A stopped/starting provider must never look
+  # like an authentication failure and trigger credential rotation.
+  if [[ -n "${OMNIROUTE_UPSTREAM_API_KEY:-}" ]]; then
+    if ! wait_omniroute 90; then
+      fail "OmniRoute did not become ready; refusing to rotate the existing managed API key"
+    fi
+    local existing_status
+    existing_status="$(omniroute_key_http_status "${OMNIROUTE_UPSTREAM_API_KEY}")"
+    if [[ "$existing_status" == "200" ]]; then
+      echo "[ok] managed OmniRoute API key is already valid"
+      return 0
+    fi
+    if [[ "$existing_status" != "401" && "$existing_status" != "403" ]]; then
+      fail "OmniRoute key validation returned HTTP ${existing_status}; refusing credential rotation on a transient/non-authentication error"
+    fi
+    info "existing OmniRoute managed key was explicitly rejected (${existing_status}); rotating it"
+  else
+    if ! wait_omniroute 90; then
+      fail "OmniRoute did not become reachable for API-key provisioning"
+    fi
+  fi
+
+  info "provisioning dedicated OmniRoute API key for Router Gateway"
+
+  [[ -n "${OMNIROUTE_INITIAL_PASSWORD:-}" ]] \
+    || fail "OMNIROUTE_INITIAL_PASSWORD is missing; cannot authenticate to OmniRoute management API"
+
+  local tmpdir cookie login_json key_json login_code key_code managed_name provisioned_key base
+  tmpdir="$(mktemp -d)"
+  chmod 700 "$tmpdir"
+  cookie="$tmpdir/cookies"
+  login_json="$tmpdir/login.json"
+  key_json="$tmpdir/key.json"
+  managed_name="${OMNIROUTE_MANAGED_API_KEY_NAME:-hermes-control-plane-router-gateway}"
+  base="$(omniroute_host_url)"
+
+  # One login attempt only. OmniRoute has brute-force lockout protection.
+  login_code="$(
+    python3 - "${OMNIROUTE_INITIAL_PASSWORD}" <<'PYLOGIN' |
+import json, sys
+print(json.dumps({"password": sys.argv[1]}))
+PYLOGIN
+    curl -sS \
+      -c "$cookie" \
+      -o "$login_json" \
+      -w '%{http_code}' \
+      -H 'Content-Type: application/json' \
+      --data-binary @- \
+      "${base}/api/auth/login" || true
+  )"
+
+  if [[ "$login_code" != "200" ]]; then
+    rm -rf "$tmpdir"
+    fail "OmniRoute management login failed with HTTP ${login_code:-unreachable}; provisioning stops after one attempt to avoid lockout"
+  fi
+
+  # Server-to-server call deliberately sends no Origin header. OmniRoute's
+  # management mutation origin guard permits this path while cookie auth still
+  # authenticates the request.
+  key_code="$(
+    python3 - "$managed_name" <<'PYKEY' |
+import json, sys
+# 'chat' is a non-management runtime scope. OmniRoute also adds its own
+# self-service usage scope during key creation.
+print(json.dumps({"name": sys.argv[1], "scopes": ["chat"]}))
+PYKEY
+    curl -sS \
+      -b "$cookie" \
+      -o "$key_json" \
+      -w '%{http_code}' \
+      -H 'Content-Type: application/json' \
+      --data-binary @- \
+      "${base}/api/keys" || true
+  )"
+
+  if [[ "$key_code" != "201" ]]; then
+    rm -rf "$tmpdir"
+    fail "OmniRoute API-key creation failed with HTTP ${key_code:-unreachable}"
+  fi
+
+  provisioned_key="$(
+    python3 - "$key_json" <<'PYREAD'
+import json, sys
+data=json.load(open(sys.argv[1]))
+key=data.get("key")
+if not isinstance(key, str) or len(key.strip()) < 16 or any(ch.isspace() for ch in key):
+    raise SystemExit(2)
+print(key.strip())
+PYREAD
+  )" || {
+    rm -rf "$tmpdir"
+    fail "OmniRoute API-key creation returned an invalid response"
+  }
+
+  rm -rf "$tmpdir"
+
+  set_env OMNIROUTE_UPSTREAM_API_KEY "$provisioned_key"
+  chmod 600 "$ENV_FILE"
+  load_env
+
+  if ! omniroute_key_valid "${OMNIROUTE_UPSTREAM_API_KEY}"; then
+    fail "OmniRoute created a managed Router Gateway key but rejected it during /v1/models verification"
+  fi
+
+  echo "[ok] provisioned and verified dedicated OmniRoute Router Gateway API key"
+  echo "     key material stored only in local .env"
+}
+
+nine_router_host_url() {
+  printf 'http://%s:%s' "${NINEROUTER_PROVISION_HOST:-127.0.0.1}" "${NINEROUTER_PORT:-20128}"
+}
+
+wait_nine_router() {
+  need curl
+  local timeout="${1:-60}" elapsed=0 base
+  base="$(nine_router_host_url)"
+  while (( elapsed < timeout )); do
+    if curl -fsS "${base}/api/health" >/dev/null 2>&1 \
+       || curl -fsS "${base}/" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+    elapsed=$((elapsed+1))
+  done
+  return 1
+}
+
+nine_router_key_http_status() {
+  need curl
+  local key="${1:-}" base code
+  [[ -n "$key" ]] || { printf '000'; return 0; }
+  base="$(nine_router_host_url)"
+  code="$(curl -sS --compressed -o /dev/null -w '%{http_code}' \
+    -H "Authorization: Bearer ${key}" \
+    "${base}/v1/models" 2>/dev/null || true)"
+  printf '%s' "${code:-000}"
+}
+
+nine_router_key_valid() {
+  [[ "$(nine_router_key_http_status "${1:-}")" == "200" ]]
+}
+
+ensure_nine_router_api_key() {
+  need curl
+  need python3
+  load_env
+
+  if [[ "${NINEROUTER_AUTO_PROVISION_API_KEY:-true}" != "true" ]]; then
+    [[ -n "${NINE_ROUTER_UPSTREAM_API_KEY:-}" ]] \
+      || fail "9router automatic API-key provisioning is disabled and NINE_ROUTER_UPSTREAM_API_KEY is empty"
+    nine_router_key_valid "${NINE_ROUTER_UPSTREAM_API_KEY}" \
+      || fail "configured 9router API key is not accepted"
+    echo "[ok] 9router API key is configured"
+    return 0
+  fi
+
+  # Wait for 9router readiness before validating an existing key. Otherwise a
+  # provider that was just restarted can return connection errors and be
+  # mistaken for a revoked key, creating duplicate managed credentials.
+  if [[ -n "${NINE_ROUTER_UPSTREAM_API_KEY:-}" ]]; then
+    if ! wait_nine_router 75; then
+      fail "9router did not become ready; refusing to rotate the existing managed API key"
+    fi
+    local existing_status
+    existing_status="$(nine_router_key_http_status "${NINE_ROUTER_UPSTREAM_API_KEY}")"
+    if [[ "$existing_status" == "200" ]]; then
+      echo "[ok] managed 9router API key is already valid"
+      return 0
+    fi
+    if [[ "$existing_status" != "401" && "$existing_status" != "403" ]]; then
+      fail "9router key validation returned HTTP ${existing_status}; refusing credential rotation on a transient/non-authentication error"
+    fi
+    info "existing 9router managed key was explicitly rejected (${existing_status}); rotating it"
+  else
+    if ! wait_nine_router 75; then
+      fail "9router did not become reachable for API-key provisioning"
+    fi
+  fi
+
+  info "provisioning dedicated 9router API key for Router Gateway"
+
+  [[ -n "${NINEROUTER_INITIAL_PASSWORD:-}" ]] \
+    || fail "NINEROUTER_INITIAL_PASSWORD is missing; cannot authenticate to 9router management API"
+
+  local tmpdir cookie login_json key_json login_code key_code managed_name provisioned_key base
+  tmpdir="$(mktemp -d)"
+  chmod 700 "$tmpdir"
+  cookie="$tmpdir/cookies"
+  login_json="$tmpdir/login.json"
+  key_json="$tmpdir/key.json"
+  managed_name="${NINEROUTER_MANAGED_API_KEY_NAME:-hermes-control-plane-router-gateway}"
+  base="$(nine_router_host_url)"
+
+  login_code="$(
+    python3 - "${NINEROUTER_INITIAL_PASSWORD}" <<'PYLOGIN' |
+import json, sys
+print(json.dumps({"password": sys.argv[1]}))
+PYLOGIN
+    curl -sS \
+      -c "$cookie" \
+      -o "$login_json" \
+      -w '%{http_code}' \
+      -H 'Content-Type: application/json' \
+      --data-binary @- \
+      "${base}/api/auth/login" || true
+  )"
+
+  if [[ "$login_code" != "200" ]]; then
+    rm -rf "$tmpdir"
+    fail "9router management login failed with HTTP ${login_code:-unreachable}; provisioning stops after one attempt to avoid dashboard lockout"
+  fi
+
+  key_code="$(
+    python3 - "$managed_name" <<'PYKEY' |
+import json, sys
+print(json.dumps({"name": sys.argv[1]}))
+PYKEY
+    curl -sS \
+      -b "$cookie" \
+      -o "$key_json" \
+      -w '%{http_code}' \
+      -H 'Content-Type: application/json' \
+      --data-binary @- \
+      "${base}/api/keys" || true
+  )"
+
+  if [[ "$key_code" != "201" ]]; then
+    rm -rf "$tmpdir"
+    fail "9router API-key creation failed with HTTP ${key_code:-unreachable}"
+  fi
+
+  provisioned_key="$(
+    python3 - "$key_json" <<'PYREAD'
+import json, sys
+data=json.load(open(sys.argv[1]))
+key=data.get("key")
+if not isinstance(key, str) or len(key.strip()) < 16 or any(ch.isspace() for ch in key):
+    raise SystemExit(2)
+print(key.strip())
+PYREAD
+  )" || {
+    rm -rf "$tmpdir"
+    fail "9router API-key creation returned an invalid response"
+  }
+
+  rm -rf "$tmpdir"
+
+  set_env NINE_ROUTER_UPSTREAM_API_KEY "$provisioned_key"
+  chmod 600 "$ENV_FILE"
+  load_env
+
+  if ! nine_router_key_valid "${NINE_ROUTER_UPSTREAM_API_KEY}"; then
+    fail "9router created a managed key but rejected it during verification"
+  fi
+
+  echo "[ok] provisioned and verified dedicated 9router Router Gateway API key"
+  echo "     key material stored only in local .env"
+}
+
+bootstrap_selected_router() {
+  need docker
+  load_env
+  local provider="${HERMES_ROUTER_PROVIDER:-nine-router}"
+  local both="${HERMES_ENABLE_BOTH_ROUTERS:-false}"
+
+  if [[ "$provider" == "nine-router" || "$both" == "true" ]]; then
+    info "starting 9router bootstrap phase"
+    "${COMPOSE[@]}" --profile nine-router up -d nine-router
+    ensure_nine_router_api_key
+  fi
+
+  if [[ "$provider" == "omniroute" || "$both" == "true" ]]; then
+    info "starting OmniRoute bootstrap phase"
+    "${COMPOSE[@]}" --profile omniroute up -d omniroute
+    ensure_omniroute_api_key
+  fi
+}
+
 cmd_up() {
   need docker
   load_env
@@ -101,8 +537,14 @@ cmd_up() {
   if [[ "$mode" == "--pull" ]]; then
     info "pulling published images for Hermes Control Plane ($provider)"
     "${COMPOSE[@]}" "${args[@]}" pull
+    bootstrap_selected_router
+    ensure_hermes_router_model
+    ensure_chatops_plugin
     "${COMPOSE[@]}" "${args[@]}" up -d --no-build
   elif [[ -z "$mode" ]]; then
+    bootstrap_selected_router
+    ensure_hermes_router_model
+    ensure_chatops_plugin
     info "starting Hermes Control Plane with active router: $provider"
     "${COMPOSE[@]}" "${args[@]}" up -d --build
   else
@@ -120,7 +562,25 @@ cmd_up() {
     fi
     sleep 1
   done
+  cmd_wait 90
   "${COMPOSE[@]}" ps
+}
+
+cmd_wait() {
+  need curl
+  load_env
+  local timeout="${1:-60}" elapsed=0
+  info "waiting for Control Plane and Kubernetes Broker health"
+  while (( elapsed < timeout )); do
+    if curl -fsS "http://${CONTROL_PLANE_BIND_IP:-127.0.0.1}:${CONTROL_PLANE_PORT:-8800}/health" >/dev/null 2>&1 \
+       && curl -fsS "http://${KUBERNETES_BROKER_BIND_IP:-127.0.0.1}:${KUBERNETES_BROKER_PORT:-8830}/health" >/dev/null 2>&1; then
+      echo "Control Plane and Kubernetes Broker are ready."
+      return 0
+    fi
+    sleep 1
+    elapsed=$((elapsed+1))
+  done
+  fail "services did not become healthy within ${timeout}s"
 }
 
 cmd_down() {
@@ -138,6 +598,8 @@ cmd_status() {
   echo
   curl -fsS "http://${ROUTER_GATEWAY_BIND_IP:-127.0.0.1}:${ROUTER_GATEWAY_PORT:-8790}/health" 2>/dev/null || true
   echo
+  curl -fsS "http://${KUBERNETES_BROKER_BIND_IP:-127.0.0.1}:${KUBERNETES_BROKER_PORT:-8830}/health" 2>/dev/null || true
+  echo
 }
 
 cmd_router_list() {
@@ -146,6 +608,308 @@ cmd_router_list() {
   curl -fsS \
     -H "Authorization: Bearer ${ROUTER_GATEWAY_ADMIN_TOKEN}" \
     "http://${ROUTER_GATEWAY_BIND_IP:-127.0.0.1}:${ROUTER_GATEWAY_PORT:-8790}/management/providers" | python3 -m json.tool
+}
+
+cmd_router_probe() {
+  need curl
+  load_env
+  local failed=0 code provider both
+  provider="${HERMES_ROUTER_PROVIDER:-nine-router}"
+  both="${HERMES_ENABLE_BOTH_ROUTERS:-false}"
+
+  code="$(curl -sS -o /dev/null -w '%{http_code}' \
+    -H "Authorization: Bearer ${SMART_ROUTER_CLIENT_API_KEY}" \
+    "http://${SMART_ROUTER_BIND_IP:-127.0.0.1}:${SMART_ROUTER_PORT:-8787}/dashboard/api/summary?hours=1" \
+    2>/dev/null || true)"
+  if [[ "$code" == "200" ]]; then
+    echo "[ok] Smart Router client authentication"
+  else
+    echo "[fail] Smart Router client authentication: HTTP ${code:-unreachable}"
+    failed=1
+  fi
+
+  code="$(curl -sS -o /dev/null -w '%{http_code}' \
+    -H "Authorization: Bearer ${ROUTER_GATEWAY_ADMIN_TOKEN}" \
+    "http://${ROUTER_GATEWAY_BIND_IP:-127.0.0.1}:${ROUTER_GATEWAY_PORT:-8790}/management/providers" \
+    2>/dev/null || true)"
+  if [[ "$code" == "200" ]]; then
+    echo "[ok] Router Gateway management API"
+  else
+    echo "[fail] Router Gateway management API: HTTP ${code:-unreachable}"
+    failed=1
+  fi
+
+  if [[ "$provider" == "nine-router" || "$both" == "true" ]]; then
+    if nine_router_key_valid "${NINE_ROUTER_UPSTREAM_API_KEY:-}"; then
+      echo "[ok] 9router managed API key"
+    else
+      echo "[fail] 9router managed API key"
+      failed=1
+    fi
+  fi
+
+  if [[ "$provider" == "omniroute" || "$both" == "true" ]]; then
+    if omniroute_key_valid "${OMNIROUTE_UPSTREAM_API_KEY:-}"; then
+      echo "[ok] OmniRoute managed API key"
+    else
+      echo "[fail] OmniRoute managed API key"
+      failed=1
+    fi
+  fi
+
+  code="$(curl -sS --compressed -o /dev/null -w '%{http_code}' \
+    -H "Authorization: Bearer ${SMART_ROUTER_CLIENT_API_KEY}" \
+    "http://${SMART_ROUTER_BIND_IP:-127.0.0.1}:${SMART_ROUTER_PORT:-8787}/v1/models" \
+    2>/dev/null || true)"
+  if [[ "$code" == "200" ]]; then
+    echo "[ok] end-to-end model route via ${provider}"
+  else
+    echo "[fail] end-to-end model route via ${provider}: HTTP ${code:-unreachable}"
+    failed=1
+  fi
+
+  return "$failed"
+}
+
+managed_key_stale_ids() {
+  # Args: provider current_key managed_name key-list-json
+  # Prints stale IDs only. Never prints raw key material.
+  python3 - "$@" <<'PYCLEAN'
+import json, sys
+
+provider, current, managed, path = sys.argv[1:5]
+data = json.load(open(path))
+keys = data.get("keys", data if isinstance(data, list) else [])
+if not isinstance(keys, list):
+    raise SystemExit(3)
+
+same = [k for k in keys if isinstance(k, dict) and k.get("name") == managed]
+if len(same) <= 1:
+    raise SystemExit(0)
+
+def matches_current(k):
+    raw = k.get("key")
+    if not isinstance(raw, str):
+        return False
+    if provider == "nine-router":
+        return raw == current
+    # OmniRoute deliberately masks keys in management responses:
+    # first 8 chars + **** + last 4 chars.
+    return len(current) >= 12 and raw.startswith(current[:8]) and raw.endswith(current[-4:])
+
+keepers = [k for k in same if matches_current(k)]
+if len(keepers) != 1:
+    # Safety first: if the active key cannot be identified unambiguously, do
+    # not delete anything.
+    raise SystemExit(4)
+
+keep_id = str(keepers[0].get("id", ""))
+if not keep_id:
+    raise SystemExit(5)
+
+for k in same:
+    kid = str(k.get("id", ""))
+    if kid and kid != keep_id:
+        print(kid)
+PYCLEAN
+}
+
+cleanup_nine_router_duplicate_keys() {
+  need curl; need python3
+  load_env
+  [[ -n "${NINE_ROUTER_UPSTREAM_API_KEY:-}" ]] || {
+    echo "[ok] no managed 9router key configured; nothing to clean"
+    return 0
+  }
+  wait_nine_router 75 || fail "9router did not become ready for duplicate-key cleanup"
+  nine_router_key_valid "${NINE_ROUTER_UPSTREAM_API_KEY}" \
+    || fail "current 9router managed key is not valid; refusing duplicate cleanup"
+
+  local tmpdir cookie login_json keys_json code base name stale_file
+  tmpdir="$(mktemp -d)"; chmod 700 "$tmpdir"
+  cookie="$tmpdir/cookies"; login_json="$tmpdir/login.json"
+  keys_json="$tmpdir/keys.json"; stale_file="$tmpdir/stale"
+  base="$(nine_router_host_url)"
+  name="${NINEROUTER_MANAGED_API_KEY_NAME:-hermes-control-plane-router-gateway}"
+
+  code="$(
+    python3 - "${NINEROUTER_INITIAL_PASSWORD}" <<'PYLOGIN' |
+import json, sys
+print(json.dumps({"password": sys.argv[1]}))
+PYLOGIN
+    curl -sS -c "$cookie" -o "$login_json" -w '%{http_code}' \
+      -H 'Content-Type: application/json' --data-binary @- \
+      "${base}/api/auth/login" || true
+  )"
+  if [[ "$code" != "200" ]]; then
+    rm -rf "$tmpdir"
+    fail "9router management login failed; duplicate cleanup aborted without deleting keys"
+  fi
+
+  code="$(curl -sS -b "$cookie" -o "$keys_json" -w '%{http_code}' \
+    "${base}/api/keys" || true)"
+  if [[ "$code" != "200" ]]; then
+    rm -rf "$tmpdir"
+    fail "9router key listing failed with HTTP ${code:-unreachable}"
+  fi
+
+  if ! managed_key_stale_ids nine-router "${NINE_ROUTER_UPSTREAM_API_KEY}" "$name" "$keys_json" >"$stale_file"; then
+    rc=$?
+    rm -rf "$tmpdir"
+    if [[ "$rc" == "4" ]]; then
+      fail "could not identify the current 9router key unambiguously; no duplicate keys were deleted"
+    fi
+    fail "could not reconcile 9router managed keys; no keys were deleted"
+  fi
+
+  local count=0 id delcode
+  while IFS= read -r id; do
+    [[ -n "$id" ]] || continue
+    delcode="$(curl -sS -b "$cookie" -o /dev/null -w '%{http_code}' \
+      -X DELETE "${base}/api/keys/${id}" || true)"
+    if [[ "$delcode" == "200" ]]; then
+      count=$((count+1))
+    else
+      rm -rf "$tmpdir"
+      fail "9router duplicate-key deletion failed with HTTP ${delcode:-unreachable}"
+    fi
+  done <"$stale_file"
+  rm -rf "$tmpdir"
+  echo "[ok] 9router managed-key reconciliation complete; removed ${count} stale duplicate(s)"
+}
+
+cleanup_omniroute_duplicate_keys() {
+  need curl; need python3
+  load_env
+  [[ -n "${OMNIROUTE_UPSTREAM_API_KEY:-}" ]] || {
+    echo "[ok] no managed OmniRoute key configured; nothing to clean"
+    return 0
+  }
+  wait_omniroute 90 || fail "OmniRoute did not become ready for duplicate-key cleanup"
+  omniroute_key_valid "${OMNIROUTE_UPSTREAM_API_KEY}" \
+    || fail "current OmniRoute managed key is not valid; refusing duplicate cleanup"
+
+  local tmpdir cookie login_json keys_json code base name stale_file
+  tmpdir="$(mktemp -d)"; chmod 700 "$tmpdir"
+  cookie="$tmpdir/cookies"; login_json="$tmpdir/login.json"
+  keys_json="$tmpdir/keys.json"; stale_file="$tmpdir/stale"
+  base="$(omniroute_host_url)"
+  name="${OMNIROUTE_MANAGED_API_KEY_NAME:-hermes-control-plane-router-gateway}"
+
+  code="$(
+    python3 - "${OMNIROUTE_INITIAL_PASSWORD}" <<'PYLOGIN' |
+import json, sys
+print(json.dumps({"password": sys.argv[1]}))
+PYLOGIN
+    curl -sS -c "$cookie" -o "$login_json" -w '%{http_code}' \
+      -H 'Content-Type: application/json' --data-binary @- \
+      "${base}/api/auth/login" || true
+  )"
+  if [[ "$code" != "200" ]]; then
+    rm -rf "$tmpdir"
+    fail "OmniRoute management login failed; duplicate cleanup aborted without deleting keys"
+  fi
+
+  code="$(curl -sS -b "$cookie" -o "$keys_json" -w '%{http_code}' \
+    "${base}/api/keys" || true)"
+  if [[ "$code" != "200" ]]; then
+    rm -rf "$tmpdir"
+    fail "OmniRoute key listing failed with HTTP ${code:-unreachable}"
+  fi
+
+  if ! managed_key_stale_ids omniroute "${OMNIROUTE_UPSTREAM_API_KEY}" "$name" "$keys_json" >"$stale_file"; then
+    rc=$?
+    rm -rf "$tmpdir"
+    if [[ "$rc" == "4" ]]; then
+      fail "could not identify the current OmniRoute key unambiguously; no duplicate keys were deleted"
+    fi
+    fail "could not reconcile OmniRoute managed keys; no keys were deleted"
+  fi
+
+  local count=0 id delcode
+  while IFS= read -r id; do
+    [[ -n "$id" ]] || continue
+    delcode="$(curl -sS -b "$cookie" -o /dev/null -w '%{http_code}' \
+      -X DELETE "${base}/api/keys/${id}" || true)"
+    if [[ "$delcode" == "200" ]]; then
+      count=$((count+1))
+    else
+      rm -rf "$tmpdir"
+      fail "OmniRoute duplicate-key deletion failed with HTTP ${delcode:-unreachable}"
+    fi
+  done <"$stale_file"
+  rm -rf "$tmpdir"
+  echo "[ok] OmniRoute managed-key reconciliation complete; removed ${count} stale duplicate(s)"
+}
+
+cmd_router_cleanup_keys() {
+  need docker
+  local provider="${1:-all}"
+  load_env
+
+  case "$provider" in
+    nine-router)
+      "${COMPOSE[@]}" --profile nine-router up -d nine-router
+      wait_nine_router 75 || fail "9router did not become ready"
+      cleanup_nine_router_duplicate_keys
+      ;;
+    omniroute)
+      "${COMPOSE[@]}" --profile omniroute up -d omniroute
+      wait_omniroute 90 || fail "OmniRoute did not become ready"
+      cleanup_omniroute_duplicate_keys
+      ;;
+    all)
+      local active="${HERMES_ROUTER_PROVIDER:-nine-router}"
+      "${COMPOSE[@]}" --profile nine-router up -d nine-router
+      wait_nine_router 75 || fail "9router did not become ready"
+      cleanup_nine_router_duplicate_keys
+
+      "${COMPOSE[@]}" --profile omniroute up -d omniroute
+      wait_omniroute 90 || fail "OmniRoute did not become ready"
+      cleanup_omniroute_duplicate_keys
+
+      if [[ "${HERMES_ENABLE_BOTH_ROUTERS:-false}" != "true" ]]; then
+        if [[ "$active" == "nine-router" ]]; then
+          "${COMPOSE[@]}" --profile omniroute stop omniroute >/dev/null 2>&1 || true
+        else
+          "${COMPOSE[@]}" --profile nine-router stop nine-router >/dev/null 2>&1 || true
+        fi
+      fi
+      ;;
+    *)
+      fail "usage: ./hermesctl router cleanup-keys nine-router|omniroute|all"
+      ;;
+  esac
+}
+
+
+cmd_router_provision() {
+  need docker
+  local provider="${1:-${HERMES_ROUTER_PROVIDER:-nine-router}}"
+  [[ "$provider" == "nine-router" || "$provider" == "omniroute" ]] \
+    || fail "usage: ./hermesctl router provision nine-router|omniroute"
+  load_env
+
+  case "$provider" in
+    nine-router)
+      info "starting 9router for managed credential provisioning"
+      "${COMPOSE[@]}" --profile nine-router up -d nine-router
+      wait_nine_router 75 || fail "9router did not become ready after start"
+      ensure_nine_router_api_key
+      ;;
+    omniroute)
+      info "starting OmniRoute for managed credential provisioning"
+      "${COMPOSE[@]}" --profile omniroute up -d omniroute
+      wait_omniroute 90 || fail "OmniRoute did not become ready after start"
+      ensure_omniroute_api_key
+      ;;
+  esac
+
+  load_env
+  info "recreating Router Gateway and Smart Router with managed ${provider} credential"
+  "${COMPOSE[@]}" --profile "$provider" up -d --force-recreate router-gateway smart-router
+  sleep 5
+  cmd_router_probe
 }
 
 cmd_router_set() {
@@ -157,7 +921,20 @@ cmd_router_set() {
   set_env HERMES_ROUTER_PROVIDER "$provider"
   load_env
   info "starting provider $provider"
-  "${COMPOSE[@]}" --profile "$provider" up -d "$provider" router-gateway
+  case "$provider" in
+    nine-router)
+      "${COMPOSE[@]}" --profile nine-router up -d nine-router
+      wait_nine_router 75 || fail "9router did not become ready after start"
+      ensure_nine_router_api_key
+      ;;
+    omniroute)
+      "${COMPOSE[@]}" --profile omniroute up -d omniroute
+      wait_omniroute 90 || fail "OmniRoute did not become ready after start"
+      ensure_omniroute_api_key
+      ;;
+  esac
+  load_env
+  "${COMPOSE[@]}" --profile "$provider" up -d --force-recreate router-gateway
   for _ in $(seq 1 45); do
     if curl -fsS "http://${ROUTER_GATEWAY_BIND_IP:-127.0.0.1}:${ROUTER_GATEWAY_PORT:-8790}/health" >/dev/null 2>&1; then break; fi
     sleep 1
@@ -172,15 +949,300 @@ cmd_router_set() {
   fi
 }
 
+
+cmd_version() {
+  local action="${1:-show}" value="${2:-}"
+  [[ -f "$ENV_FILE" ]] || fail ".env does not exist; run ./hermesctl init"
+  case "$action" in
+    show|"")
+      local configured repo running
+      configured="$(grep '^VERSION=' "$ENV_FILE" | tail -1 | cut -d= -f2-)"
+      repo="$(cat "$ROOT/VERSION")"
+      running="$(curl -fsS "http://127.0.0.1:${CONTROL_PLANE_PORT:-8800}/health" 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("version","unknown"))' 2>/dev/null || true)"
+      echo "Repository: ${repo:-unknown}"
+      echo "Configured: ${configured:-unknown}"
+      echo "Running: ${running:-not-running}"
+      ;;
+    set)
+      [[ "$value" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]] || fail "invalid version: $value"
+      set_env VERSION "$value"
+      echo "Configured VERSION=$value"
+      ;;
+    *) fail "usage: ./hermesctl version [set <version>]" ;;
+  esac
+}
+
+cmd_upgrade() {
+  need docker
+  local target="${1:-}"
+  [[ -n "$target" ]] || fail "usage: ./hermesctl upgrade <version>"
+  [[ "$target" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]] || fail "invalid version: $target"
+  load_env
+  local old="${VERSION:-}"
+  local ns="${IMAGE_NAMESPACE:-afsharidevops}"
+  info "verifying published release images for $target"
+  docker buildx imagetools inspect "$ns/hermes-control-plane-api:$target" >/dev/null || fail "API image tag not found"
+  docker buildx imagetools inspect "$ns/hermes-control-plane-kubernetes-broker:$target" >/dev/null || fail "Kubernetes Broker image tag not found"
+  mkdir -p "$ROOT/backups"
+  if "${COMPOSE[@]}" ps --status running --services | grep -qx control-plane; then
+    local stamp
+    stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+    "${COMPOSE[@]}" cp control-plane:/data/control-plane.sqlite3 "$ROOT/backups/control-plane-$stamp.sqlite3" >/dev/null 2>&1 || true
+  fi
+  set_env VERSION "$target"
+  if ! cmd_up --pull; then
+    echo "Upgrade failed; restoring configured version $old" >&2
+    set_env VERSION "$old"
+    cmd_up --pull || true
+    return 1
+  fi
+  info "upgrade complete: $old -> $target"
+}
+
+cmd_kubeconfig_import() {
+  need curl; need python3; need sha256sum
+  local name="${1:-}" file="${2:-}"
+  [[ -n "$name" && -f "$file" ]] || fail "usage: ./hermesctl kubeconfig import <name> <file>"
+  load_env
+  local sha response id dest
+  sha="$(sha256sum "$file" | awk '{print $1}')"
+  response="$(python3 - "$name" "$sha" <<'PYJSON' | curl -fsS -X POST \
+      -H "Authorization: Bearer ${HERMES_CONTROL_ADMIN_TOKEN}" -H 'Content-Type: application/json' \
+      --data-binary @- "http://${CONTROL_PLANE_BIND_IP:-127.0.0.1}:${CONTROL_PLANE_PORT:-8800}/v1/credential-refs"
+import json,sys
+print(json.dumps({"name":sys.argv[1],"kind":"kubeconfig","provider":"local-file","metadata":{"storage":"local-kubeconfig","sha256":sys.argv[2]}}))
+PYJSON
+  )"
+  id="$(printf '%s' "$response" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')"
+  dest="$ROOT/data/kubeconfigs/${id}.yaml"
+  install -m 0600 "$file" "$dest"
+  python3 - "$sha" "$id" <<'PYJSON' | curl -fsS -X PATCH \
+      -H "Authorization: Bearer ${HERMES_CONTROL_ADMIN_TOKEN}" -H 'Content-Type: application/json' \
+      --data-binary @- "http://${CONTROL_PLANE_BIND_IP:-127.0.0.1}:${CONTROL_PLANE_PORT:-8800}/v1/credential-refs/$id" | python3 -m json.tool
+import json,sys
+print(json.dumps({"metadata":{"storage":"local-kubeconfig","sha256":sys.argv[1],"file":sys.argv[2]+".yaml"}}))
+PYJSON
+  echo "Stored kubeconfig material at $dest (mode 0600). The Control Plane stores only its reference/fingerprint."
+}
+
+cmd_kubeconfig_list() {
+  need curl; need python3
+  load_env
+  curl -fsS "http://${CONTROL_PLANE_BIND_IP:-127.0.0.1}:${CONTROL_PLANE_PORT:-8800}/v1/credential-refs" | python3 -c 'import json,sys; print(json.dumps([x for x in json.load(sys.stdin) if x.get("kind")=="kubeconfig"], indent=2))'
+}
+
+cmd_kubeconfig_remove() {
+  need curl
+  local id="${1:-}"
+  [[ "$id" =~ ^cred_[0-9a-f]{16}$ ]] || fail "usage: ./hermesctl kubeconfig remove <credential-id>"
+  load_env
+  curl -fsS -X DELETE -H "Authorization: Bearer ${HERMES_CONTROL_ADMIN_TOKEN}" "http://${CONTROL_PLANE_BIND_IP:-127.0.0.1}:${CONTROL_PLANE_PORT:-8800}/v1/credential-refs/$id"
+  rm -f "$ROOT/data/kubeconfigs/$id.yaml"
+  echo "Removed $id"
+}
+
+cmd_execution() {
+  need docker
+  local action="${1:-status}"
+  load_env
+  case "$action" in
+    status)
+      echo "HERMES_EXECUTION_ENABLED=${HERMES_EXECUTION_ENABLED:-false}"
+      echo "HERMES_KUBERNETES_EXECUTION_ENABLED=${HERMES_KUBERNETES_EXECUTION_ENABLED:-false}"
+      ;;
+    enable|disable)
+      local value=false
+      [[ "$action" == "enable" ]] && value=true
+      set_env HERMES_EXECUTION_ENABLED "$value"
+      set_env HERMES_KUBERNETES_EXECUTION_ENABLED "$value"
+      load_env
+      info "execution ${action}d; recreating Control Plane and Kubernetes Broker"
+      "${COMPOSE[@]}" up -d --force-recreate control-plane kubernetes-broker
+      cmd_wait 90
+      cmd_execution status
+      ;;
+    *) fail "usage: ./hermesctl execution enable|disable|status" ;;
+  esac
+}
+
+cmd_bot() {
+  need python3
+  local action="${1:-status}" value="${2:-}"
+  load_env
+  case "$action" in
+    status)
+      [[ -n "${HERMES_BOT_SERVICE_TOKEN:-}" && "${HERMES_BOT_SERVICE_TOKEN:-}" != "CHANGE_ME" ]] && echo "Hermes Bot service identity: configured" || echo "Hermes Bot service identity: missing"
+      [[ -n "${HERMES_APPROVAL_BOT_TOKEN:-}" && "${HERMES_APPROVAL_BOT_TOKEN:-}" != "CHANGE_ME" ]] && echo "Approval Bot service identity: configured" || echo "Approval Bot service identity: missing"
+      [[ -n "${TELEGRAM_BOT_TOKEN:-}" ]] && echo "Hermes Telegram gateway token: configured" || echo "Hermes Telegram gateway token: missing"
+      echo "Telegram gateway users: ${TELEGRAM_ALLOWED_USERS:-<none>}"
+      echo "Telegram mutation users: ${HERMES_CONTROL_PLANE_BOT_USERS:-<none>}"
+      ;;
+    allow)
+      [[ "$value" =~ ^[0-9]+$ ]] || fail "usage: ./hermesctl bot allow <numeric-telegram-user-id>"
+      local mutation_users telegram_users
+      mutation_users="$(python3 - "${HERMES_CONTROL_PLANE_BOT_USERS:-}" "$value" <<'PYBOT'
+import sys
+existing=[x.strip() for x in sys.argv[1].replace(',', '\n').splitlines() if x.strip().isdigit()]
+value=sys.argv[2]
+if value not in existing:
+    existing.append(value)
+print(','.join(existing))
+PYBOT
+)"
+      telegram_users="$(python3 - "${TELEGRAM_ALLOWED_USERS:-}" "$mutation_users" <<'PYBOT'
+import sys
+out=[]
+for raw in sys.argv[1:]:
+    for item in raw.replace(',', '\n').splitlines():
+        item=item.strip()
+        if item.isdigit() and item not in out:
+            out.append(item)
+print(','.join(out))
+PYBOT
+)"
+      set_env HERMES_CONTROL_PLANE_BOT_USERS "$mutation_users"
+      set_env TELEGRAM_ALLOWED_USERS "$telegram_users"
+      echo "Allowed Telegram user $value for Hermes Control Plane mutation requests."
+      echo "The user is also allowed through the Hermes Telegram gateway."
+      ;;
+    telegram)
+      local token
+      printf 'Telegram bot token (input hidden): ' >&2
+      IFS= read -r -s token
+      printf '\n' >&2
+      [[ "$token" =~ ^[0-9]+:[A-Za-z0-9_-]{20,}$ ]] || fail "Telegram bot token format does not look valid"
+      set_env TELEGRAM_BOT_TOKEN "$token"
+      load_env
+      echo "Hermes Telegram gateway token saved to local .env."
+      if command -v docker >/dev/null 2>&1; then
+        ensure_hermes_router_model
+        ensure_chatops_plugin
+        if "${COMPOSE[@]}" --profile hermes ps --status running --services 2>/dev/null | grep -qx hermes; then
+          info "recreating Hermes so Telegram/plugin configuration is loaded"
+          "${COMPOSE[@]}" --profile hermes up -d --force-recreate hermes
+        fi
+      fi
+      ;;
+    model-sync)
+      ensure_hermes_router_model
+      if "${COMPOSE[@]}" --profile hermes ps --status running --services 2>/dev/null | grep -qx hermes; then
+        info "recreating Hermes with synchronized Smart Router model configuration"
+        "${COMPOSE[@]}" --profile hermes up -d --force-recreate hermes
+      fi
+      ;;
+    check)
+      need docker
+      echo "Local bot configuration:"
+      cmd_bot status
+      echo
+      echo "Runtime ChatOps plugin:"
+      if ! "${COMPOSE[@]}" --profile hermes ps --status running --services | grep -qx hermes; then
+        echo "[warn] Hermes container is not running"
+        return 0
+      fi
+      if "${COMPOSE[@]}" --profile hermes exec -T hermes sh -lc \
+          'test -f /opt/data/plugins/control-plane-chatops/plugin.yaml'; then
+        echo "[ok] plugin mounted at /opt/data/plugins/control-plane-chatops"
+      else
+        echo "[fail] control-plane-chatops plugin mount missing"
+        return 1
+      fi
+      local plugin_line
+      plugin_line="$(hermes_cli_run plugins list --plain --no-bundled 2>&1 | grep -i "control-plane-chatops" | head -1 || true)"
+      if [[ -n "$plugin_line" ]]; then
+        echo "[ok] plugin discovered: control-plane-chatops"
+      else
+        echo "[fail] plugin is mounted but Hermes does not discover it"
+        return 1
+      fi
+      local model_summary
+      model_summary="$("${COMPOSE[@]}" --profile hermes exec -T hermes /opt/hermes/.venv/bin/python - <<'PYMODELCHK'
+from pathlib import Path
+import yaml
+data=yaml.safe_load(Path('/opt/data/config.yaml').read_text()) or {}
+m=data.get('model') if isinstance(data,dict) else {}
+print(f"{m.get('provider','')}|{m.get('default','')}|{m.get('base_url','')}|{m.get('api_mode','')}" if isinstance(m,dict) else 'invalid')
+PYMODELCHK
+)"
+      if [[ "$model_summary" == "custom|auto|http://smart-router:8080/v1|chat_completions" ]]; then
+        echo "[ok] Hermes main model routed through Smart Router with model=auto"
+      else
+        echo "[warn] Hermes model configuration not synchronized; fixing it"
+        ensure_hermes_router_model
+      fi
+      if grep -qE '^[[:space:]]*-[[:space:]]*control-plane-chatops[[:space:]]*$' <(
+          "${COMPOSE[@]}" --profile hermes exec -T hermes sh -lc \
+            "sed -n '/^plugins:/,/^[^[:space:]]/p' /opt/data/config.yaml 2>/dev/null" || true
+        ); then
+        echo "[ok] plugin is present in plugins.enabled"
+      else
+        echo "[warn] could not prove plugin enabled from config.yaml; re-running enable"
+        ensure_chatops_plugin
+      fi
+      ;;
+    *) fail "usage: ./hermesctl bot allow <telegram-user-id>|telegram|model-sync|status|check" ;;
+  esac
+}
+
 cmd_doctor() {
   need python3
   echo "Hermes Control Plane doctor"
   echo "Version: $(cat "$ROOT/VERSION")"
+  local file_version file_ns
+  file_version="$(grep '^VERSION=' "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2- || true)"
+  file_ns="$(grep '^IMAGE_NAMESPACE=' "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2- || true)"
+  if [[ -n "$SHELL_VERSION_OVERRIDE" && "$SHELL_VERSION_OVERRIDE" != "$file_version" ]]; then echo "[warn] shell VERSION=$SHELL_VERSION_OVERRIDE differs from .env VERSION=$file_version"; fi
+  if [[ -n "$SHELL_NAMESPACE_OVERRIDE" && "$SHELL_NAMESPACE_OVERRIDE" != "$file_ns" ]]; then echo "[warn] shell IMAGE_NAMESPACE=$SHELL_NAMESPACE_OVERRIDE differs from .env IMAGE_NAMESPACE=$file_ns"; fi
   for c in docker curl openssl python3; do
     if command -v "$c" >/dev/null 2>&1; then echo "[ok] $c"; else echo "[missing] $c"; fi
   done
   if command -v docker >/dev/null 2>&1 && [[ -f "$ENV_FILE" ]]; then
     if "${COMPOSE[@]}" config >/dev/null; then echo "[ok] docker compose config"; else echo "[fail] docker compose config"; fi
+    load_env
+    local host_uid host_gid broker_uid broker_gid
+    host_uid="$(id -u)"; host_gid="$(id -g)"
+    broker_uid="${HERMES_KUBERNETES_BROKER_UID:-}"
+    broker_gid="${HERMES_KUBERNETES_BROKER_GID:-}"
+    if [[ "$broker_uid" == "$host_uid" && "$broker_gid" == "$host_gid" ]]; then
+      echo "[ok] Kubernetes Broker UID/GID matches local kubeconfig owner (${host_uid}:${host_gid})"
+    else
+      echo "[warn] Kubernetes Broker UID/GID=${broker_uid:-unset}:${broker_gid:-unset}; local operator=${host_uid}:${host_gid}; run ./hermesctl init"
+    fi
+    if [[ -n "${TELEGRAM_BOT_TOKEN:-}" ]]; then
+      echo "[ok] Hermes Telegram gateway token configured"
+    else
+      echo "[warn] Hermes Telegram gateway token missing; run ./hermesctl bot telegram"
+    fi
+    if [[ -n "${HERMES_CONTROL_PLANE_BOT_USERS:-}" && -n "${TELEGRAM_ALLOWED_USERS:-}" ]]; then
+      echo "[ok] Telegram/Control Plane bot allowlists configured"
+    else
+      echo "[warn] Telegram bot allowlist incomplete; run ./hermesctl bot allow <numeric-id>"
+    fi
+    if [[ -n "${SMART_ROUTER_CLIENT_API_KEY:-}" ]]; then
+      echo "[ok] Smart Router stack client credential configured"
+    else
+      echo "[fail] SMART_ROUTER_CLIENT_API_KEY missing"
+    fi
+    if [[ "${NINEROUTER_AUTO_PROVISION_API_KEY:-true}" == "true" ]]; then
+      echo "[ok] 9router API-key auto-provisioning enabled"
+    else
+      echo "[warn] 9router API-key auto-provisioning disabled"
+    fi
+    if [[ -n "${NINE_ROUTER_UPSTREAM_API_KEY:-}" ]]; then
+      echo "[ok] managed 9router Router Gateway credential present"
+    else
+      echo "[info] managed 9router credential will be created automatically when 9router is enabled"
+    fi
+    if [[ "${OMNIROUTE_AUTO_PROVISION_API_KEY:-true}" == "true" ]]; then
+      echo "[ok] OmniRoute API-key auto-provisioning enabled"
+    else
+      echo "[warn] OmniRoute API-key auto-provisioning disabled"
+    fi
+    if [[ -n "${OMNIROUTE_UPSTREAM_API_KEY:-}" ]]; then
+      echo "[ok] managed OmniRoute Router Gateway credential present"
+    else
+      echo "[info] managed OmniRoute credential will be created automatically when OmniRoute is enabled"
+    fi
   fi
 }
 
@@ -194,10 +1256,26 @@ Commands:
   up --pull                    Pull published images and start without local builds
   down                         Stop the stack
   status                       Show Compose and service health
+  wait [seconds]               Wait until Control Plane and Kubernetes Broker are ready
+  execution enable|disable     Toggle mutation execution and wait for readiness
+  execution status             Show execution gates
+  bot allow <telegram-id>      Allow a numeric Telegram user to request bot-only mutations
+  bot telegram                 Configure Telegram bot token with hidden input
+  bot model-sync               Route Hermes main model through internal Smart Router
+  bot status                   Show bot/gateway configuration status (never tokens)
+  bot check                    Check ChatOps plugin + Smart Router model wiring
   doctor                       Check local prerequisites/config
   router list                  Show configured router health and active provider
+  router provision <provider>  Provision/repair dedicated router API key automatically
+  router probe                 Verify every router authentication/routing hop
   router set nine-router       Start/select 9router
   router set omniroute         Start/select OmniRoute
+  version                      Show repository/configured/running versions
+  version set <version>        Set .env VERSION explicitly
+  upgrade <version>            Verify, backup, pull and upgrade a published release
+  kubeconfig import <n> <file> Import kubeconfig material locally and create a reference
+  kubeconfig list              List kubeconfig credential references
+  kubeconfig remove <id>       Remove unused kubeconfig reference and local material
 TXT
 }
 
@@ -206,10 +1284,26 @@ case "${1:-}" in
   up) cmd_up "${2:-}" ;;
   down) cmd_down ;;
   status) cmd_status ;;
+  wait) cmd_wait "${2:-60}" ;;
+  execution) cmd_execution "${2:-status}" ;;
+  bot) cmd_bot "${2:-status}" "${3:-}" ;;
   doctor) cmd_doctor ;;
+  version) cmd_version "${2:-show}" "${3:-}" ;;
+  upgrade) cmd_upgrade "${2:-}" ;;
+  kubeconfig)
+    case "${2:-}" in
+      import) cmd_kubeconfig_import "${3:-}" "${4:-}" ;;
+      list) cmd_kubeconfig_list ;;
+      remove) cmd_kubeconfig_remove "${3:-}" ;;
+      *) usage; exit 2 ;;
+    esac
+    ;;
   router)
     case "${2:-}" in
       list) cmd_router_list ;;
+      provision) cmd_router_provision "${3:-${HERMES_ROUTER_PROVIDER:-nine-router}}" ;;
+      cleanup-keys) cmd_router_cleanup_keys "${3:-all}" ;;
+      probe) cmd_router_probe ;;
       set) cmd_router_set "${3:-}" ;;
       *) usage; exit 2 ;;
     esac

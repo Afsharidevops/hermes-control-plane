@@ -2,13 +2,13 @@
 
 **Target:** `0.5.10`
 
-**Current development release:** `0.5.10-alpha.2`
+**Current development release:** `0.5.10-beta.1`
 
 **Project:** `hermes-control-plane`
 
 ## 1. Vision
 
-Hermes Control Plane evolves the Hermes Linux Stack into a self-hosted AI-assisted DevOps control plane. Operators should be able to manage infrastructure from the Operations Center UI, Telegram ChatOps, API, and CLI while keeping credentials and privileged execution outside the LLM trust boundary.
+Hermes Control Plane evolves the Hermes Linux Stack into a self-hosted AI-assisted DevOps control plane. The Operations Center UI configures and observes infrastructure; Kubernetes/Helm and future privileged infrastructure mutations originate from Hermes Bot, with HIGH/CRITICAL approval delegated to a separate Approval Bot identity. Credentials and privileged execution remain outside the LLM trust boundary.
 
 The platform must run in either of two forms without changing the product model:
 
@@ -608,15 +608,23 @@ The roadmap is intentionally compressed so development can move faster while pre
 - migration/backfill from the alpha.1 SQLite schema
 - privileged execution remains disabled
 
-### 0.5.10-beta.1 — feature-complete DevOps adapters
+### 0.5.10-beta.1 — feature-complete DevOps adapters (in progress)
 
-Kubernetes + Helm:
-- direct kubeconfig connection through the credential boundary
-- agent Kubernetes connection
-- Kubernetes discovery
-- manifest server dry-run/diff/apply
-- Helm plan/install/upgrade/rollback
-- namespace/resource policy
+Kubernetes + Helm dev.1 implemented:
+- Docker/VM direct kubeconfig reference + fingerprint boundary
+- Kubernetes Broker isolated from Smart Router
+- Kubernetes discovery without Secret reads
+- manifest server dry-run/diff and guarded apply
+- Helm install/upgrade server dry-run and guarded execution
+- Helm rollback planning/execution
+- target snapshot drift invalidation
+- signed short-lived execution tickets
+- conservative manifest resource safety floor
+
+Remaining Kubernetes + Helm beta work:
+- production credential service / external secret backend
+- agent Kubernetes connection and enrollment
+- richer namespace/resource policy and rollout rollback metadata
 
 Git + applications:
 - GitHub integration

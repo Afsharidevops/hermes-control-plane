@@ -87,7 +87,7 @@ class ChangeSetCreate(StrictModel):
     adapter: str = Field(min_length=1, max_length=80)
     target_id: str = Field(min_length=1, max_length=160)
     requested_by: str = Field(min_length=1, max_length=160)
-    source_channel: Literal["ui", "telegram", "api", "cli"] = "api"
+    source_channel: Literal["ui", "telegram", "hermes-bot", "api", "cli"] = "api"
     source_revision: str | None = Field(default=None, max_length=256)
     parameters: dict[str, Any] = Field(default_factory=dict)
     policy_generation: int = Field(default=1, ge=1)
@@ -108,3 +108,14 @@ class ApprovalDecision(StrictModel):
 class RejectDecision(StrictModel):
     actor: str = Field(min_length=1, max_length=160)
     reason: str | None = Field(default=None, max_length=1000)
+
+
+class ExecuteDecision(StrictModel):
+    actor: str = Field(min_length=1, max_length=160)
+
+
+
+class RollbackPlanCreate(StrictModel):
+    requested_by: str = Field(min_length=1, max_length=160)
+    source_channel: Literal["ui", "telegram", "hermes-bot", "api", "cli"] = "api"
+    ttl_seconds: int = Field(default=900, ge=60, le=86400)

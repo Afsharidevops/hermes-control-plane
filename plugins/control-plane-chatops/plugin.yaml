@@ -1,0 +1,13 @@
+name: control-plane-chatops
+version: 0.1.0
+description: "Bot-only Kubernetes and Helm ChangeSet planning/execution through Hermes Control Plane. No infrastructure credentials are exposed to Hermes. Approval is performed by a separate approval identity."
+author: hermes-control-plane
+kind: standalone
+provides_tools:
+  - hcp_list_targets
+  - hcp_get_changeset
+  - hcp_plan_kubernetes
+  - hcp_plan_helm
+  - hcp_request_approval
+  - hcp_execute_changeset
+  - hcp_plan_rollback

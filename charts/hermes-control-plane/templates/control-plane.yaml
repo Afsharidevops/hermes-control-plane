@@ -27,6 +27,12 @@ spec:
             - {name: HERMES_RUNTIME, value: kubernetes}
             - name: HERMES_CONTROL_ADMIN_TOKEN
               valueFrom: {secretKeyRef: {name: {{ include "hermes.secretName" . }}, key: control-admin-token}}
+            - {name: HERMES_KUBERNETES_BROKER_URL, value: http://{{ include "hermes.fullname" . }}-kubernetes-broker:{{ .Values.kubernetesBroker.service.port }} }
+            - name: HERMES_KUBERNETES_BROKER_TOKEN
+              valueFrom: {secretKeyRef: {name: {{ include "hermes.secretName" . }}, key: kubernetes-broker-token}}
+            - name: HERMES_EXECUTION_HMAC_KEY
+              valueFrom: {secretKeyRef: {name: {{ include "hermes.secretName" . }}, key: execution-hmac-key}}
+            - {name: HERMES_EXECUTION_ENABLED, value: {{ .Values.controlPlane.executionEnabled | quote }}}
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

@@ -1,7 +1,7 @@
 name: validate
 on:
   push:
-    branches: [main]
+    branches: [main, 'dev/**']
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -19,19 +19,49 @@ jobs:
           python-version: '3.12'
 
       - name: Compile Python services
-        run: python -m compileall -q control-plane/src router-gateway/src node-agent/src
+        run: python -m compileall -q control-plane/src router-gateway/src node-agent/src kubernetes-broker/src
 
-      - name: Test Control Plane alpha.2 safety core
+      - name: Test Control Plane safety core and beta Kubernetes flow
         run: |
           python -m pip install --upgrade pip
           pip install -r control-plane/requirements-dev.txt
+          pip install -r kubernetes-broker/requirements-dev.txt
           PYTHONPATH=control-plane/src pytest -q control-plane/tests
+          PYTHONPATH=kubernetes-broker/src pytest -q kubernetes-broker/tests
 
-      - name: Validate Compose
+      - name: Validate Compose and bot wiring
         run: |
           cp .env.example .env
           sed -i 's/CHANGE_ME/0123456789abcdef0123456789abcdef0123456789abcdef/g' .env
           docker compose --env-file .env config >/dev/null
+          python - <<'PY'
+          from pathlib import Path
+          compose = Path("docker-compose.yml").read_text()
+          ctl = Path("hermesctl").read_text()
+          required = [
+              "./plugins/control-plane-chatops:/opt/data/plugins/control-plane-chatops:ro",
+              "TELEGRAM_BOT_TOKEN:",
+              "TELEGRAM_ALLOWED_USERS:",
+              "OPENAI_BASE_URL: http://smart-router:8080/v1",
+              "OPENAI_API_KEY: ${SMART_ROUTER_CLIENT_API_KEY}",
+              "HERMES_MODEL:",
+          ]
+          for item in required:
+              assert item in compose, item
+          assert "plugins enable control-plane-chatops" in ctl
+          assert "--entrypoint /opt/hermes/.venv/bin/hermes" in ctl
+          assert "ensure_nine_router_api_key" in ctl
+          assert "nine_router_key_http_status" in ctl
+          assert "omniroute_key_http_status" in ctl
+          assert "cmd_router_cleanup_keys" in ctl
+          assert "ensure_omniroute_api_key" in ctl
+          assert "omniroute_key_valid" in ctl
+          assert "/api/auth/login" in ctl
+          assert "/api/keys" in ctl
+          assert "OMNIROUTE_UPSTREAM_API_KEY" in compose
+          assert "HERMES_KUBERNETES_BROKER_UID" in compose
+          print("bot/credential wiring: ok")
+          PY
 
       - name: Helm lint
         uses: azure/setup-helm@v4

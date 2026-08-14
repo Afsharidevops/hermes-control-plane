@@ -1,0 +1,65 @@
+{{- if .Values.kubernetesBroker.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "hermes.fullname" . }}-kubernetes-broker
+  labels: {{- include "hermes.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: kubernetes-broker
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/component: kubernetes-broker
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      automountServiceAccountToken: {{ .Values.kubernetesBroker.inCluster.automountServiceAccountToken }}
+      securityContext:
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: kubernetes-broker
+          image: "{{ .Values.imageNamespace }}/hermes-control-plane-kubernetes-broker:{{ .Values.imageTag }}"
+          imagePullPolicy: {{ .Values.imagePullPolicy }}
+          ports: [{name: http, containerPort: 8830}]
+          env:
+            - name: HERMES_KUBERNETES_BROKER_TOKEN
+              valueFrom: {secretKeyRef: {name: {{ include "hermes.secretName" . }}, key: kubernetes-broker-token}}
+            - name: HERMES_EXECUTION_HMAC_KEY
+              valueFrom: {secretKeyRef: {name: {{ include "hermes.secretName" . }}, key: execution-hmac-key}}
+            - {name: HERMES_KUBERNETES_EXECUTION_ENABLED, value: {{ .Values.kubernetesBroker.executionEnabled | quote }}}
+            - {name: HERMES_KUBERNETES_COMMAND_TIMEOUT, value: {{ .Values.kubernetesBroker.commandTimeout | quote }}}
+            - {name: HERMES_KUBECONFIG_ROOT, value: /credentials/kubeconfigs}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          volumeMounts:
+            - {name: tmp, mountPath: /tmp}
+            {{- if .Values.kubernetesBroker.kubeconfigSecret }}
+            - {name: kubeconfigs, mountPath: /credentials/kubeconfigs, readOnly: true}
+            {{- end }}
+          readinessProbe: {httpGet: {path: /health, port: http}, initialDelaySeconds: 3, periodSeconds: 10}
+      volumes:
+        - name: tmp
+          emptyDir: {medium: Memory, sizeLimit: 32Mi}
+        {{- if .Values.kubernetesBroker.kubeconfigSecret }}
+        - name: kubeconfigs
+          secret:
+            secretName: {{ .Values.kubernetesBroker.kubeconfigSecret }}
+            defaultMode: 0400
+        {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "hermes.fullname" . }}-kubernetes-broker
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/component: kubernetes-broker
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  ports: [{name: http, port: {{ .Values.kubernetesBroker.service.port }}, targetPort: http}]
+{{- end }}
