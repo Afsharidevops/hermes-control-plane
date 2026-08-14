@@ -1,7 +1,7 @@
 name: validate
 on:
   push:
-    branches: [main]
+    branches: [main, 'dev/**']
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -29,11 +29,26 @@ jobs:
           PYTHONPATH=control-plane/src pytest -q control-plane/tests
           PYTHONPATH=kubernetes-broker/src pytest -q kubernetes-broker/tests
 
-      - name: Validate Compose
+      - name: Validate Compose and bot wiring
         run: |
           cp .env.example .env
           sed -i 's/CHANGE_ME/0123456789abcdef0123456789abcdef0123456789abcdef/g' .env
           docker compose --env-file .env config >/dev/null
+          python - <<'PY'
+          from pathlib import Path
+          compose = Path("docker-compose.yml").read_text()
+          ctl = Path("hermesctl").read_text()
+          required = [
+              "./plugins/control-plane-chatops:/opt/data/plugins/control-plane-chatops:ro",
+              "TELEGRAM_BOT_TOKEN:",
+              "TELEGRAM_ALLOWED_USERS:",
+          ]
+          for item in required:
+              assert item in compose, item
+          assert "plugins enable control-plane-chatops" in ctl
+          assert "HERMES_KUBERNETES_BROKER_UID" in compose
+          print("bot/credential wiring: ok")
+          PY
 
       - name: Helm lint
         uses: azure/setup-helm@v4

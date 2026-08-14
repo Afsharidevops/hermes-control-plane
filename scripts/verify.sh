@@ -10,7 +10,23 @@ for f in ['plan.md','README.md','HANDOVER.md','docker-compose.yml','charts/herme
     p=root/f
     if not p.exists() or not p.read_text().strip():
         raise SystemExit(f'missing/empty: {p}')
+compose=(root/'docker-compose.yml').read_text()
+ctl=(root/'hermesctl').read_text()
+workflow=(root/'.github/workflows/validate.yml').read_text()
+for marker in [
+    './plugins/control-plane-chatops:/opt/data/plugins/control-plane-chatops:ro',
+    'TELEGRAM_BOT_TOKEN:',
+    'TELEGRAM_ALLOWED_USERS:',
+    'HERMES_KUBERNETES_BROKER_UID',
+]:
+    if marker not in compose:
+        raise SystemExit(f'missing compose wiring: {marker}')
+if 'plugins enable control-plane-chatops' not in ctl:
+    raise SystemExit('hermesctl does not auto-enable ChatOps plugin')
+if "'dev/**'" not in workflow:
+    raise SystemExit('validate workflow does not cover dev/** pushes')
 print('foundation files: ok')
+print('bot/credential wiring: ok')
 PY
 if PYTHONPATH="$ROOT/control-plane/src" python3 - <<'PY' >/dev/null 2>&1
 import fastapi, httpx, pytest

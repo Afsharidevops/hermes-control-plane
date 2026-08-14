@@ -19,6 +19,12 @@ Generate missing service identities:
 ./hermesctl init
 ```
 
+Configure the main Hermes Telegram bot token using hidden terminal input:
+
+```bash
+./hermesctl bot telegram
+```
+
 Allow your Telegram numeric user ID:
 
 ```bash
@@ -26,10 +32,17 @@ Allow your Telegram numeric user ID:
 ./hermesctl bot status
 ```
 
-Then recreate/start Hermes so the allowlist is loaded:
+Start Hermes:
 
 ```bash
 ./hermesctl up
+```
+
+`hermesctl up` enables the bind-mounted `control-plane-chatops` plugin before
+gateway startup. Verify discovery with:
+
+```bash
+./hermesctl bot check
 ```
 
 Do not paste service tokens or kubeconfigs into Telegram.

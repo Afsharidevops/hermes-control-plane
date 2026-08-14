@@ -91,6 +91,25 @@ init_env() {
     set_env HERMES_KUBERNETES_BROKER_GID "$(id -g)"
   fi
 
+  # Any identity trusted to request Control Plane mutations must also be able
+  # to reach the upstream Hermes Telegram gateway. Preserve any other Telegram
+  # users while adding the Control Plane mutation allowlist.
+  local telegram_users
+  telegram_users="$(python3 - "${TELEGRAM_ALLOWED_USERS:-}" "${HERMES_CONTROL_PLANE_BOT_USERS:-}" <<'PYTG'
+import sys
+out=[]
+for raw in sys.argv[1:]:
+    for item in raw.replace(',', '\n').splitlines():
+        item=item.strip()
+        if item and item.isdigit() and item not in out:
+            out.append(item)
+print(','.join(out))
+PYTG
+)"
+  if [[ -n "$telegram_users" ]]; then
+    set_env TELEGRAM_ALLOWED_USERS "$telegram_users"
+  fi
+
   info "generated missing local secrets"
   echo "Review $ENV_FILE before exposing services."
 }
@@ -106,6 +125,18 @@ profiles_for_up() {
   printf '%s\n' "${profiles[@]}"
 }
 
+ensure_chatops_plugin() {
+  need docker
+  load_env
+  info "ensuring Hermes Control Plane ChatOps plugin is enabled"
+  # The official Hermes plugin loader scans $HERMES_HOME/plugins, but user
+  # plugins are opt-in. Enable the bind-mounted plugin before gateway startup.
+  if ! "${COMPOSE[@]}" --profile hermes run --rm --no-deps -T \
+      hermes plugins enable control-plane-chatops >/dev/null; then
+    fail "could not enable control-plane-chatops plugin; run ./hermesctl bot check"
+  fi
+}
+
 cmd_up() {
   need docker
   load_env
@@ -117,8 +148,10 @@ cmd_up() {
   if [[ "$mode" == "--pull" ]]; then
     info "pulling published images for Hermes Control Plane ($provider)"
     "${COMPOSE[@]}" "${args[@]}" pull
+    ensure_chatops_plugin
     "${COMPOSE[@]}" "${args[@]}" up -d --no-build
   elif [[ -z "$mode" ]]; then
+    ensure_chatops_plugin
     info "starting Hermes Control Plane with active router: $provider"
     "${COMPOSE[@]}" "${args[@]}" up -d --build
   else
@@ -332,24 +365,76 @@ cmd_bot() {
     status)
       [[ -n "${HERMES_BOT_SERVICE_TOKEN:-}" && "${HERMES_BOT_SERVICE_TOKEN:-}" != "CHANGE_ME" ]] && echo "Hermes Bot service identity: configured" || echo "Hermes Bot service identity: missing"
       [[ -n "${HERMES_APPROVAL_BOT_TOKEN:-}" && "${HERMES_APPROVAL_BOT_TOKEN:-}" != "CHANGE_ME" ]] && echo "Approval Bot service identity: configured" || echo "Approval Bot service identity: missing"
+      [[ -n "${TELEGRAM_BOT_TOKEN:-}" ]] && echo "Hermes Telegram gateway token: configured" || echo "Hermes Telegram gateway token: missing"
+      echo "Telegram gateway users: ${TELEGRAM_ALLOWED_USERS:-<none>}"
       echo "Telegram mutation users: ${HERMES_CONTROL_PLANE_BOT_USERS:-<none>}"
       ;;
     allow)
       [[ "$value" =~ ^[0-9]+$ ]] || fail "usage: ./hermesctl bot allow <numeric-telegram-user-id>"
-      local merged
-      merged="$(python3 - "${HERMES_CONTROL_PLANE_BOT_USERS:-}" "$value" <<'PYBOT'
+      local mutation_users telegram_users
+      mutation_users="$(python3 - "${HERMES_CONTROL_PLANE_BOT_USERS:-}" "$value" <<'PYBOT'
 import sys
-existing=[x.strip() for x in sys.argv[1].replace(',', '\n').splitlines() if x.strip()]
+existing=[x.strip() for x in sys.argv[1].replace(',', '\n').splitlines() if x.strip().isdigit()]
 value=sys.argv[2]
-if value not in existing: existing.append(value)
+if value not in existing:
+    existing.append(value)
 print(','.join(existing))
 PYBOT
 )"
-      set_env HERMES_CONTROL_PLANE_BOT_USERS "$merged"
+      telegram_users="$(python3 - "${TELEGRAM_ALLOWED_USERS:-}" "$mutation_users" <<'PYBOT'
+import sys
+out=[]
+for raw in sys.argv[1:]:
+    for item in raw.replace(',', '\n').splitlines():
+        item=item.strip()
+        if item.isdigit() and item not in out:
+            out.append(item)
+print(','.join(out))
+PYBOT
+)"
+      set_env HERMES_CONTROL_PLANE_BOT_USERS "$mutation_users"
+      set_env TELEGRAM_ALLOWED_USERS "$telegram_users"
       echo "Allowed Telegram user $value for Hermes Control Plane mutation requests."
-      echo "Recreate Hermes with: docker compose --env-file .env --profile hermes up -d --force-recreate hermes"
+      echo "The user is also allowed through the Hermes Telegram gateway."
       ;;
-    *) fail "usage: ./hermesctl bot allow <telegram-user-id>|status" ;;
+    telegram)
+      local token
+      printf 'Telegram bot token (input hidden): ' >&2
+      IFS= read -r -s token
+      printf '\n' >&2
+      [[ "$token" =~ ^[0-9]+:[A-Za-z0-9_-]{20,}$ ]] || fail "Telegram bot token format does not look valid"
+      set_env TELEGRAM_BOT_TOKEN "$token"
+      load_env
+      echo "Hermes Telegram gateway token saved to local .env."
+      if command -v docker >/dev/null 2>&1; then
+        ensure_chatops_plugin
+        if "${COMPOSE[@]}" --profile hermes ps --status running --services 2>/dev/null | grep -qx hermes; then
+          info "recreating Hermes so Telegram/plugin configuration is loaded"
+          "${COMPOSE[@]}" --profile hermes up -d --force-recreate hermes
+        fi
+      fi
+      ;;
+    check)
+      need docker
+      echo "Local bot configuration:"
+      cmd_bot status
+      echo
+      echo "Runtime ChatOps plugin:"
+      if ! "${COMPOSE[@]}" --profile hermes ps --status running --services | grep -qx hermes; then
+        echo "[warn] Hermes container is not running"
+        return 0
+      fi
+      if "${COMPOSE[@]}" --profile hermes exec -T hermes sh -lc \
+          'test -f /opt/data/plugins/control-plane-chatops/plugin.yaml'; then
+        echo "[ok] plugin mounted at /opt/data/plugins/control-plane-chatops"
+      else
+        echo "[fail] control-plane-chatops plugin mount missing"
+        return 1
+      fi
+      "${COMPOSE[@]}" --profile hermes exec -T hermes sh -lc \
+        'HERMES_PLUGINS_DEBUG=1 hermes plugins list 2>&1 | grep -i -C2 "control-plane-chatops" || true'
+      ;;
+    *) fail "usage: ./hermesctl bot allow <telegram-user-id>|telegram|status|check" ;;
   esac
 }
 
@@ -377,6 +462,16 @@ cmd_doctor() {
     else
       echo "[warn] Kubernetes Broker UID/GID=${broker_uid:-unset}:${broker_gid:-unset}; local operator=${host_uid}:${host_gid}; run ./hermesctl init"
     fi
+    if [[ -n "${TELEGRAM_BOT_TOKEN:-}" ]]; then
+      echo "[ok] Hermes Telegram gateway token configured"
+    else
+      echo "[warn] Hermes Telegram gateway token missing; run ./hermesctl bot telegram"
+    fi
+    if [[ -n "${HERMES_CONTROL_PLANE_BOT_USERS:-}" && -n "${TELEGRAM_ALLOWED_USERS:-}" ]]; then
+      echo "[ok] Telegram/Control Plane bot allowlists configured"
+    else
+      echo "[warn] Telegram bot allowlist incomplete; run ./hermesctl bot allow <numeric-id>"
+    fi
   fi
 }
 
@@ -394,7 +489,9 @@ Commands:
   execution enable|disable     Toggle mutation execution and wait for readiness
   execution status             Show execution gates
   bot allow <telegram-id>      Allow a numeric Telegram user to request bot-only mutations
-  bot status                   Show bot service identity/allowlist status (never tokens)
+  bot telegram                 Configure Telegram bot token with hidden input
+  bot status                   Show bot/gateway configuration status (never tokens)
+  bot check                    Check runtime ChatOps plugin discovery
   doctor                       Check local prerequisites/config
   router list                  Show configured router health and active provider
   router set nine-router       Start/select 9router
