@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.5.10-rc.1 (development)
+
+- fix RC.1 stabilization R1 combo bootstrap abort: tolerate EOF from tiny action files under `set -e` and newline-terminate reconciliation plan files
+- keep the R1 9router combo reconciliation design while ensuring first-run combo creation actually executes
+- preserve Hermes Smart Router authentication with `api_key: ${OPENAI_API_KEY}` rather than clearing the config reference
+- make `bot check` verify an authenticated Hermes -> Smart Router runtime request
+- automatically reconcile 9router `ai`, `combo-fast`, `combo-standard`, and `combo-strong` routing objects from the current OpenCode free-model catalog
+- preserve operator-customized tier combos after initial creation while refreshing the Hermes-managed `ai` combo when the catalog is available
+- keep existing 9router combos usable during a temporary OpenCode catalog outage
+- leave OmniRoute on its native `auto/best-*` routing path with no synthetic combo provisioning
+- upgrade `router probe` from a model-list check to a real streaming chat-completion request
+- preserve the original `managed_key_stale_ids` exit status so ambiguous active-key cleanup reports the dedicated fail-closed error
+- document `router cleanup-keys` in CLI help
+
 ## 0.5.10-beta.1
 
 - add isolated Kubernetes Broker image with kubectl/Helm

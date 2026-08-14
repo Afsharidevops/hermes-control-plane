@@ -33,6 +33,19 @@ if 'plugins list --plain --no-bundled' not in ctl:
 for marker in ['nine_router_key_http_status','omniroute_key_http_status','cmd_router_cleanup_keys','managed_key_stale_ids']:
     if marker not in ctl:
         raise SystemExit(f'missing router idempotency marker: {marker}')
+if 'if ! managed_key_stale_ids' in ctl:
+    raise SystemExit('managed_key_stale_ids exit status is still hidden by shell negation')
+for marker in [
+    "'api_key':'${OPENAI_API_KEY}'",
+    'ensure_nine_router_routing_combos',
+    '/api/combos',
+    'opencode.ai/zen/v1/models',
+    '/v1/chat/completions',
+    'router cleanup-keys [scope]',
+    'Hermes -> Smart Router authenticated runtime request',
+]:
+    if marker not in ctl:
+        raise SystemExit(f'missing RC router/auth stabilization marker: {marker}')
 for marker in [
     '/api/auth/login',
     '/api/keys',
@@ -47,6 +60,8 @@ env_example=(root/'.env.example').read_text()
 for marker in [
     'NINEROUTER_AUTO_PROVISION_API_KEY=true',
     'NINEROUTER_MANAGED_API_KEY_NAME=hermes-control-plane-router-gateway',
+    'NINEROUTER_AUTO_PROVISION_COMBOS=true',
+    'NINEROUTER_OPENCODE_CATALOG_URL=https://opencode.ai/zen/v1/models',
     'OMNIROUTE_AUTO_PROVISION_API_KEY=true',
     'OMNIROUTE_MANAGED_API_KEY_NAME=hermes-control-plane-router-gateway',
 ]:

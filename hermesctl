@@ -163,14 +163,15 @@ desired={
     'default':os.environ.get('HERMES_MODEL','auto') or 'auto',
     'base_url':'http://smart-router:8080/v1',
     'api_mode':'chat_completions',
+    # Keep the actual Smart Router client secret in the process environment.
+    # Hermes expands this reference at runtime; config.yaml never receives the
+    # raw key material.
+    'api_key':'${OPENAI_API_KEY}',
 }
 changed=False
 for k,v in desired.items():
     if model.get(k)!=v:
         model[k]=v; changed=True
-# Keep the routing client secret only in the process environment.
-if model.get('api_key'):
-    model['api_key']=''; changed=True
 if data.get('model')!=model:
     data['model']=model; changed=True
 if changed:
@@ -507,6 +508,207 @@ PYREAD
   echo "     key material stored only in local .env"
 }
 
+ensure_nine_router_routing_combos() {
+  need curl
+  need python3
+  load_env
+
+  if [[ "${NINEROUTER_AUTO_PROVISION_COMBOS:-true}" != "true" ]]; then
+    echo "[ok] automatic 9router Hermes combo provisioning is disabled"
+    return 0
+  fi
+
+  [[ -n "${NINEROUTER_INITIAL_PASSWORD:-}" ]] \
+    || fail "NINEROUTER_INITIAL_PASSWORD is missing; cannot reconcile 9router routing combos"
+  [[ -n "${NINE_ROUTER_UPSTREAM_API_KEY:-}" ]] \
+    || fail "NINE_ROUTER_UPSTREAM_API_KEY is missing; cannot verify 9router routing combos"
+  wait_nine_router 75 || fail "9router did not become ready for routing-combo reconciliation"
+
+  local tmpdir cookie login_json combos_json catalog_json plan_dir code base
+  tmpdir="$(mktemp -d)"
+  chmod 700 "$tmpdir"
+  cookie="$tmpdir/cookies"
+  login_json="$tmpdir/login.json"
+  combos_json="$tmpdir/combos.json"
+  catalog_json="$tmpdir/opencode-models.json"
+  plan_dir="$tmpdir/plan"
+  mkdir -p "$plan_dir"
+  base="$(nine_router_host_url)"
+
+  code="$(
+    python3 - "${NINEROUTER_INITIAL_PASSWORD}" <<'PYLOGIN' |
+import json, sys
+print(json.dumps({"password": sys.argv[1]}))
+PYLOGIN
+    curl -sS -c "$cookie" -o "$login_json" -w '%{http_code}' \
+      -H 'Content-Type: application/json' --data-binary @- \
+      "${base}/api/auth/login" || true
+  )"
+  if [[ "$code" != "200" ]]; then
+    rm -rf "$tmpdir"
+    fail "9router management login failed; routing-combo reconciliation aborted"
+  fi
+
+  code="$(curl -sS -b "$cookie" -o "$combos_json" -w '%{http_code}' \
+    "${base}/api/combos" || true)"
+  if [[ "$code" != "200" ]]; then
+    rm -rf "$tmpdir"
+    fail "9router combo listing failed with HTTP ${code:-unreachable}"
+  fi
+
+  # A temporary OpenCode catalog outage must not make an already-provisioned
+  # router unbootable. We only require the live catalog when one of the
+  # Hermes-required combos is missing; otherwise we preserve the existing
+  # routing objects and let `router probe` validate a real completion.
+  local missing_before
+  missing_before="$(python3 - "$combos_json" <<'PYCHECK'
+import json, sys
+doc=json.load(open(sys.argv[1], encoding='utf-8'))
+combos=doc.get('combos', []) if isinstance(doc, dict) else []
+names={c.get('name') for c in combos if isinstance(c, dict)}
+required=['ai','combo-fast','combo-standard','combo-strong']
+print(','.join(x for x in required if x not in names))
+PYCHECK
+)"
+
+  local catalog_url catalog_ok=true
+  catalog_url="${NINEROUTER_OPENCODE_CATALOG_URL:-https://opencode.ai/zen/v1/models}"
+  code="$(curl -sS --compressed --connect-timeout 5 --max-time 25 -o "$catalog_json" -w '%{http_code}' \
+    -H 'x-opencode-client: desktop' "$catalog_url" || true)"
+  if [[ "$code" != "200" ]]; then
+    catalog_ok=false
+  fi
+
+  if [[ "$catalog_ok" == "false" ]]; then
+    if [[ -n "$missing_before" ]]; then
+      rm -rf "$tmpdir"
+      fail "OpenCode free-model catalog returned HTTP ${code:-unreachable} and required 9router combo(s) are missing: ${missing_before}"
+    fi
+    echo "[warn] OpenCode free-model catalog unavailable (HTTP ${code:-unreachable}); preserving existing 9router Hermes combos"
+  else
+    if ! python3 - "$combos_json" "$catalog_json" "$plan_dir" <<'PYCOMBO'; then
+import json, pathlib, sys
+combos_path, catalog_path, out_dir = sys.argv[1:4]
+out = pathlib.Path(out_dir)
+combos_doc = json.load(open(combos_path, encoding='utf-8'))
+catalog = json.load(open(catalog_path, encoding='utf-8'))
+combos = combos_doc.get('combos', []) if isinstance(combos_doc, dict) else []
+if not isinstance(combos, list):
+    raise SystemExit('invalid 9router combo response')
+models = catalog.get('data', []) if isinstance(catalog, dict) else []
+free = []
+for item in models:
+    if not isinstance(item, dict):
+        continue
+    mid = item.get('id')
+    if isinstance(mid, str) and (mid.endswith('-free') or mid == 'big-pickle'):
+        free.append('oc/' + mid)
+free = list(dict.fromkeys(free))
+if not free:
+    raise SystemExit('OpenCode returned no currently free models')
+existing = {c.get('name'): c for c in combos if isinstance(c, dict) and isinstance(c.get('name'), str)}
+required = ['ai', 'combo-fast', 'combo-standard', 'combo-strong']
+for name in required:
+    payload = {'name': name, 'models': free, 'kind': 'llm'}
+    (out / f'{name}.json').write_text(json.dumps(payload), encoding='utf-8')
+    current = existing.get(name)
+    if name == 'ai' and current:
+        cid = current.get('id')
+        if not cid:
+            raise SystemExit('existing ai combo has no id')
+        action = f'update|{cid}'
+    elif current:
+        # Seed tier combos once, then let the operator own/customize them.
+        action = 'preserve|'
+    else:
+        action = 'create|'
+    (out / f'{name}.action').write_text(action + '\n', encoding='utf-8')
+(out / 'count').write_text(str(len(free)) + '\n', encoding='utf-8')
+PYCOMBO
+      rm -rf "$tmpdir"
+      if [[ -z "$missing_before" ]]; then
+        echo "[warn] OpenCode free-model catalog contained no usable free models; preserving existing 9router Hermes combos"
+        return 0
+      fi
+      fail "could not build the 9router routing-combo reconciliation plan"
+    fi
+
+    local name action id payload result_code
+    for name in ai combo-fast combo-standard combo-strong; do
+      # action files are deliberately tiny and may not end with a newline.
+      # `read` returns status 1 at EOF without a trailing newline, which under
+      # `set -e` used to abort `hermesctl up` silently before creating combos.
+      # Accept EOF after populated fields, then validate the parsed action below.
+      action=""
+      id=""
+      IFS='|' read -r action id <"$plan_dir/${name}.action" || true
+      payload="$plan_dir/${name}.json"
+      case "$action" in
+        preserve)
+          echo "[ok] 9router combo ${name} exists; preserving operator configuration"
+          ;;
+        create)
+          result_code="$(curl -sS -b "$cookie" -o "$tmpdir/${name}.result" -w '%{http_code}' \
+            -H 'Content-Type: application/json' --data-binary @"$payload" \
+            "${base}/api/combos" || true)"
+          if [[ "$result_code" != "201" ]]; then
+            rm -rf "$tmpdir"
+            fail "9router combo ${name} creation failed with HTTP ${result_code:-unreachable}"
+          fi
+          echo "[ok] created 9router combo ${name}"
+          ;;
+        update)
+          result_code="$(curl -sS -b "$cookie" -o "$tmpdir/${name}.result" -w '%{http_code}' \
+            -X PUT -H 'Content-Type: application/json' --data-binary @"$payload" \
+            "${base}/api/combos/${id}" || true)"
+          if [[ "$result_code" != "200" ]]; then
+            rm -rf "$tmpdir"
+            fail "9router combo ${name} update failed with HTTP ${result_code:-unreachable}"
+          fi
+          echo "[ok] refreshed 9router managed combo ${name}"
+          ;;
+        *)
+          rm -rf "$tmpdir"
+          fail "invalid 9router combo reconciliation action for ${name}"
+          ;;
+      esac
+    done
+  fi
+
+  local models_json
+  models_json="$tmpdir/models.json"
+  code="$(curl -sS --compressed -o "$models_json" -w '%{http_code}' \
+    -H "Authorization: Bearer ${NINE_ROUTER_UPSTREAM_API_KEY}" \
+    "${base}/v1/models" || true)"
+  if [[ "$code" != "200" ]]; then
+    rm -rf "$tmpdir"
+    fail "9router rejected its managed key while verifying routing combos"
+  fi
+  if ! python3 - "$models_json" <<'PYVERIFY'; then
+import json, sys
+data = json.load(open(sys.argv[1], encoding='utf-8'))
+items = data.get('data', []) if isinstance(data, dict) else []
+ids = {x.get('id') for x in items if isinstance(x, dict)}
+required = {'ai', 'combo-fast', 'combo-standard', 'combo-strong'}
+missing = sorted(required - ids)
+if missing:
+    print('missing required combo(s): ' + ', '.join(missing), file=sys.stderr)
+    raise SystemExit(1)
+PYVERIFY
+    rm -rf "$tmpdir"
+    fail "9router routing-combo verification failed"
+  fi
+
+  if [[ "$catalog_ok" == "true" ]]; then
+    local free_count
+    free_count="$(cat "$plan_dir/count")"
+    echo "[ok] 9router Hermes routing combos ready (${free_count} current OpenCode free model(s))"
+  else
+    echo "[ok] existing 9router Hermes routing combos verified"
+  fi
+  rm -rf "$tmpdir"
+}
+
 bootstrap_selected_router() {
   need docker
   load_env
@@ -517,6 +719,7 @@ bootstrap_selected_router() {
     info "starting 9router bootstrap phase"
     "${COMPOSE[@]}" --profile nine-router up -d nine-router
     ensure_nine_router_api_key
+    ensure_nine_router_routing_combos
   fi
 
   if [[ "$provider" == "omniroute" || "$both" == "true" ]]; then
@@ -657,14 +860,18 @@ cmd_router_probe() {
     fi
   fi
 
+  local probe_body
+  probe_body='{"model":"auto","messages":[{"role":"user","content":"Reply only with OK"}],"max_tokens":16,"stream":true}'
   code="$(curl -sS --compressed -o /dev/null -w '%{http_code}' \
     -H "Authorization: Bearer ${SMART_ROUTER_CLIENT_API_KEY}" \
-    "http://${SMART_ROUTER_BIND_IP:-127.0.0.1}:${SMART_ROUTER_PORT:-8787}/v1/models" \
+    -H 'Content-Type: application/json' \
+    --data-binary "$probe_body" \
+    "http://${SMART_ROUTER_BIND_IP:-127.0.0.1}:${SMART_ROUTER_PORT:-8787}/v1/chat/completions" \
     2>/dev/null || true)"
   if [[ "$code" == "200" ]]; then
-    echo "[ok] end-to-end model route via ${provider}"
+    echo "[ok] real chat completion through Smart Router -> ${provider}"
   else
-    echo "[fail] end-to-end model route via ${provider}: HTTP ${code:-unreachable}"
+    echo "[fail] real chat completion through Smart Router -> ${provider}: HTTP ${code:-unreachable}"
     failed=1
   fi
 
@@ -753,7 +960,9 @@ PYLOGIN
     fail "9router key listing failed with HTTP ${code:-unreachable}"
   fi
 
-  if ! managed_key_stale_ids nine-router "${NINE_ROUTER_UPSTREAM_API_KEY}" "$name" "$keys_json" >"$stale_file"; then
+  if managed_key_stale_ids nine-router "${NINE_ROUTER_UPSTREAM_API_KEY}" "$name" "$keys_json" >"$stale_file"; then
+    :
+  else
     rc=$?
     rm -rf "$tmpdir"
     if [[ "$rc" == "4" ]]; then
@@ -817,7 +1026,9 @@ PYLOGIN
     fail "OmniRoute key listing failed with HTTP ${code:-unreachable}"
   fi
 
-  if ! managed_key_stale_ids omniroute "${OMNIROUTE_UPSTREAM_API_KEY}" "$name" "$keys_json" >"$stale_file"; then
+  if managed_key_stale_ids omniroute "${OMNIROUTE_UPSTREAM_API_KEY}" "$name" "$keys_json" >"$stale_file"; then
+    :
+  else
     rc=$?
     rm -rf "$tmpdir"
     if [[ "$rc" == "4" ]]; then
@@ -896,6 +1107,7 @@ cmd_router_provision() {
       "${COMPOSE[@]}" --profile nine-router up -d nine-router
       wait_nine_router 75 || fail "9router did not become ready after start"
       ensure_nine_router_api_key
+      ensure_nine_router_routing_combos
       ;;
     omniroute)
       info "starting OmniRoute for managed credential provisioning"
@@ -926,6 +1138,7 @@ cmd_router_set() {
       "${COMPOSE[@]}" --profile nine-router up -d nine-router
       wait_nine_router 75 || fail "9router did not become ready after start"
       ensure_nine_router_api_key
+      ensure_nine_router_routing_combos
       ;;
     omniroute)
       "${COMPOSE[@]}" --profile omniroute up -d omniroute
@@ -1161,14 +1374,39 @@ from pathlib import Path
 import yaml
 data=yaml.safe_load(Path('/opt/data/config.yaml').read_text()) or {}
 m=data.get('model') if isinstance(data,dict) else {}
-print(f"{m.get('provider','')}|{m.get('default','')}|{m.get('base_url','')}|{m.get('api_mode','')}" if isinstance(m,dict) else 'invalid')
+print(f"{m.get('provider','')}|{m.get('default','')}|{m.get('base_url','')}|{m.get('api_mode','')}|{m.get('api_key','')}" if isinstance(m,dict) else 'invalid')
 PYMODELCHK
 )"
-      if [[ "$model_summary" == "custom|auto|http://smart-router:8080/v1|chat_completions" ]]; then
-        echo "[ok] Hermes main model routed through Smart Router with model=auto"
+      if [[ "$model_summary" == 'custom|auto|http://smart-router:8080/v1|chat_completions|${OPENAI_API_KEY}' ]]; then
+        echo "[ok] Hermes main model routed through Smart Router with environment-key reference"
       else
         echo "[warn] Hermes model configuration not synchronized; fixing it"
         ensure_hermes_router_model
+        info "recreating Hermes so the repaired model configuration is active"
+        "${COMPOSE[@]}" --profile hermes up -d --force-recreate hermes
+        sleep 5
+      fi
+      if "${COMPOSE[@]}" --profile hermes exec -T hermes /opt/hermes/.venv/bin/python - <<'PYAUTHCHK'
+import os, urllib.error, urllib.request
+key=os.environ.get('OPENAI_API_KEY','')
+if not key:
+    print('[fail] OPENAI_API_KEY missing inside Hermes')
+    raise SystemExit(1)
+req=urllib.request.Request('http://smart-router:8080/v1/models', headers={'Authorization': f'Bearer {key}'})
+try:
+    with urllib.request.urlopen(req, timeout=10) as response:
+        if response.status != 200:
+            print(f'[fail] Hermes -> Smart Router authentication HTTP {response.status}')
+            raise SystemExit(1)
+except urllib.error.HTTPError as exc:
+    print(f'[fail] Hermes -> Smart Router authentication HTTP {exc.code}')
+    raise SystemExit(1)
+print('[ok] Hermes -> Smart Router authenticated runtime request')
+PYAUTHCHK
+      then
+        :
+      else
+        return 1
       fi
       if grep -qE '^[[:space:]]*-[[:space:]]*control-plane-chatops[[:space:]]*$' <(
           "${COMPOSE[@]}" --profile hermes exec -T hermes sh -lc \
@@ -1266,8 +1504,9 @@ Commands:
   bot check                    Check ChatOps plugin + Smart Router model wiring
   doctor                       Check local prerequisites/config
   router list                  Show configured router health and active provider
-  router provision <provider>  Provision/repair dedicated router API key automatically
-  router probe                 Verify every router authentication/routing hop
+  router provision <provider>  Provision/repair router key and 9router routing combos
+  router cleanup-keys [scope]  Remove stale managed keys (nine-router|omniroute|all)
+  router probe                 Verify auth plus a real end-to-end chat completion
   router set nine-router       Start/select 9router
   router set omniroute         Start/select OmniRoute
   version                      Show repository/configured/running versions

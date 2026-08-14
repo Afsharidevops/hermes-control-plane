@@ -1,6 +1,6 @@
 # Security Policy
 
-Hermes Control Plane `0.5.10-beta.1` adds the first Kubernetes/Helm broker vertical slice on top of the alpha.2 ChangeSet safety boundary. It is still a development release and is not approved for unattended production mutation.
+Hermes Control Plane `0.5.10-rc.1` is the current stabilization candidate on top of the beta.1 Kubernetes/Helm vertical slice. It remains a development release and is not approved for unattended production mutation.
 
 ## Implemented boundaries
 

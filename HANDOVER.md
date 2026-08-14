@@ -1,168 +1,325 @@
 # Hermes Control Plane — Development Handover
 
-**Repository:** `Afsharidevops/hermes-control-plane`  
-**Active development branch:** `dev/0.5.10-beta.1`  
-**Frozen releases:** `v0.5.10-alpha.1`, `v0.5.10-alpha.2`  
-**Current package:** `0.5.10-beta.1`
+**Repository:** `Afsharidevops/hermes-control-plane`
+**Published prerelease:** `v0.5.10-beta.1`
+**Active development branch:** `dev/0.5.10-rc.1`
+**Current development package:** `0.5.10-rc.1`
+**Latest local update:** RC.1 stabilization R2
+**Status:** beta tag is already published; RC is not ready to tag yet. R1 exposed a shell EOF bug before combo creation; R2 fixes it and still requires live validation.
 
-## Project purpose
+## Continuation rule
 
-Hermes Control Plane is a self-hosted AI-assisted DevOps management plane. It must run on a Docker/VM installation or Kubernetes and support runtime-selectable 9router or OmniRoute without separate router branches.
+Continue only on `dev/0.5.10-rc.1`. Do not move or recreate `v0.5.10-beta.1`. Do not merge/tag `v0.5.10-rc.1` until the RC acceptance tests below pass.
 
-The key product rule is: AI plans; constrained brokers/agents execute. Raw infrastructure credentials must not be exposed to Smart Router/Hermes/LLM-facing services.
+Keep both mutation execution gates disabled during routing/Telegram debugging:
 
-## Existing published image namespace
+```text
+HERMES_EXECUTION_ENABLED=false
+HERMES_KUBERNETES_EXECUTION_ENABLED=false
+```
 
-The new project is isolated from `hermes-linux-stack` by using only `hermes-control-plane-*` repositories:
+## Product/security architecture that must not regress
 
-- `afsharidevops/hermes-control-plane-api`
-- `afsharidevops/hermes-control-plane-router-gateway`
-- `afsharidevops/hermes-control-plane-smart-router`
-- `afsharidevops/hermes-control-plane-execution-broker`
-- `afsharidevops/hermes-control-plane-kubernetes-broker` (new in beta dev)
-- `afsharidevops/hermes-control-plane-node-agent`
+Hermes Control Plane is a self-hosted AI-assisted DevOps management plane for Docker/VM and Kubernetes installations.
 
-GitHub Actions uses `DOCKERHUB_USERNAME` as a repository variable and `DOCKERHUB_TOKEN` as an Actions secret. Main publishes `edge` + SHA tags; version tags publish the version; only stable tags publish `latest`.
+Core rule: **AI plans; constrained brokers/agents execute.**
 
-## Alpha.2 state (frozen and validated)
+- UI/admin: configuration, observability, discovery, audit and plan inspection only.
+- Hermes Bot: bot-only infrastructure mutation planning/preview/request/execute flow.
+- Approval Bot: separate service identity/token; only it may approve/reject protected infrastructure ChangeSets.
+- Kubernetes Broker: isolated kubectl/Helm and credential/execution boundary; no Docker socket and no router authority.
+- Smart Router/Router Gateway: model routing only; no raw infrastructure credentials.
+- Raw kubeconfig/provider infrastructure credentials must not reach Hermes/LLM/Smart Router.
+- approvals bind to the exact immutable ChangeSet hash.
+- target/credential drift invalidates execution.
+- execution is disabled by default and broker execution requires a short-lived exact-plan ticket.
 
-Alpha.2 was merged into `main`, tagged correctly, published as multi-arch amd64/arm64 images, pulled from Docker Hub, and tested locally with both 9router and OmniRoute. A GitHub prerelease exists. Its development branch was deleted after merge.
+The UI must not regain Kubernetes/Helm mutation editors, approval buttons, or execute buttons. Backend admin-token mutation must remain blocked.
 
-Alpha.2 implemented Environment/Integration/Target registries, metadata-only credential refs, ChangeSet canonical JSON/SHA-256, risk classification, exact-hash approval binding, expiry, audit, and starter UI. Execution was disabled.
+## Release history/current branch state
 
-## Beta.1 dev.1 implemented in this package
+The beta development branch was merged into `main` and the tag `v0.5.10-beta.1` was pushed. After that, `dev/0.5.10-rc.1` was created from `main` and pushed.
 
-### Kubernetes Broker
+Do not rewrite that history. Stabilization work belongs on `dev/0.5.10-rc.1`.
 
-A new isolated `kubernetes-broker/` service/image contains kubectl and Helm. It has no Docker socket and no router authority.
+## Beta functionality retained
 
-Capabilities:
-- Kubernetes discovery (`version`, namespaces, nodes, deployments/statefulsets/daemonsets)
-- manifest server-side dry-run + diff
-- guarded server-side apply
-- Helm install/upgrade server dry-run with secret hiding
-- Helm install/upgrade execution + status verification
-- Helm rollback planning + execution
-- conservative manifest kind allowlist
-- explicit deny of Secrets, RBAC, admission webhooks, CSRs and CRDs
-- broker-enforced namespace allow/deny and kind allow/deny target scopes
-- Namespace mutation requires explicit `allow_cluster_scoped=true`
-- discovery respects namespace scope and hides node inventory unless `cluster_read=true`
+The repository already contains:
 
-Execution defaults to disabled.
-
-### Credential boundary for Docker/VM
-
-`hermesctl kubeconfig import <name> <file>`:
-- calls the Control Plane to create an opaque kubeconfig credential reference
-- copies the kubeconfig locally to `data/kubeconfigs/<credential-id>.yaml` mode `0600`
-- records only file ID + SHA-256 fingerprint in the Control Plane
-- Kubernetes Broker receives the directory read-only
-
-The Control Plane never receives the kubeconfig content. This is a beta file boundary, not the final encrypted credential service.
-
-### ChangeSet schema v2
-
-Plans now include an immutable target snapshot with credential metadata/fingerprint. Preview and execution fail if current target/credential metadata differs from the planned snapshot.
-
-Live Kubernetes/Helm previews come from Kubernetes Broker, not user-supplied text.
-
-Execution requires:
-1. valid stored plan hash
-2. live broker preview
-3. valid exact-hash approval if risk requires approval
-4. unchanged target snapshot
-5. `HERMES_EXECUTION_ENABLED=true`
-6. `HERMES_KUBERNETES_EXECUTION_ENABLED=true`
-7. a short-lived HMAC-signed exact-plan broker ticket
-
-Broker rejects in-process ticket replay.
-
-### Operations Center
-
-`/ui` now has Overview, Infrastructure, Changes and Audit views. It includes:
-- environment management
-- kubeconfig reference visibility
-- Kubernetes target creation
+- Environment / Integration / Target registries
+- metadata-only credential references
+- ChangeSet canonical JSON/SHA-256 hashing
+- risk classification and exact-hash approval binding
+- audit trail
+- isolated Kubernetes Broker with kubectl/Helm
+- kubeconfig file-reference/fingerprint boundary on Docker/VM
 - Kubernetes discovery
-- manifest ChangeSet + live preview
-- Helm ChangeSet + live preview
-- approval and execute controls
+- server-side manifest dry-run/diff and guarded apply
+- Helm server dry-run, install/upgrade verification, and rollback
+- target snapshot/credential-fingerprint drift invalidation
+- short-lived HMAC-signed exact-plan broker tickets
+- Operations Center configuration/discovery views
+- Hermes ChatOps plugin and separate Approval Bot service identity
 
-### CLI
+## Router key lifecycle state
 
-New commands:
-- `hermesctl version`
-- `hermesctl version set <version>`
-- `hermesctl upgrade <version>`
-- `hermesctl kubeconfig import <name> <file>`
-- `hermesctl kubeconfig list`
-- `hermesctl kubeconfig remove <credential-id>`
+R8 fixed duplicate managed API-key creation during provider restart/switching.
 
-`upgrade` verifies published API/Kubernetes Broker image tags, takes a best-effort Control Plane DB backup, updates `.env`, pulls, health-starts, and restores the configured version on failure.
+Validated in the real development environment:
 
-## Deployment
+- repeated `down -> up` reused the existing valid 9router managed key;
+- no new key was created on normal restart;
+- `./hermesctl router cleanup-keys` removed 1 stale 9router duplicate and 2 stale OmniRoute duplicates.
 
-Docker Compose now runs Kubernetes Broker as a core internal service and mounts `./data/kubeconfigs` read-only.
+RC stabilization R1 also fixes the small R8 error-reporting issue by preserving the real `managed_key_stale_ids` helper status without shell negation, and adds `router cleanup-keys` to CLI help.
 
-The Helm chart deploys Kubernetes Broker too. ServiceAccount token automount is false by default. Direct kubeconfigs may be supplied via an existing Kubernetes Secret. The chart intentionally does not create broad Kubernetes RBAC.
+Duplicate cleanup must continue to fail closed when the active key cannot be identified unambiguously.
 
-## Current security limitations / remaining beta work
+## Hermes -> Smart Router authentication bug — diagnosed
 
-Do not treat dev.1 as feature-complete beta.1. Remaining work:
-- dedicated encrypted credential service / external secret backend
-- agent enrollment/identity/revocation and remote Kubernetes mode
-- Telegram planning + separate approval bot integration
-- GitHub/GitLab adapters and Application registry
-- Docker/Compose/Swarm adapter
-- SSH UI CRUD and credential rotation
-- richer target policy, rollout verification/rollback metadata
-- persistent replay protection / separate approval signing authority
-- Node.js action warning cleanup
+Telegram read-only requests initially failed with:
 
-## Next implementation order
+```text
+HTTP 401 authentication required
+```
 
-1. Test beta dev.1 on a disposable Kubernetes cluster with execution disabled: kubeconfig import, target creation, Discover, manifest live dry-run, Helm live dry-run.
-2. Enable both execution switches only on that disposable cluster and validate exact approval -> apply -> audit.
-3. Add Telegram approval integration using the exact ChangeSet hash.
-4. Add GitHub/GitLab + Application registry.
-5. Add Docker/Compose/Swarm, then SSH.
-6. Merge to `main` only when beta acceptance tests pass; do not tag `v0.5.10-beta.1` from dev.1.
+Diagnostics proved:
+
+```text
+OPENAI_API_KEY exists inside Hermes                     OK
+Hermes container -> Smart Router /v1/models HTTP 200   OK
+Router Gateway management API                          OK
+9router managed API key                                OK
+```
+
+The bug was `./hermesctl bot model-sync`: `ensure_hermes_router_model()` cleared `model.api_key` in `/opt/data/config.yaml`.
+
+Manual validation proved the fix by setting:
+
+```yaml
+model:
+  provider: custom
+  default: auto
+  base_url: http://smart-router:8080/v1
+  api_mode: chat_completions
+  api_key: ${OPENAI_API_KEY}
+```
+
+After recreating Hermes, the Smart Router 401 disappeared.
+
+RC stabilization R1 makes this permanent. Only the `${OPENAI_API_KEY}` reference is stored in YAML; the raw Smart Router client key remains in the process environment.
+
+`./hermesctl bot check` now validates the environment reference and performs an authenticated Hermes-container -> Smart Router `/v1/models` request.
+
+## Missing 9router combo bootstrap — diagnosed
+
+Router Gateway already maps neutral Hermes tiers to these 9router model names:
+
+```text
+hermes/observe   -> ai
+hermes/fast      -> combo-fast
+hermes/standard  -> combo-standard
+hermes/strong    -> combo-strong
+hermes/coding    -> combo-strong
+hermes/vision    -> combo-strong
+```
+
+But beta.1 did not provision those combos. The live 9router dashboard showed **no combos**, and `/v1/models` contained no `ai`/tier combo entries.
+
+The implementation pattern was compared with `Afsharidevops/hermes-linux-stack` main. That project already seeds an OpenCode free pool and creates `ai`, `combo-fast`, `combo-standard`, and `combo-strong`, preserving customized tier combos on rerun.
+
+For Hermes Control Plane, R1 ports only the routing-combo concept. It does **not** port the old direct-DB API-key insertion because the newer Control Plane managed-key lifecycle is safer and must remain authoritative.
+
+R1 uses the current authenticated 9router `/api/combos` management API rather than directly editing the router database.
+
+## OpenCode provider evidence
+
+The 9router dashboard showed **OpenCode Free: Ready**.
+
+`opencode-go/*` model IDs were visible in `/v1/models`, but all real completions failed with:
+
+```text
+No active credentials for provider: opencode-go
+```
+
+Those are credential-backed `opencode-go` routes and must not be used as the default no-auth bootstrap pool.
+
+The live OpenCode Zen catalog at `https://opencode.ai/zen/v1/models` returned current model IDs. A real 9router completion using:
+
+```text
+oc/deepseek-v4-flash-free
+```
+
+returned HTTP 200 with the existing managed 9router API key.
+
+This proves the `oc/*-free` route is a valid bootstrap source.
+
+## RC stabilization R1 — implementation
+
+R1 adds `ensure_nine_router_routing_combos()` to `hermesctl`.
+
+When 9router is selected:
+
+1. start/wait for 9router;
+2. reuse/provision the managed Router Gateway API key;
+3. authenticate to 9router management API;
+4. list existing combos;
+5. fetch the current OpenCode Zen catalog;
+6. select IDs ending in `-free` plus `big-pickle`, prefix with `oc/`;
+7. create/update required routing objects;
+8. verify all four required combo names appear through authenticated `/v1/models`.
+
+Ownership behavior:
+
+- `ai`: Hermes-managed and refreshed from the live free pool when the catalog is available;
+- `combo-fast`: created only if absent, then operator-owned/preserved;
+- `combo-standard`: created only if absent, then operator-owned/preserved;
+- `combo-strong`: created only if absent, then operator-owned/preserved;
+- unrelated/user combos are untouched.
+
+If the catalog is temporarily unavailable **and all required combos already exist**, startup preserves/verifies them instead of failing solely because of the external catalog outage. If required combos are missing and the catalog cannot be fetched, reconciliation fails rather than knowingly starting with broken routing.
+
+Config controls:
+
+```text
+NINEROUTER_AUTO_PROVISION_COMBOS=true
+NINEROUTER_OPENCODE_CATALOG_URL=https://opencode.ai/zen/v1/models
+```
+
+## OmniRoute behavior
+
+Do not apply 9router combo provisioning to OmniRoute.
+
+OmniRoute remains on its native zero-config routing path through Router Gateway:
+
+```text
+hermes/observe   -> auto/best-chat
+hermes/fast      -> auto/best-fast
+hermes/standard  -> auto/best-chat
+hermes/strong    -> auto/best-reasoning
+hermes/coding    -> auto/best-coding
+hermes/vision    -> auto/best-vision
+```
+
+## Stronger probe behavior
+
+The beta `router probe` incorrectly labeled a successful `/v1/models` request as an end-to-end route test.
+
+R1 changes `./hermesctl router probe` to POST a small real streaming chat completion with `model=auto` through Smart Router. This is expected to traverse Smart Router -> Router Gateway -> selected router -> real model/provider.
+
+## First test sequence for R1
+
+Apply the R1 package to `dev/0.5.10-rc.1`, keep the existing local `.env`, then set the branch package version:
+
+```bash
+./hermesctl version set 0.5.10-rc.1
+./hermesctl execution disable
+./scripts/verify.sh
+./hermesctl up
+```
+
+On the first 9router run, expected output includes creation of any missing required combos. Then:
+
+```bash
+./hermesctl router probe
+./hermesctl bot check
+./hermesctl execution status
+```
+
+Expected:
+
+```text
+real chat completion through Smart Router -> nine-router   OK
+Hermes -> Smart Router authenticated runtime request       OK
+HERMES_EXECUTION_ENABLED=false
+HERMES_KUBERNETES_EXECUTION_ENABLED=false
+```
+
+Open the 9router dashboard -> Combo & Vision Adapter and verify:
+
+- `ai`
+- `combo-fast`
+- `combo-standard`
+- `combo-strong`
+
+exist.
+
+Run `./hermesctl up` again. Expected: `ai` may be refreshed from the current free catalog; existing tier combos must be reported as preserved rather than overwritten.
+
+Then send the Telegram read-only request:
+
+```text
+Show me the Kubernetes targets managed by Hermes Control Plane.
+```
+
+It must no longer return `authentication required`, and it must not fail because `ai` is absent.
+
+## Router cleanup follow-up tests
+
+After R1 routing tests:
+
+```bash
+./hermesctl router cleanup-keys all
+./hermesctl router cleanup-keys all
+```
+
+The second run should normally remove zero stale duplicates.
+
+Still desirable before RC tag:
+
+- controlled invalid/revoked managed-key rotation test: explicit 401/403 -> exactly one replacement -> next restart reuses replacement;
+- controlled ambiguous-current-key cleanup test: deletes nothing and emits the dedicated ambiguity error.
+
+## Kubernetes/Telegram RC acceptance still pending
+
+Do not tag RC merely because model routing works.
+
+With execution disabled first, validate on a disposable Kubernetes cluster:
+
+1. kubeconfig import;
+2. environment/target creation;
+3. discovery;
+4. bot-originated manifest ChangeSet;
+5. live server-side manifest dry-run/diff;
+6. bot-originated Helm ChangeSet;
+7. live Helm server dry-run;
+8. UI remains inspection/configuration-only;
+9. admin-token mutation is rejected;
+10. execution is blocked while gates are false.
+
+Then, only on the disposable cluster, enable execution and validate:
+
+1. Hermes Bot creates exact plan;
+2. separate Approval Bot approves exact current hash;
+3. execute through Kubernetes Broker;
+4. verify result and audit trail;
+5. target/credential drift blocks stale execution;
+6. wrong/expired approval blocks execution;
+7. replayed broker ticket is rejected;
+8. rollback where supported.
+
+After execution testing, disable execution again unless explicitly needed.
+
+## RC release rule
+
+Do not create `v0.5.10-rc.1` until routing/authentication, bot-only authorization, Kubernetes preview/execution, upgrade/install, 9router/OmniRoute, and security regression checks pass.
+
+When RC acceptance is complete, merge `dev/0.5.10-rc.1` to `main`, re-run validation on the merged commit, and only then tag `v0.5.10-rc.1`.
+
+After RC.1, allow only release-blocking fixes before `v0.5.10` stable.
 
 ## Recommended continuation prompt
 
-Upload the latest source ZIP and this HANDOVER.md, then say:
+Upload the latest source ZIP and this `HANDOVER.md`, then say:
 
-> Continue Hermes Control Plane from HANDOVER.md. Inspect the package first. Continue `dev/0.5.10-beta.1` from the current Kubernetes + Helm vertical slice without weakening the ChangeSet/credential/approval boundaries.
+> Continue Hermes Control Plane from HANDOVER.md. Inspect the source ZIP first. We are on `dev/0.5.10-rc.1`; `v0.5.10-beta.1` is already published and must not be changed. RC stabilization R1 permanently fixes Hermes Smart Router auth reference handling, provisions/repairs the missing 9router `ai`/tier combos from the current `oc/*-free` pool while preserving operator-customized tier combos, upgrades router probe to a real completion, and includes the R8 cleanup error/help fixes. Keep execution disabled until routing and Telegram read-only tests pass, then continue the RC acceptance plan without weakening bot-only mutation, credential isolation, exact-hash approval, or broker execution boundaries.
 
-## Bot-only mutation architecture update
+## RC.1 stabilization R2 — current checkpoint
 
-Kubernetes and Helm mutation is now intentionally bot-only.
+R1 was overlaid on the real `dev/0.5.10-rc.1` checkout and validated far enough to expose one additional shell bug. `./hermesctl up` printed the 9router bootstrap phase and valid managed-key message, then exited before combo creation. The dashboard still showed no combos and the strengthened real-completion probe returned HTTP 404.
 
-- UI/admin: configuration + observability + discovery only.
-- Hermes Bot: create/preview mutation ChangeSets, request approval, execute already-approved exact hashes, plan rollback.
-- Approval Bot: separate token/identity; only it can approve/reject infrastructure mutation ChangeSets.
-- Kubernetes Broker: unchanged credential/execution boundary.
+Root cause: R1 wrote tiny combo action files without a trailing newline, then parsed them with Bash `read` under global `set -e`. `read` populated the fields but returned status 1 at EOF, aborting the command before the create/update/preserve `case` ran.
 
-The UI no longer contains manifest/Helm mutation editors or approval/execute buttons. Backend authorization also blocks admin-token mutation requests, so this is not a cosmetic restriction.
+R2 fixes this by newline-terminating plan files and making the action-file `read` explicitly EOF-tolerant while preserving fail-closed validation for invalid actions. It also removes handover trailing whitespace so `git diff --check` passes.
 
-New env keys are generated by `./hermesctl init`:
-
-- `HERMES_BOT_SERVICE_TOKEN`
-- `HERMES_APPROVAL_BOT_TOKEN`
-- `HERMES_CONTROL_PLANE_BOT_USERS` (operator-configured numeric Telegram allowlist)
-
-New helper commands:
-
-```bash
-./hermesctl bot allow <numeric-telegram-user-id>
-./hermesctl bot status
-./hermesctl execution enable
-./hermesctl execution disable
-./hermesctl execution status
-./hermesctl wait 90
-```
-
-The `control-plane-chatops` Hermes plugin is mounted read-only into the Hermes container and refuses mutation tools unless the session is interactive Telegram and the numeric user is allow-listed.
-
-Current public-version policy: keep all work on `dev/0.5.10-beta.1`; do not create dev-version tags. Tag `v0.5.10-beta.1` only when the broad beta feature scope is integrated, then one `v0.5.10-rc.1`, then `v0.5.10` stable.
+R2 must now be overlaid on the same branch and tested with execution disabled. Expected first-run behavior is creation of `ai`, `combo-fast`, `combo-standard`, and `combo-strong`; a second startup must refresh `ai` but preserve existing tier combos. Then `router probe`, `bot check`, and the Telegram read-only target query must pass.

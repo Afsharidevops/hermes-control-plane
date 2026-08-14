@@ -35,7 +35,7 @@ from .models import (
 )
 from .risk import approval_required, classify
 
-VERSION = "0.5.10-beta.1"
+VERSION = "0.5.10-rc.1"
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 TERMINAL_CHANGESET_STATES = {
     "REJECTED", "CANCELLED", "EXPIRED", "EXECUTED", "FAILED",

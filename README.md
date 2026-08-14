@@ -2,7 +2,7 @@
 
 Hermes Control Plane is a self-hosted, AI-assisted DevOps control plane designed to run on a Docker/VM installation or Kubernetes while keeping privileged credentials and infrastructure execution outside the LLM trust boundary.
 
-> Current development branch: **0.5.10-beta.1** (not yet tagged). Kubernetes/Helm mutations are bot-only, exact-hash approved, broker-executed, and disabled by default.
+> Current development branch: **dev/0.5.10-rc.1**. `v0.5.10-beta.1` is already published; do not tag RC until acceptance tests pass. Kubernetes/Helm mutations are bot-only, exact-hash approved, broker-executed, and disabled by default.
 
 ## What is included
 
@@ -147,7 +147,7 @@ The Kubernetes Broker re-enforces target scope (`namespace_allowlist`/`namespace
 Manual fallback build/publish remains available:
 
 ```bash
-IMAGE_NAMESPACE=afsharidevops VERSION=0.5.10-beta.1 ./scripts/push-images.sh
+IMAGE_NAMESPACE=afsharidevops VERSION=0.5.10-rc.1 ./scripts/push-images.sh
 ```
 
 ## Verify
@@ -163,3 +163,5 @@ CI runs the Control Plane safety/beta flow tests, Kubernetes Broker policy/ticke
 The Control Plane API does not accept raw kubeconfig material. Kubernetes/Helm mutation requires live broker preview plus the exact approved ChangeSet and is disabled by default. Read `SECURITY.md` before enabling execution.
 
 9router and OmniRoute Router Gateway API credentials are provisioned automatically by `./hermesctl up`; no dashboard key copy/paste is required.
+
+For 9router, `hermesctl` also reconciles the routing objects expected by Router Gateway: `ai`, `combo-fast`, `combo-standard`, and `combo-strong`. The `ai` combo is refreshed from the current OpenCode free-model catalog; tier combos are created only when missing and are then operator-owned so dashboard customizations are preserved. OmniRoute keeps its native `auto/best-*` routing and does not require synthetic combos.

@@ -16,7 +16,7 @@ import yaml
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 
-VERSION = "0.5.10-beta.1"
+VERSION = "0.5.10-rc.1"
 CREDENTIAL_ROOT = Path(os.getenv("HERMES_KUBECONFIG_ROOT", "/credentials/kubeconfigs"))
 TOKEN = os.getenv("HERMES_KUBERNETES_BROKER_TOKEN", "")
 EXECUTION_KEY = os.getenv("HERMES_EXECUTION_HMAC_KEY", "")
