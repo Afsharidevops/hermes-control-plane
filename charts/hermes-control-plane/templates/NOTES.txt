@@ -1,11 +1,14 @@
 Hermes Control Plane {{ .Chart.AppVersion }} installed.
 
-This is an alpha foundation. Privileged DevOps execution should remain disabled until the ChangeSet/credential/approval boundaries are implemented and reviewed.
+Alpha.2 provides the management and safety core: environment/integration/target registries,
+credential references, ChangeSet hashing/risk/approval binding, audit, and a starter Operations UI.
+Privileged DevOps execution remains disabled by design until beta adapter work lands.
 
 Smart Router service:
   {{ include "hermes.fullname" . }}-smart-router:{{ .Values.smartRouter.service.port }}
 
-Control Plane API:
+Control Plane API / Operations UI:
   {{ include "hermes.fullname" . }}-control-plane:{{ .Values.controlPlane.service.port }}
+  /ui
 
 Active router: {{ .Values.router.activeProvider }}

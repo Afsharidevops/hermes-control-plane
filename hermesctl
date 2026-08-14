@@ -93,12 +93,21 @@ profiles_for_up() {
 cmd_up() {
   need docker
   load_env
+  local mode="${1:-}"
   local provider="${HERMES_ROUTER_PROVIDER:-nine-router}"
   [[ "$provider" == "nine-router" || "$provider" == "omniroute" ]] || fail "HERMES_ROUTER_PROVIDER must be nine-router or omniroute"
   local args=()
   while IFS= read -r p; do args+=(--profile "$p"); done < <(profiles_for_up "$provider")
-  info "starting Hermes Control Plane with active router: $provider"
-  "${COMPOSE[@]}" "${args[@]}" up -d --build
+  if [[ "$mode" == "--pull" ]]; then
+    info "pulling published images for Hermes Control Plane ($provider)"
+    "${COMPOSE[@]}" "${args[@]}" pull
+    "${COMPOSE[@]}" "${args[@]}" up -d --no-build
+  elif [[ -z "$mode" ]]; then
+    info "starting Hermes Control Plane with active router: $provider"
+    "${COMPOSE[@]}" "${args[@]}" up -d --build
+  else
+    fail "usage: ./hermesctl up [--pull]"
+  fi
   # Persist the active provider through the gateway once it is reachable.
   for _ in $(seq 1 30); do
     if curl -fsS "http://${ROUTER_GATEWAY_BIND_IP:-127.0.0.1}:${ROUTER_GATEWAY_PORT:-8790}/health" >/dev/null 2>&1; then
@@ -182,6 +191,7 @@ Usage: ./hermesctl <command>
 Commands:
   init                         Create .env and generate missing local secrets
   up                           Build/start core + Hermes + selected router
+  up --pull                    Pull published images and start without local builds
   down                         Stop the stack
   status                       Show Compose and service health
   doctor                       Check local prerequisites/config
@@ -193,7 +203,7 @@ TXT
 
 case "${1:-}" in
   init) init_env ;;
-  up) cmd_up ;;
+  up) cmd_up "${2:-}" ;;
   down) cmd_down ;;
   status) cmd_status ;;
   doctor) cmd_doctor ;;

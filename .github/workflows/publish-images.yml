@@ -2,15 +2,10 @@ name: Build and Publish Docker Images
 
 on:
   push:
-    branches:
-      - main
-    tags:
-      - "v*"
-
+    branches: [main]
+    tags: ["v*"]
   pull_request:
-    branches:
-      - main
-
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -24,29 +19,22 @@ jobs:
   build:
     name: ${{ matrix.image }}
     runs-on: ubuntu-latest
-
     strategy:
       fail-fast: false
       matrix:
         include:
-
           - image: hermes-control-plane-api
             context: ./control-plane
-
           - image: hermes-control-plane-router-gateway
             context: ./router-gateway
-
           - image: hermes-control-plane-smart-router
             context: ./smart-router
-
           - image: hermes-control-plane-execution-broker
             context: ./execution-broker
-
           - image: hermes-control-plane-node-agent
             context: ./node-agent
 
     steps:
-
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -68,10 +56,8 @@ jobs:
         uses: docker/metadata-action@v6
         with:
           images: ${{ vars.DOCKERHUB_USERNAME }}/${{ matrix.image }}
-
           flavor: |
             latest=false
-
           tags: |
             type=raw,value=edge,enable=${{ github.ref == 'refs/heads/main' }}
             type=sha,prefix=sha-
@@ -86,9 +72,7 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-
-          cache-from: |
-            type=gha,scope=${{ matrix.image }}
-
-          cache-to: |
-            type=gha,mode=max,scope=${{ matrix.image }}
+          provenance: true
+          sbom: true
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}

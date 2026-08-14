@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Hermes Control Plane</title>
+  <style>
+    :root { font-family: ui-sans-serif, system-ui, sans-serif; color-scheme: light dark; }
+    body { margin: 0; background: #111827; color: #e5e7eb; }
+    header { padding: 20px 28px; border-bottom: 1px solid #374151; display:flex; gap:18px; align-items:center; flex-wrap:wrap; }
+    main { padding: 24px 28px; display:grid; gap:20px; }
+    .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:16px; }
+    .card { border:1px solid #374151; border-radius:12px; padding:16px; background:#1f2937; }
+    h1,h2 { margin:0 0 12px; } h1{font-size:20px} h2{font-size:16px}
+    input,select,textarea,button { box-sizing:border-box; width:100%; margin:5px 0; padding:9px; border-radius:8px; border:1px solid #4b5563; background:#111827; color:#e5e7eb; }
+    button { cursor:pointer; background:#2563eb; border:0; font-weight:600; }
+    button.secondary { background:#374151; }
+    table { width:100%; border-collapse:collapse; font-size:13px; }
+    td,th { padding:7px; border-bottom:1px solid #374151; text-align:left; vertical-align:top; }
+    code { font-size:12px; word-break:break-all; }
+    .muted { color:#9ca3af; font-size:13px; }
+    .good { color:#34d399; } .warn{color:#fbbf24}
+  </style>
+</head>
+<body>
+<header>
+  <div><h1>Hermes Control Plane</h1><div class="muted">0.5.10-alpha.2 Management + Safety Core</div></div>
+  <div style="min-width:300px;flex:1"><input id="token" type="password" placeholder="HERMES_CONTROL_ADMIN_TOKEN (kept only in this tab)" /></div>
+  <div style="width:140px"><button onclick="refreshAll()">Refresh</button></div>
+</header>
+<main>
+  <div class="card"><h2>System</h2><pre id="system" class="muted">Loading…</pre></div>
+  <div class="grid">
+    <section class="card"><h2>Environments</h2><input id="env-name" placeholder="Production"/><select id="env-risk"><option>LOW</option><option>HIGH</option><option>CRITICAL</option></select><button onclick="createEnvironment()">Add environment</button><div id="environments"></div></section>
+    <section class="card"><h2>Credential references</h2><div class="muted">Metadata only. No token/key/kubeconfig value is accepted by this alpha service.</div><input id="cred-name" placeholder="prod-kubeconfig-ref"/><select id="cred-kind"><option>kubeconfig</option><option>ssh-key</option><option>ssh-password</option><option>token</option><option>registry</option><option>generic</option></select><button onclick="createCredential()">Add reference</button><div id="credentials"></div></section>
+    <section class="card"><h2>Integrations</h2><input id="int-name" placeholder="company-gitlab"/><select id="int-kind"><option>gitlab</option><option>github</option><option>kubernetes</option><option>docker</option><option>swarm</option><option>ssh</option><option>registry</option><option>helm</option></select><input id="int-endpoint" placeholder="https://gitlab.example.com"/><input id="int-env" placeholder="environment id"/><button onclick="createIntegration()">Add integration</button><div id="integrations"></div></section>
+    <section class="card"><h2>Targets</h2><input id="tgt-name" placeholder="production-k8s"/><select id="tgt-kind"><option>kubernetes</option><option>docker</option><option>swarm</option><option>ssh</option><option>git-project</option><option>helm-target</option></select><input id="tgt-env" placeholder="environment id"/><input id="tgt-int" placeholder="integration id (optional)"/><button onclick="createTarget()">Add target</button><div id="targets"></div></section>
+  </div>
+  <div class="grid">
+    <section class="card"><h2>ChangeSet planner</h2><input id="chg-op" placeholder="kubernetes.deployment.scale"/><input id="chg-adapter" value="kubernetes"/><input id="chg-target" placeholder="target id"/><input id="chg-requester" value="ui:operator"/><textarea id="chg-params" rows="4">{"namespace":"default","deployment":"example","replicas":2}</textarea><button onclick="createChangeSet()">Create immutable plan</button><pre id="changeset-result" class="muted"></pre></section>
+    <section class="card"><h2>Recent ChangeSets</h2><div id="changesets"></div></section>
+    <section class="card"><h2>Recent audit</h2><div id="audit"></div></section>
+  </div>
+</main>
+<script>
+const token = () => document.getElementById('token').value;
+const headers = () => ({'Content-Type':'application/json','Authorization':'Bearer '+token()});
+async function req(url,opt={}) { const r=await fetch(url,opt); if(!r.ok){throw new Error(`${r.status} ${await r.text()}`)}; return r.status===204?null:r.json(); }
+function table(rows, cols){ if(!rows.length)return '<p class="muted">None</p>'; return '<table><tr>'+cols.map(c=>`<th>${c[0]}</th>`).join('')+'</tr>'+rows.map(r=>'<tr>'+cols.map(c=>`<td>${c[1](r)}</td>`).join('')+'</tr>').join('')+'</table>'; }
+async function refreshAll(){
+  try{
+    const [sys,envs,creds,ints,tgts,chgs,audit]=await Promise.all([req('/v1/system'),req('/v1/environments'),req('/v1/credential-refs'),req('/v1/integrations'),req('/v1/targets'),req('/v1/changesets?limit=30'),req('/v1/audit?limit=30')]);
+    system.textContent=JSON.stringify(sys,null,2);
+    environments.innerHTML=table(envs,[['Name',r=>r.name],['ID',r=>`<code>${r.id}</code>`],['Risk',r=>r.risk_level]]);
+    credentials.innerHTML=table(creds,[['Name',r=>r.name],['ID',r=>`<code>${r.id}</code>`],['Kind',r=>r.kind]]);
+    integrations.innerHTML=table(ints,[['Name',r=>r.name],['Kind',r=>r.kind],['Health',r=>r.health_status],['ID',r=>`<code>${r.id}</code>`]]);
+    targets.innerHTML=table(tgts,[['Name',r=>r.name],['Kind',r=>r.kind],['ID',r=>`<code>${r.id}</code>`]]);
+    changesets.innerHTML=table(chgs,[['Operation',r=>r.operation],['Risk',r=>r.risk],['State',r=>r.state],['Hash',r=>`<code>${r.plan_hash?.slice(0,12)}…</code>`]]);
+    audit.innerHTML=table(audit,[['Event',r=>r.event_type],['Actor',r=>r.actor],['Subject',r=>`<code>${r.subject_id}</code>`]]);
+  }catch(e){ system.textContent=e.message; }
+}
+async function createEnvironment(){ await req('/v1/environments',{method:'POST',headers:headers(),body:JSON.stringify({name:document.getElementById('env-name').value,risk_level:document.getElementById('env-risk').value})}); refreshAll(); }
+async function createCredential(){ await req('/v1/credential-refs',{method:'POST',headers:headers(),body:JSON.stringify({name:document.getElementById('cred-name').value,kind:document.getElementById('cred-kind').value,metadata:{}})}); refreshAll(); }
+async function createIntegration(){ await req('/v1/integrations',{method:'POST',headers:headers(),body:JSON.stringify({name:document.getElementById('int-name').value,kind:document.getElementById('int-kind').value,environment_id:document.getElementById('int-env').value,endpoint:document.getElementById('int-endpoint').value||null,connection_mode:'direct'})}); refreshAll(); }
+async function createTarget(){ await req('/v1/targets',{method:'POST',headers:headers(),body:JSON.stringify({name:document.getElementById('tgt-name').value,kind:document.getElementById('tgt-kind').value,environment_id:document.getElementById('tgt-env').value,integration_id:document.getElementById('tgt-int').value||null,connection_mode:'direct'})}); refreshAll(); }
+async function createChangeSet(){ try{const data=await req('/v1/changesets',{method:'POST',headers:headers(),body:JSON.stringify({operation:document.getElementById('chg-op').value,adapter:document.getElementById('chg-adapter').value,target_id:document.getElementById('chg-target').value,requested_by:document.getElementById('chg-requester').value,source_channel:'ui',parameters:JSON.parse(document.getElementById('chg-params').value)})}); document.getElementById('changeset-result').textContent=JSON.stringify(data,null,2); refreshAll();}catch(e){document.getElementById('changeset-result').textContent=e.message;} }
+refreshAll();
+</script>
+</body>
+</html>
