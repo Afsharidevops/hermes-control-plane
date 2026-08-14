@@ -1,345 +1,136 @@
-# Hermes Control Plane — Chat Handover
+# Hermes Control Plane — Development Handover
 
-**Last updated:** 2026-08-14 19:02 +03:30  
-**Current implementation package:** `0.5.10-alpha.2`  
 **Repository:** `Afsharidevops/hermes-control-plane`  
-**Legacy project kept separate:** `Afsharidevops/hermes-linux-stack`
+**Active development branch:** `dev/0.5.10-beta.1`  
+**Frozen releases:** `v0.5.10-alpha.1`, `v0.5.10-alpha.2`  
+**Current package:** `0.5.10-beta.1-dev.1`
 
-## How to resume in a later ChatGPT conversation
+## Project purpose
 
-Upload this file (and, when useful, the latest project ZIP) and say:
+Hermes Control Plane is a self-hosted AI-assisted DevOps management plane. It must run on a Docker/VM installation or Kubernetes and support runtime-selectable 9router or OmniRoute without separate router branches.
 
-> Continue Hermes Control Plane from HANDOVER.md. Inspect the current package/repository state first, preserve the security boundaries and Docker image naming policy, and continue with the next milestone.
+The key product rule is: AI plans; constrained brokers/agents execute. Raw infrastructure credentials must not be exposed to Smart Router/Hermes/LLM-facing services.
 
-## Product direction
+## Existing published image namespace
 
-Hermes Control Plane is the new project derived from Hermes Linux Stack. It is intended to become a self-hosted AI-assisted DevOps control plane with full management from UI/API/CLI/Telegram while keeping privileged credentials and execution outside the LLM trust boundary.
+The new project is isolated from `hermes-linux-stack` by using only `hermes-control-plane-*` repositories:
 
-It must run in either deployment mode:
+- `afsharidevops/hermes-control-plane-api`
+- `afsharidevops/hermes-control-plane-router-gateway`
+- `afsharidevops/hermes-control-plane-smart-router`
+- `afsharidevops/hermes-control-plane-execution-broker`
+- `afsharidevops/hermes-control-plane-kubernetes-broker` (new in beta dev)
+- `afsharidevops/hermes-control-plane-node-agent`
 
-- on-prem VM/bare metal with Docker Compose
-- Kubernetes with the Hermes Control Plane Helm chart
+GitHub Actions uses `DOCKERHUB_USERNAME` as a repository variable and `DOCKERHUB_TOKEN` as an Actions secret. Main publishes `edge` + SHA tags; version tags publish the version; only stable tags publish `latest`.
 
-9router and OmniRoute are runtime-selectable providers in the same codebase. There must not be separate long-lived branches for each provider.
+## Alpha.2 state (frozen and validated)
 
-## Permanent naming/isolation rule
+Alpha.2 was merged into `main`, tagged correctly, published as multi-arch amd64/arm64 images, pulled from Docker Hub, and tested locally with both 9router and OmniRoute. A GitHub prerelease exists. Its development branch was deleted after merge.
 
-The new project must never overwrite Docker Hub repositories owned by `hermes-linux-stack`.
+Alpha.2 implemented Environment/Integration/Target registries, metadata-only credential refs, ChangeSet canonical JSON/SHA-256, risk classification, exact-hash approval binding, expiry, audit, and starter UI. Execution was disabled.
 
-Legacy examples reserved for the old stack:
+## Beta.1 dev.1 implemented in this package
 
-```text
-afsharidevops/hermes-smart-router
-afsharidevops/hermes-execution-broker
-```
+### Kubernetes Broker
 
-New project-owned repositories:
+A new isolated `kubernetes-broker/` service/image contains kubectl and Helm. It has no Docker socket and no router authority.
 
-```text
-afsharidevops/hermes-control-plane-api
-afsharidevops/hermes-control-plane-router-gateway
-afsharidevops/hermes-control-plane-smart-router
-afsharidevops/hermes-control-plane-execution-broker
-afsharidevops/hermes-control-plane-node-agent
-```
+Capabilities:
+- Kubernetes discovery (`version`, namespaces, nodes, deployments/statefulsets/daemonsets)
+- manifest server-side dry-run + diff
+- guarded server-side apply
+- Helm install/upgrade server dry-run with secret hiding
+- Helm install/upgrade execution + status verification
+- Helm rollback planning + execution
+- conservative manifest kind allowlist
+- explicit deny of Secrets, RBAC, admission webhooks, CSRs and CRDs
+- broker-enforced namespace allow/deny and kind allow/deny target scopes
+- Namespace mutation requires explicit `allow_cluster_scoped=true`
+- discovery respects namespace scope and hides node inventory unless `cluster_read=true`
 
-This policy must remain consistent in Compose, Helm, local scripts, GitHub Actions and documentation.
+Execution defaults to disabled.
 
-## GitHub / Docker Hub state established by the operator
+### Credential boundary for Docker/VM
 
-GitHub repository exists:
+`hermesctl kubeconfig import <name> <file>`:
+- calls the Control Plane to create an opaque kubeconfig credential reference
+- copies the kubeconfig locally to `data/kubeconfigs/<credential-id>.yaml` mode `0600`
+- records only file ID + SHA-256 fingerprint in the Control Plane
+- Kubernetes Broker receives the directory read-only
 
-```text
-https://github.com/Afsharidevops/hermes-control-plane
-```
+The Control Plane never receives the kubeconfig content. This is a beta file boundary, not the final encrypted credential service.
 
-The operator authenticated GitHub CLI and successfully pushed `main` and `v0.5.10-alpha.1`.
+### ChangeSet schema v2
 
-Docker Hub contains the five isolated `hermes-control-plane-*` repositories above. Alpha.1 images were successfully pushed locally.
+Plans now include an immutable target snapshot with credential metadata/fingerprint. Preview and execution fail if current target/credential metadata differs from the planned snapshot.
 
-GitHub Actions has been connected to Docker Hub using:
+Live Kubernetes/Helm previews come from Kubernetes Broker, not user-supplied text.
 
-```text
-Repository variable: DOCKERHUB_USERNAME=afsharidevops
-Repository secret:   DOCKERHUB_TOKEN=<Docker Hub PAT; value is not stored here>
-```
+Execution requires:
+1. valid stored plan hash
+2. live broker preview
+3. valid exact-hash approval if risk requires approval
+4. unchanged target snapshot
+5. `HERMES_EXECUTION_ENABLED=true`
+6. `HERMES_KUBERNETES_EXECUTION_ENABLED=true`
+7. a short-lived HMAC-signed exact-plan broker ticket
 
-Never request or record the token value in project files or this handover.
+Broker rejects in-process ticket replay.
 
-## CI/release policy
+### Operations Center
 
-Normal image publishing is now GitHub Actions. `scripts/push-images.sh` remains an emergency/manual fallback.
+`/ui` now has Overview, Infrastructure, Changes and Audit views. It includes:
+- environment management
+- kubeconfig reference visibility
+- Kubernetes target creation
+- Kubernetes discovery
+- manifest ChangeSet + live preview
+- Helm ChangeSet + live preview
+- approval and execute controls
 
-Desired Docker tag behavior:
+### CLI
 
-```text
-Pull request        -> build only, no Docker Hub push
-main push           -> :edge + :sha-<commit>
-v0.5.10-alpha.2     -> :0.5.10-alpha.2 (+ sha tag)
-v0.5.10-beta.1      -> :0.5.10-beta.1 (+ sha tag)
-v0.5.10-rc.1        -> :0.5.10-rc.1 (+ sha tag)
-v0.5.10             -> :0.5.10 + :latest (+ sha tag)
-```
+New commands:
+- `hermesctl version`
+- `hermesctl version set <version>`
+- `hermesctl upgrade <version>`
+- `hermesctl kubeconfig import <name> <file>`
+- `hermesctl kubeconfig list`
+- `hermesctl kubeconfig remove <credential-id>`
 
-Alpha/beta/RC tags must never move `latest`.
+`upgrade` verifies published API/Kubernetes Broker image tags, takes a best-effort Control Plane DB backup, updates `.env`, pulls, health-starts, and restores the configured version on failure.
 
-The workflow file is `.github/workflows/publish-images.yml` and builds `linux/amd64,linux/arm64` with Buildx/QEMU.
+## Deployment
 
-## Important current Git/tag issue
+Docker Compose now runs Kubernetes Broker as a core internal service and mounts `./data/kubeconfigs` read-only.
 
-The operator accidentally created and pushed `v0.5.10-alpha.2` before alpha.2 code was implemented. That tag points to alpha.1-era code plus the Docker publishing workflow.
+The Helm chart deploys Kubernetes Broker too. ServiceAccount token automount is false by default. Direct kubeconfigs may be supplied via an existing Kubernetes Secret. The chart intentionally does not create broad Kubernetes RBAC.
 
-Before publishing the real alpha.2, remove the premature tag:
+## Current security limitations / remaining beta work
 
-```bash
-git push origin :refs/tags/v0.5.10-alpha.2 || true
-git tag -d v0.5.10-alpha.2 2>/dev/null || true
-```
+Do not treat dev.1 as feature-complete beta.1. Remaining work:
+- dedicated encrypted credential service / external secret backend
+- agent enrollment/identity/revocation and remote Kubernetes mode
+- Telegram planning + separate approval bot integration
+- GitHub/GitLab adapters and Application registry
+- Docker/Compose/Swarm adapter
+- SSH UI CRUD and credential rotation
+- richer target policy, rollout verification/rollback metadata
+- persistent replay protection / separate approval signing authority
+- Node.js action warning cleanup
 
-If Docker Hub already received a premature `0.5.10-alpha.2` image tag, it does not need a separate deletion; the correct tag-triggered build can replace the tag after the source release is fixed.
+## Next implementation order
 
-## Alpha.1 foundation completed
+1. Test beta dev.1 on a disposable Kubernetes cluster with execution disabled: kubeconfig import, target creation, Discover, manifest live dry-run, Helm live dry-run.
+2. Enable both execution switches only on that disposable cluster and validate exact approval -> apply -> audit.
+3. Add Telegram approval integration using the exact ChangeSet hash.
+4. Add GitHub/GitLab + Application registry.
+5. Add Docker/Compose/Swarm, then SSH.
+6. Merge to `main` only when beta acceptance tests pass; do not tag `v0.5.10-beta.1` from dev.1.
 
-`0.5.10-alpha.1` established:
+## Recommended continuation prompt
 
-- monorepo
-- migrated Smart Router foundation
-- migrated Execution Broker foundation
-- router gateway
-- runtime 9router/OmniRoute selection
-- Control Plane API skeleton
-- Node Agent skeleton
-- Docker Compose deployment
-- initial Helm chart
-- isolated Docker image naming
-- local multi-arch push scripts
-- GitHub validation/publishing foundation
-- architecture/security plan
-
-The operator tested Docker Compose locally. 9router and OmniRoute both started successfully and runtime switching worked.
-
-## Alpha.2 implementation in the current ZIP
-
-The accelerated roadmap merged the old Integration Registry and ChangeSet milestones into one release: **Management + Safety Core**.
-
-Implemented in this package:
-
-### Management registry
-
-- persistent Environment Registry
-- persistent Integration Registry
-- persistent Target Registry
-- credential-reference registry containing metadata only
-- integration environment/scope/connection metadata
-- HTTP/HTTPS connection health probe foundation
-- starter Operations Center management UI at `/ui`
-- alpha.1 SQLite migration/backfill
+Upload the latest source ZIP and this HANDOVER.md, then say:
 
-### ChangeSet safety core
-
-- typed ChangeSet plan envelope
-- deterministic canonical JSON
-- SHA-256 plan hash
-- risk levels: `READ`, `LOW`, `HIGH`, `CRITICAL`
-- risk is computed by the server; callers cannot lower it in the request
-- preview storage
-- ChangeSet states used in alpha.2: `PLANNED`, `PREVIEWED`, `AWAITING_APPROVAL`, `APPROVED`, `REJECTED`, `CANCELLED`, `EXPIRED`
-- approval bound to exact `plan_hash`
-- HIGH/CRITICAL requester self-approval is blocked
-- expiry
-- append-oriented audit events
-- no privileged execute endpoint
-
-### Tests/validation
-
-The generated package was validated in the artifact environment with:
-
-```text
-Control Plane tests: 5 passed
-Python compileall: passed
-Bash syntax checks: passed
-YAML parsing: passed
-```
-
-Docker Engine and Helm were not available in the artifact environment, so Docker Compose runtime and `helm lint` must be confirmed by the operator/GitHub `validate` workflow after push.
-
-## Security invariants that must not be weakened
-
-- LLM/Smart Router must not receive Docker sockets.
-- LLM/Smart Router must not receive raw kubeconfigs.
-- LLM/Smart Router must not receive SSH private keys/passwords.
-- LLM/Smart Router must not receive GitHub/GitLab tokens.
-- LLM/Smart Router must not receive registry passwords.
-- Credential objects in the general Control Plane are opaque references, not secret values.
-- AI may interpret/plan/explain; brokers/agents execute only policy-authorized ChangeSets.
-- Mutation must be plan-first and preview/dry-run-first where supported.
-- Approval must bind to exact target/parameters/revision/policy generation/plan hash.
-- Any material plan change invalidates approval.
-- Critical/destructive behavior is deny-by-default.
-- Secrets must not be pasted into Telegram as the normal credential setup path.
-- Audit must identify requester/planner/approver/executor/target/outcome/hashes.
-
-## Router design
-
-Smart Router uses neutral aliases such as:
-
-```text
-hermes/observe
-hermes/fast
-hermes/standard
-hermes/strong
-hermes/coding
-hermes/vision
-```
-
-`router-gateway` translates/forwards to the selected upstream provider.
-
-Operator commands:
-
-```bash
-./hermesctl router list
-./hermesctl router set nine-router
-./hermesctl router set omniroute
-```
-
-The same repository and deployment packages support both providers.
-
-## Deployment design
-
-Docker/VM:
-
-```bash
-./hermesctl init
-./hermesctl up
-```
-
-After official images are published, pull-only deployment is available in alpha.2:
-
-```bash
-./hermesctl up --pull
-```
-
-Kubernetes:
-
-```bash
-helm upgrade --install hermes-control-plane ./charts/hermes-control-plane \
-  -n hermes-system --create-namespace
-```
-
-The runtime cluster (where Hermes runs) and managed clusters are separate concepts. Managing the runtime/self-hosting cluster later must receive elevated risk.
-
-## Accelerated remaining roadmap
-
-### 0.5.10-beta.1 — feature-complete DevOps adapters
-
-Kubernetes/Helm:
-
-- isolated credential backend for kubeconfig/service-account material
-- direct Kubernetes connection
-- Node Agent Kubernetes connection
-- cluster/namespace/workload discovery
-- logs/events/status
-- manifest server-side dry-run/diff/apply
-- rollout verify/rollback
-- Helm repository/OCI, plan/install/upgrade/rollback
-- namespace/resource allow/deny policy
-- protect Secret values, RBAC escalation and cluster-admin by default
-
-Git/applications:
-
-- GitHub integration (prefer GitHub Apps where possible)
-- GitLab integration (minimum-scoped project/group credentials)
-- Application Registry
-- branch/commit/PR/MR workflows
-- GitOps mode
-- deployment verification and rollback metadata
-
-Docker/Compose/Swarm:
-
-- structured container/Compose plans
-- Compose validate/pull/up/down
-- Swarm stacks/services/scale/update/rollback
-- Docker socket only on isolated broker/agent
-
-SSH:
-
-- Operations Center SSH CRUD
-- fingerprint verification
-- credential rotation reference
-- approved execution through isolated broker/agent
-
-Telegram:
-
-- Hermes bot for planning/status
-- separate approval bot
-- exact ChangeSet summary/hash/expiry in approval
-- approved execution only through broker/agent
-
-### 0.5.10-rc.1 — hardening
-
-- threat-model review
-- real credential service / secret backend and rotation
-- agent enrollment/device identity/replay protection/revocation
-- policy generation invalidation
-- two-person critical approval
-- backup/restore
-- audit retention/export
-- HA
-- Docker-to-Kubernetes migration tests
-- upgrade/rollback tests
-- failure/network-loss tests
-- security/operator docs
-
-### 0.5.10 — stable
-
-Release only after all acceptance gates in `plan.md` pass.
-
-## Recommended next architectural task
-
-Before implementing arbitrary `kubectl`, Helm, Docker, Git or SSH command execution, build the beta adapter contract around the alpha.2 ChangeSet model:
-
-```text
-discover()
-validate()
-plan()
-preview()
-execute()
-verify()
-rollback()
-```
-
-The planner chooses adapters. Adapters do not grant authority. Authority comes from policy plus target-scoped credentials and a valid approval envelope.
-
-The first beta vertical slice should be Kubernetes + Helm because it exercises discovery, credentials, dry-run/diff, high-risk approval, execution, verification and rollback. Build it end-to-end for one safe namespace before adding broad Git/Docker/SSH mutation.
-
-## Fast alpha.2 release commands
-
-See `docs/UPGRADE-ALPHA2.md`. The intended flow is:
-
-1. delete the premature alpha.2 tag
-2. overlay the alpha.2 ZIP on the existing checkout
-3. update existing `.env` to `VERSION=0.5.10-alpha.2`
-4. run verification
-5. commit/push directly to `main` for the fastest alpha release
-6. wait for `validate`
-7. recreate/push `v0.5.10-alpha.2`
-8. let GitHub Actions publish all five multi-arch images
-9. test `./hermesctl up --pull`
-
-## Files to inspect first in the next chat
-
-```text
-HANDOVER.md
-plan.md
-SECURITY.md
-docs/ALPHA2.md
-docs/UPGRADE-ALPHA2.md
-control-plane/src/hermes_control_plane/main.py
-control-plane/src/hermes_control_plane/db.py
-control-plane/src/hermes_control_plane/models.py
-control-plane/src/hermes_control_plane/risk.py
-.github/workflows/validate.yml
-.github/workflows/publish-images.yml
-docker-compose.yml
-charts/hermes-control-plane/
-```
+> Continue Hermes Control Plane from HANDOVER.md. Inspect the package first. Continue `dev/0.5.10-beta.1` from the current Kubernetes + Helm vertical slice without weakening the ChangeSet/credential/approval boundaries.

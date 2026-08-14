@@ -2,7 +2,7 @@
 
 **Target:** `0.5.10`
 
-**Current development release:** `0.5.10-alpha.2`
+**Current development release:** `0.5.10-beta.1-dev.1`
 
 **Project:** `hermes-control-plane`
 
@@ -608,15 +608,23 @@ The roadmap is intentionally compressed so development can move faster while pre
 - migration/backfill from the alpha.1 SQLite schema
 - privileged execution remains disabled
 
-### 0.5.10-beta.1 — feature-complete DevOps adapters
+### 0.5.10-beta.1 — feature-complete DevOps adapters (in progress)
 
-Kubernetes + Helm:
-- direct kubeconfig connection through the credential boundary
-- agent Kubernetes connection
-- Kubernetes discovery
-- manifest server dry-run/diff/apply
-- Helm plan/install/upgrade/rollback
-- namespace/resource policy
+Kubernetes + Helm dev.1 implemented:
+- Docker/VM direct kubeconfig reference + fingerprint boundary
+- Kubernetes Broker isolated from Smart Router
+- Kubernetes discovery without Secret reads
+- manifest server dry-run/diff and guarded apply
+- Helm install/upgrade server dry-run and guarded execution
+- Helm rollback planning/execution
+- target snapshot drift invalidation
+- signed short-lived execution tickets
+- conservative manifest resource safety floor
+
+Remaining Kubernetes + Helm beta work:
+- production credential service / external secret backend
+- agent Kubernetes connection and enrollment
+- richer namespace/resource policy and rollout rollback metadata
 
 Git + applications:
 - GitHub integration

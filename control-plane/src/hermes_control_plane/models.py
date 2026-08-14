@@ -108,3 +108,8 @@ class ApprovalDecision(StrictModel):
 class RejectDecision(StrictModel):
     actor: str = Field(min_length=1, max_length=160)
     reason: str | None = Field(default=None, max_length=1000)
+
+
+class ExecuteDecision(StrictModel):
+    actor: str = Field(min_length=1, max_length=160)
+

@@ -19,13 +19,15 @@ jobs:
           python-version: '3.12'
 
       - name: Compile Python services
-        run: python -m compileall -q control-plane/src router-gateway/src node-agent/src
+        run: python -m compileall -q control-plane/src router-gateway/src node-agent/src kubernetes-broker/src
 
-      - name: Test Control Plane alpha.2 safety core
+      - name: Test Control Plane safety core and beta Kubernetes flow
         run: |
           python -m pip install --upgrade pip
           pip install -r control-plane/requirements-dev.txt
+          pip install -r kubernetes-broker/requirements-dev.txt
           PYTHONPATH=control-plane/src pytest -q control-plane/tests
+          PYTHONPATH=kubernetes-broker/src pytest -q kubernetes-broker/tests
 
       - name: Validate Compose
         run: |

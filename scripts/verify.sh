@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-python3 -m compileall -q "$ROOT/control-plane/src" "$ROOT/router-gateway/src" "$ROOT/node-agent/src"
+python3 -m compileall -q "$ROOT/control-plane/src" "$ROOT/router-gateway/src" "$ROOT/node-agent/src" "$ROOT/kubernetes-broker/src"
 ROOT="$ROOT" python3 - <<'PY'
 from pathlib import Path
 import os
 root=Path(os.environ['ROOT'])
-for f in ['plan.md','README.md','HANDOVER.md','docker-compose.yml','charts/hermes-control-plane/Chart.yaml','docs/ALPHA2.md']:
+for f in ['plan.md','README.md','HANDOVER.md','docker-compose.yml','charts/hermes-control-plane/Chart.yaml','docs/ALPHA2.md','docs/BETA1.md']:
     p=root/f
     if not p.exists() or not p.read_text().strip():
         raise SystemExit(f'missing/empty: {p}')
@@ -17,6 +17,14 @@ import fastapi, httpx, pytest
 PY
 then
   PYTHONPATH="$ROOT/control-plane/src" python3 -m pytest -q "$ROOT/control-plane/tests"
+  if PYTHONPATH="$ROOT/kubernetes-broker/src" python3 - <<'PY2' >/dev/null 2>&1
+import yaml
+PY2
+  then
+    PYTHONPATH="$ROOT/kubernetes-broker/src" python3 -m pytest -q "$ROOT/kubernetes-broker/tests"
+  else
+    echo "kubernetes-broker tests: skipped locally (install kubernetes-broker/requirements-dev.txt); CI runs them"
+  fi
 else
   echo "control-plane tests: skipped locally (install control-plane/requirements-dev.txt); CI runs them"
 fi

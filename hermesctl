@@ -2,6 +2,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SHELL_VERSION_OVERRIDE="${VERSION-}"
+SHELL_NAMESPACE_OVERRIDE="${IMAGE_NAMESPACE-}"
 ENV_FILE="$ROOT/.env"
 COMPOSE=(docker compose --project-directory "$ROOT" --env-file "$ENV_FILE")
 
@@ -51,6 +53,8 @@ init_env() {
   load_env
   declare -A sizes=(
     [HERMES_CONTROL_ADMIN_TOKEN]=32
+    [HERMES_KUBERNETES_BROKER_TOKEN]=32
+    [HERMES_EXECUTION_HMAC_KEY]=32
     [ROUTER_GATEWAY_ADMIN_TOKEN]=32
     [SMART_ROUTER_HMAC_SECRET]=32
     [SMART_ROUTER_CLIENT_API_KEY]=32
@@ -138,6 +142,8 @@ cmd_status() {
   echo
   curl -fsS "http://${ROUTER_GATEWAY_BIND_IP:-127.0.0.1}:${ROUTER_GATEWAY_PORT:-8790}/health" 2>/dev/null || true
   echo
+  curl -fsS "http://${KUBERNETES_BROKER_BIND_IP:-127.0.0.1}:${KUBERNETES_BROKER_PORT:-8830}/health" 2>/dev/null || true
+  echo
 }
 
 cmd_router_list() {
@@ -172,10 +178,107 @@ cmd_router_set() {
   fi
 }
 
+
+cmd_version() {
+  local action="${1:-show}" value="${2:-}"
+  [[ -f "$ENV_FILE" ]] || fail ".env does not exist; run ./hermesctl init"
+  case "$action" in
+    show|"")
+      local configured repo running
+      configured="$(grep '^VERSION=' "$ENV_FILE" | tail -1 | cut -d= -f2-)"
+      repo="$(cat "$ROOT/VERSION")"
+      running="$(curl -fsS "http://127.0.0.1:${CONTROL_PLANE_PORT:-8800}/health" 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("version","unknown"))' 2>/dev/null || true)"
+      echo "Repository: ${repo:-unknown}"
+      echo "Configured: ${configured:-unknown}"
+      echo "Running: ${running:-not-running}"
+      ;;
+    set)
+      [[ "$value" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]] || fail "invalid version: $value"
+      set_env VERSION "$value"
+      echo "Configured VERSION=$value"
+      ;;
+    *) fail "usage: ./hermesctl version [set <version>]" ;;
+  esac
+}
+
+cmd_upgrade() {
+  need docker
+  local target="${1:-}"
+  [[ -n "$target" ]] || fail "usage: ./hermesctl upgrade <version>"
+  [[ "$target" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]] || fail "invalid version: $target"
+  load_env
+  local old="${VERSION:-}"
+  local ns="${IMAGE_NAMESPACE:-afsharidevops}"
+  info "verifying published release images for $target"
+  docker buildx imagetools inspect "$ns/hermes-control-plane-api:$target" >/dev/null || fail "API image tag not found"
+  docker buildx imagetools inspect "$ns/hermes-control-plane-kubernetes-broker:$target" >/dev/null || fail "Kubernetes Broker image tag not found"
+  mkdir -p "$ROOT/backups"
+  if "${COMPOSE[@]}" ps --status running --services | grep -qx control-plane; then
+    local stamp
+    stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+    "${COMPOSE[@]}" cp control-plane:/data/control-plane.sqlite3 "$ROOT/backups/control-plane-$stamp.sqlite3" >/dev/null 2>&1 || true
+  fi
+  set_env VERSION "$target"
+  if ! cmd_up --pull; then
+    echo "Upgrade failed; restoring configured version $old" >&2
+    set_env VERSION "$old"
+    cmd_up --pull || true
+    return 1
+  fi
+  info "upgrade complete: $old -> $target"
+}
+
+cmd_kubeconfig_import() {
+  need curl; need python3; need sha256sum
+  local name="${1:-}" file="${2:-}"
+  [[ -n "$name" && -f "$file" ]] || fail "usage: ./hermesctl kubeconfig import <name> <file>"
+  load_env
+  local sha response id dest
+  sha="$(sha256sum "$file" | awk '{print $1}')"
+  response="$(python3 - "$name" "$sha" <<'PYJSON' | curl -fsS -X POST \
+      -H "Authorization: Bearer ${HERMES_CONTROL_ADMIN_TOKEN}" -H 'Content-Type: application/json' \
+      --data-binary @- "http://${CONTROL_PLANE_BIND_IP:-127.0.0.1}:${CONTROL_PLANE_PORT:-8800}/v1/credential-refs"
+import json,sys
+print(json.dumps({"name":sys.argv[1],"kind":"kubeconfig","provider":"local-file","metadata":{"storage":"local-kubeconfig","sha256":sys.argv[2]}}))
+PYJSON
+  )"
+  id="$(printf '%s' "$response" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')"
+  dest="$ROOT/data/kubeconfigs/${id}.yaml"
+  install -m 0600 "$file" "$dest"
+  python3 - "$sha" "$id" <<'PYJSON' | curl -fsS -X PATCH \
+      -H "Authorization: Bearer ${HERMES_CONTROL_ADMIN_TOKEN}" -H 'Content-Type: application/json' \
+      --data-binary @- "http://${CONTROL_PLANE_BIND_IP:-127.0.0.1}:${CONTROL_PLANE_PORT:-8800}/v1/credential-refs/$id" | python3 -m json.tool
+import json,sys
+print(json.dumps({"metadata":{"storage":"local-kubeconfig","sha256":sys.argv[1],"file":sys.argv[2]+".yaml"}}))
+PYJSON
+  echo "Stored kubeconfig material at $dest (mode 0600). The Control Plane stores only its reference/fingerprint."
+}
+
+cmd_kubeconfig_list() {
+  need curl; need python3
+  load_env
+  curl -fsS "http://${CONTROL_PLANE_BIND_IP:-127.0.0.1}:${CONTROL_PLANE_PORT:-8800}/v1/credential-refs" | python3 -c 'import json,sys; print(json.dumps([x for x in json.load(sys.stdin) if x.get("kind")=="kubeconfig"], indent=2))'
+}
+
+cmd_kubeconfig_remove() {
+  need curl
+  local id="${1:-}"
+  [[ "$id" =~ ^cred_[0-9a-f]{16}$ ]] || fail "usage: ./hermesctl kubeconfig remove <credential-id>"
+  load_env
+  curl -fsS -X DELETE -H "Authorization: Bearer ${HERMES_CONTROL_ADMIN_TOKEN}" "http://${CONTROL_PLANE_BIND_IP:-127.0.0.1}:${CONTROL_PLANE_PORT:-8800}/v1/credential-refs/$id"
+  rm -f "$ROOT/data/kubeconfigs/$id.yaml"
+  echo "Removed $id"
+}
+
 cmd_doctor() {
   need python3
   echo "Hermes Control Plane doctor"
   echo "Version: $(cat "$ROOT/VERSION")"
+  local file_version file_ns
+  file_version="$(grep '^VERSION=' "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2- || true)"
+  file_ns="$(grep '^IMAGE_NAMESPACE=' "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2- || true)"
+  if [[ -n "$SHELL_VERSION_OVERRIDE" && "$SHELL_VERSION_OVERRIDE" != "$file_version" ]]; then echo "[warn] shell VERSION=$SHELL_VERSION_OVERRIDE differs from .env VERSION=$file_version"; fi
+  if [[ -n "$SHELL_NAMESPACE_OVERRIDE" && "$SHELL_NAMESPACE_OVERRIDE" != "$file_ns" ]]; then echo "[warn] shell IMAGE_NAMESPACE=$SHELL_NAMESPACE_OVERRIDE differs from .env IMAGE_NAMESPACE=$file_ns"; fi
   for c in docker curl openssl python3; do
     if command -v "$c" >/dev/null 2>&1; then echo "[ok] $c"; else echo "[missing] $c"; fi
   done
@@ -198,6 +301,12 @@ Commands:
   router list                  Show configured router health and active provider
   router set nine-router       Start/select 9router
   router set omniroute         Start/select OmniRoute
+  version                      Show repository/configured/running versions
+  version set <version>        Set .env VERSION explicitly
+  upgrade <version>            Verify, backup, pull and upgrade a published release
+  kubeconfig import <n> <file> Import kubeconfig material locally and create a reference
+  kubeconfig list              List kubeconfig credential references
+  kubeconfig remove <id>       Remove unused kubeconfig reference and local material
 TXT
 }
 
@@ -207,6 +316,16 @@ case "${1:-}" in
   down) cmd_down ;;
   status) cmd_status ;;
   doctor) cmd_doctor ;;
+  version) cmd_version "${2:-show}" "${3:-}" ;;
+  upgrade) cmd_upgrade "${2:-}" ;;
+  kubeconfig)
+    case "${2:-}" in
+      import) cmd_kubeconfig_import "${3:-}" "${4:-}" ;;
+      list) cmd_kubeconfig_list ;;
+      remove) cmd_kubeconfig_remove "${3:-}" ;;
+      *) usage; exit 2 ;;
+    esac
+    ;;
   router)
     case "${2:-}" in
       list) cmd_router_list ;;

@@ -8,6 +8,7 @@ for spec in \
   "hermes-control-plane-router-gateway:router-gateway" \
   "hermes-control-plane-smart-router:smart-router" \
   "hermes-control-plane-execution-broker:execution-broker" \
+  "hermes-control-plane-kubernetes-broker:kubernetes-broker" \
   "hermes-control-plane-node-agent:node-agent"; do
   name="${spec%%:*}"; dir="${spec#*:}"
   echo "==> building ${NS}/${name}:${VERSION}"

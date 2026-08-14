@@ -22,7 +22,7 @@ The token value must never be committed.
 
 - pull request: build only, no push
 - `main`: `edge` plus immutable `sha-...`
-- prerelease tag such as `v0.5.10-alpha.2`: `0.5.10-alpha.2` (and `sha-...`)
+- prerelease tag such as `v0.5.10-beta.1`: `0.5.10-beta.1` (and `sha-...`)
 - stable tag such as `v0.5.10`: `0.5.10`, `sha-...`, and `latest`
 
 `latest` is deliberately not moved by alpha/beta/RC releases.
@@ -31,7 +31,7 @@ The token value must never be committed.
 
 ```bash
 docker login
-IMAGE_NAMESPACE=afsharidevops VERSION=0.5.10-alpha.2 ./scripts/push-images.sh
+IMAGE_NAMESPACE=afsharidevops VERSION=0.5.10-beta.1 ./scripts/push-images.sh
 ```
 
 The fallback script follows the same rule: only a stable `x.y.z` version also updates `latest`.

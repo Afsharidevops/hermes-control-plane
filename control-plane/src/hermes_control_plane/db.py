@@ -175,7 +175,9 @@ def init_db() -> None:
                     approval_required INTEGER NOT NULL DEFAULT 0,
                     policy_generation INTEGER NOT NULL DEFAULT 1,
                     expires_at INTEGER,
-                    updated_at INTEGER
+                    updated_at INTEGER,
+                    execution_json TEXT,
+                    executed_at INTEGER
                 )"""
             )
         else:
@@ -190,6 +192,8 @@ def init_db() -> None:
                 "policy_generation": "INTEGER NOT NULL DEFAULT 1",
                 "expires_at": "INTEGER",
                 "updated_at": "INTEGER",
+                "execution_json": "TEXT",
+                "executed_at": "INTEGER",
             }
             for name, ddl in additions.items():
                 if name not in cols:
@@ -225,7 +229,7 @@ def init_db() -> None:
                 (canonical, plan_hash, plan_hash, row["id"]),
             )
 
-        conn.execute("PRAGMA user_version = 2")
+        conn.execute("PRAGMA user_version = 3")
         conn.commit()
 
 

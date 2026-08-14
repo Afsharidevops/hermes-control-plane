@@ -15,6 +15,8 @@ from fastapi.responses import FileResponse
 
 from . import db
 from .canonical import canonical_json, sha256_hex
+from . import kubernetes as kubernetes_broker
+from .tickets import issue_ticket
 from .models import (
     ApprovalDecision,
     ChangeSetCreate,
@@ -22,6 +24,7 @@ from .models import (
     CredentialRefUpdate,
     EnvironmentCreate,
     EnvironmentUpdate,
+    ExecuteDecision,
     IntegrationCreate,
     IntegrationUpdate,
     PreviewCreate,
@@ -31,7 +34,7 @@ from .models import (
 )
 from .risk import approval_required, classify
 
-VERSION = "0.5.10-alpha.2"
+VERSION = "0.5.10-beta.1-dev.1"
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 
@@ -44,7 +47,7 @@ async def lifespan(_: FastAPI):
 app = FastAPI(
     title="Hermes Control Plane API",
     version=VERSION,
-    description="Management + safety core for Hermes Control Plane v0.5.10-alpha.2",
+    description="Kubernetes + Helm beta vertical slice for Hermes Control Plane",
     lifespan=lifespan,
 )
 
@@ -107,14 +110,52 @@ def _target_dict(row: Any) -> dict[str, Any]:
     return _row_json(row, {"scope_json": "scope", "labels_json": "labels"})
 
 
+def _credential_snapshot(conn, credential_ref: str | None) -> dict[str, Any] | None:
+    if not credential_ref:
+        return None
+    row = _get_credential_ref(conn, credential_ref)
+    return {
+        "id": row["id"],
+        "kind": row["kind"],
+        "provider": row["provider"],
+        "status": row["status"],
+        "metadata": json.loads(row["metadata_json"] or "{}"),
+        "updated_at": row["updated_at"],
+    }
+
+
+def _target_snapshot(conn, target_id: str) -> dict[str, Any]:
+    row = conn.execute("SELECT * FROM targets WHERE id=?", (target_id,)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="target not found")
+    target = _target_dict(row)
+    snapshot = {
+        "id": target["id"],
+        "name": target["name"],
+        "kind": target["kind"],
+        "environment_id": target["environment_id"],
+        "integration_id": target["integration_id"],
+        "credential_ref": target["credential_ref"],
+        "connection_mode": target["connection_mode"],
+        "address": target["address"],
+        "scope": target["scope"],
+        "status": target["status"],
+        "credential_snapshot": _credential_snapshot(conn, target["credential_ref"]),
+    }
+    snapshot["snapshot_hash"] = sha256_hex(snapshot)
+    return snapshot
+
+
 def _changeset_dict(row: Any) -> dict[str, Any]:
     item = dict(row)
     item["parameters"] = json.loads(item.pop("parameters_json") or "{}")
     item["plan"] = json.loads(item.pop("plan_json") or "{}")
     item["preview"] = json.loads(item.pop("preview_json") or "null")
+    item["execution"] = json.loads(item.pop("execution_json", None) or "null")
     item["approval_required"] = bool(item["approval_required"])
-    item["executable"] = False
-    item["execution_note"] = "alpha.2 intentionally has no privileged execute endpoint"
+    enabled = os.getenv("HERMES_EXECUTION_ENABLED", "false").lower() == "true"
+    item["executable"] = enabled and item["adapter"] in {"kubernetes", "helm"}
+    item["execution_note"] = "beta.1 execution requires live preview, approval when required, target snapshot match, and a signed one-time broker ticket"
     return item
 
 
@@ -122,7 +163,7 @@ def _changeset(conn, changeset_id: str):
     row = conn.execute("SELECT * FROM changesets WHERE id=?", (changeset_id,)).fetchone()
     if not row:
         raise HTTPException(status_code=404, detail="changeset not found")
-    if row["expires_at"] and int(row["expires_at"]) < int(time.time()) and row["state"] not in {"REJECTED", "CANCELLED", "EXPIRED"}:
+    if row["expires_at"] and int(row["expires_at"]) < int(time.time()) and row["state"] not in {"REJECTED", "CANCELLED", "EXPIRED", "EXECUTED", "FAILED"}:
         conn.execute("UPDATE changesets SET state='EXPIRED', updated_at=? WHERE id=?", (int(time.time()), changeset_id))
         db.audit(conn, "changeset.expired", "system", "changeset", changeset_id, {"plan_hash": row["plan_hash"]})
         conn.commit()
@@ -158,10 +199,10 @@ def system() -> dict[str, Any]:
     return {
         "name": "Hermes Control Plane",
         "version": VERSION,
-        "stage": "alpha",
+        "stage": "beta-dev",
         "runtime": os.getenv("HERMES_RUNTIME", "docker"),
-        "capabilities": ["integration-registry", "target-registry", "credential-references", "changeset-planning", "risk-engine", "approval-binding", "audit"],
-        "execution_enabled": False,
+        "capabilities": ["integration-registry", "target-registry", "credential-references", "changeset-planning", "risk-engine", "approval-binding", "audit", "kubernetes-discovery", "kubernetes-server-dry-run", "helm-server-dry-run", "signed-execution-tickets"],
+        "execution_enabled": os.getenv("HERMES_EXECUTION_ENABLED", "false").lower() == "true",
         "counts": counts,
     }
 
@@ -493,20 +534,22 @@ def create_changeset(payload: ChangeSetCreate, authorization: str | None = Heade
     expires_at = created_at + payload.ttl_seconds
     changeset_id = f"chg_{uuid.uuid4().hex[:16]}"
     risk = classify(payload.operation)
-    plan = {
-        "schema_version": 1,
-        "operation": payload.operation,
-        "adapter": payload.adapter,
-        "target_id": payload.target_id,
-        "source_revision": payload.source_revision,
-        "parameters": payload.parameters,
-        "policy_generation": payload.policy_generation,
-    }
-    plan_json = canonical_json(plan)
-    plan_hash = sha256_hex(plan)
     with closing(db.connect()) as conn:
-        if not conn.execute("SELECT 1 FROM targets WHERE id=?", (payload.target_id,)).fetchone():
-            raise HTTPException(status_code=404, detail="target not found")
+        target_snapshot = _target_snapshot(conn, payload.target_id)
+        if target_snapshot["status"] != "configured":
+            raise HTTPException(status_code=409, detail="target is disabled")
+        plan = {
+            "schema_version": 2,
+            "operation": payload.operation,
+            "adapter": payload.adapter,
+            "target_id": payload.target_id,
+            "source_revision": payload.source_revision,
+            "parameters": payload.parameters,
+            "policy_generation": payload.policy_generation,
+            "target_snapshot": target_snapshot,
+        }
+        plan_json = canonical_json(plan)
+        plan_hash = sha256_hex(plan)
         conn.execute(
             """INSERT INTO changesets
             (id,operation,target_id,requested_by,source_channel,risk,parameters_json,content_hash,state,created_at,adapter,source_revision,plan_json,plan_hash,preview_json,approval_required,policy_generation,expires_at,updated_at)
@@ -575,7 +618,7 @@ def approve_changeset(changeset_id: str, payload: ApprovalDecision, authorizatio
         conn.execute("UPDATE changesets SET state='APPROVED',updated_at=? WHERE id=?", (now, changeset_id))
         db.audit(conn, "changeset.approved", payload.approver, "changeset", changeset_id, {"approval_id": approval_id, "plan_hash": row["plan_hash"], "expires_at": expires_at})
         conn.commit()
-    return {"id": approval_id, "changeset_id": changeset_id, "plan_hash": payload.plan_hash, "approver": payload.approver, "status": "APPROVED", "issued_at": now, "expires_at": expires_at, "execution_enabled": False}
+    return {"id": approval_id, "changeset_id": changeset_id, "plan_hash": payload.plan_hash, "approver": payload.approver, "status": "APPROVED", "issued_at": now, "expires_at": expires_at, "execution_enabled": os.getenv("HERMES_EXECUTION_ENABLED", "false").lower() == "true"}
 
 
 @app.post("/v1/changesets/{changeset_id}/reject")
@@ -608,6 +651,98 @@ def cancel_changeset(changeset_id: str, payload: RejectDecision, authorization: 
         conn.commit()
         updated = conn.execute("SELECT * FROM changesets WHERE id=?", (changeset_id,)).fetchone()
     return _changeset_dict(updated)
+
+
+@app.post("/v1/kubernetes/targets/{target_id}/discover")
+async def discover_kubernetes_target(target_id: str, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_admin(authorization)
+    with closing(db.connect()) as conn:
+        snapshot = _target_snapshot(conn, target_id)
+    if snapshot["kind"] != "kubernetes":
+        raise HTTPException(status_code=422, detail="target is not kubernetes")
+    result = await kubernetes_broker.post("/v1/discover", {"target_snapshot": snapshot})
+    with closing(db.connect()) as conn:
+        db.audit(conn, "kubernetes.discovered", "admin", "target", target_id, {"snapshot_hash": snapshot["snapshot_hash"]})
+        conn.commit()
+    return result
+
+
+@app.post("/v1/changesets/{changeset_id}/preview-live")
+async def preview_changeset_live(changeset_id: str, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_admin(authorization)
+    with closing(db.connect()) as conn:
+        row = _changeset(conn, changeset_id)
+        if row["state"] not in {"PLANNED", "PREVIEWED"}:
+            raise HTTPException(status_code=409, detail=f"cannot preview ChangeSet in state {row['state']}")
+        if row["adapter"] not in {"kubernetes", "helm"}:
+            raise HTTPException(status_code=422, detail="live preview is currently available only for Kubernetes/Helm adapters")
+        plan = json.loads(row["plan_json"] or "{}")
+        if sha256_hex(plan) != row["plan_hash"]:
+            raise HTTPException(status_code=409, detail="stored ChangeSet hash verification failed")
+        current = _target_snapshot(conn, row["target_id"])
+        if current != plan.get("target_snapshot"):
+            raise HTTPException(status_code=409, detail="target or credential metadata changed after planning; create a new ChangeSet")
+    result = await kubernetes_broker.post("/v1/preview", {"plan": plan})
+    now = int(time.time())
+    preview = {"summary": result.get("summary", "Live broker preview completed"), "details": result, "generated_at": now, "source": "kubernetes-broker"}
+    with closing(db.connect()) as conn:
+        conn.execute("UPDATE changesets SET preview_json=?,state='PREVIEWED',updated_at=? WHERE id=?", (json.dumps(preview, sort_keys=True), now, changeset_id))
+        db.audit(conn, "changeset.previewed.live", "kubernetes-broker", "changeset", changeset_id, {"plan_hash": row["plan_hash"]})
+        conn.commit()
+        updated = conn.execute("SELECT * FROM changesets WHERE id=?", (changeset_id,)).fetchone()
+    return _changeset_dict(updated)
+
+
+@app.post("/v1/changesets/{changeset_id}/execute")
+async def execute_changeset(changeset_id: str, payload: ExecuteDecision, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_admin(authorization)
+    if os.getenv("HERMES_EXECUTION_ENABLED", "false").lower() != "true":
+        raise HTTPException(status_code=403, detail="Control Plane execution is disabled; set HERMES_EXECUTION_ENABLED=true only after review")
+    now = int(time.time())
+    with closing(db.connect()) as conn:
+        row = _changeset(conn, changeset_id)
+        if row["state"] not in {"PREVIEWED", "APPROVED"}:
+            raise HTTPException(status_code=409, detail="ChangeSet must have a live preview and any required approval before execution")
+        plan = json.loads(row["plan_json"] or "{}")
+        if sha256_hex(plan) != row["plan_hash"]:
+            raise HTTPException(status_code=409, detail="stored ChangeSet hash verification failed")
+        current = _target_snapshot(conn, row["target_id"])
+        if current != plan.get("target_snapshot"):
+            raise HTTPException(status_code=409, detail="target or credential metadata changed after approval; create a new ChangeSet")
+        preview = json.loads(row["preview_json"] or "null")
+        if not preview or preview.get("source") != "kubernetes-broker":
+            raise HTTPException(status_code=409, detail="a live Kubernetes Broker preview is required")
+        if row["approval_required"]:
+            approval = conn.execute("SELECT * FROM approvals WHERE changeset_id=? AND plan_hash=? AND status='APPROVED' ORDER BY issued_at DESC LIMIT 1", (changeset_id, row["plan_hash"])).fetchone()
+            if not approval or int(approval["expires_at"]) < now:
+                raise HTTPException(status_code=409, detail="no valid approval is bound to this exact plan hash")
+        try:
+            ticket, signature = issue_ticket(changeset_id, row["plan_hash"], plan)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        conn.execute("UPDATE changesets SET state='EXECUTING',updated_at=? WHERE id=?", (now, changeset_id))
+        db.audit(conn, "changeset.execution.started", payload.actor, "changeset", changeset_id, {"plan_hash": row["plan_hash"]})
+        conn.commit()
+    try:
+        result = await kubernetes_broker.post("/v1/execute", {"ticket": ticket, "signature": signature})
+        state = "EXECUTED"
+    except HTTPException as exc:
+        result = {"error": exc.detail, "status_code": exc.status_code}
+        state = "FAILED"
+    finished = int(time.time())
+    with closing(db.connect()) as conn:
+        conn.execute("UPDATE changesets SET state=?,execution_json=?,executed_at=?,updated_at=? WHERE id=?", (state, json.dumps(result, sort_keys=True), finished, finished, changeset_id))
+        db.audit(conn, f"changeset.execution.{state.lower()}", payload.actor, "changeset", changeset_id, {"plan_hash": ticket["plan_hash"]})
+        conn.commit()
+        updated = conn.execute("SELECT * FROM changesets WHERE id=?", (changeset_id,)).fetchone()
+    if state == "FAILED":
+        raise HTTPException(status_code=502, detail=_changeset_dict(updated))
+    return _changeset_dict(updated)
+
+
+@app.get("/v1/kubernetes/broker-health")
+async def kubernetes_broker_health() -> dict[str, Any]:
+    return await kubernetes_broker.health()
 
 
 @app.get("/v1/changesets/{changeset_id}/approvals")

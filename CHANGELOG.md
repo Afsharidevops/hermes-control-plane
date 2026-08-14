@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.5.10-beta.1-dev.1
+
+- add isolated Kubernetes Broker image with kubectl/Helm
+- add kubeconfig local-reference/fingerprint boundary for Docker/VM
+- add ChangeSet schema v2 target snapshots and drift invalidation
+- add Kubernetes discovery, server-side manifest dry-run/diff and guarded apply
+- add Helm server dry-run, install/upgrade verification and rollback flow
+- add signed short-lived exact-plan execution tickets
+- keep Kubernetes and Control Plane execution disabled by default
+- add Kubernetes-focused Operations Center workflows
+- add hermesctl kubeconfig/version/upgrade commands
+- add Docker Compose/Helm/CI wiring for Kubernetes Broker
+
 ## 0.5.10-alpha.2
 
 - merged Integration Registry and ChangeSet milestones into one Management + Safety Core release

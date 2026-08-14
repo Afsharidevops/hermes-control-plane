@@ -1,5 +1,5 @@
 imageNamespace: afsharidevops
-imageTag: 0.5.10-alpha.2
+imageTag: 0.5.10-beta.1-dev.1
 imagePullPolicy: IfNotPresent
 
 router:
@@ -15,9 +15,20 @@ routers:
 
 controlPlane:
   enabled: true
+  executionEnabled: false
   service:
     type: ClusterIP
     port: 8800
+
+kubernetesBroker:
+  enabled: true
+  executionEnabled: false
+  commandTimeout: 60
+  kubeconfigSecret: ""
+  service:
+    port: 8830
+  inCluster:
+    automountServiceAccountToken: false
 
 routerGateway:
   enabled: true
@@ -42,6 +53,8 @@ nodeAgent:
 secrets:
   existingSecret: ""
   controlAdminToken: ""
+  kubernetesBrokerToken: ""
+  executionHmacKey: ""
   routerGatewayAdminToken: ""
   smartRouterHmacSecret: ""
   smartRouterClientApiKey: ""

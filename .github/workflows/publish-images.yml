@@ -31,6 +31,8 @@ jobs:
             context: ./smart-router
           - image: hermes-control-plane-execution-broker
             context: ./execution-broker
+          - image: hermes-control-plane-kubernetes-broker
+            context: ./kubernetes-broker
           - image: hermes-control-plane-node-agent
             context: ./node-agent
 

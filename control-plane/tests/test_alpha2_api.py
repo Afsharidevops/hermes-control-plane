@@ -136,4 +136,4 @@ def test_audit_events_are_written(client: TestClient):
 def test_ui_is_served(client: TestClient):
     r = client.get("/ui")
     assert r.status_code == 200
-    assert "Management + Safety Core" in r.text
+    assert "Kubernetes + Helm vertical slice" in r.text

@@ -73,7 +73,7 @@ services:
       start_period: 40s
 
   router-gateway:
-    image: ${IMAGE_NAMESPACE:-afsharidevops}/hermes-control-plane-router-gateway:${VERSION:-0.5.10-alpha.2}
+    image: ${IMAGE_NAMESPACE:-afsharidevops}/hermes-control-plane-router-gateway:${VERSION:-0.5.10-beta.1-dev.1}
     build:
       context: ./router-gateway
     restart: unless-stopped
@@ -106,7 +106,7 @@ services:
     networks: [app-net]
 
   smart-router:
-    image: ${IMAGE_NAMESPACE:-afsharidevops}/hermes-control-plane-smart-router:${VERSION:-0.5.10-alpha.2}
+    image: ${IMAGE_NAMESPACE:-afsharidevops}/hermes-control-plane-smart-router:${VERSION:-0.5.10-beta.1-dev.1}
     build:
       context: ./smart-router
     restart: unless-stopped
@@ -155,8 +155,31 @@ services:
     security_opt: ["no-new-privileges:true"]
     cap_drop: ["ALL"]
 
+
+  kubernetes-broker:
+    image: ${IMAGE_NAMESPACE:-afsharidevops}/hermes-control-plane-kubernetes-broker:${VERSION:-0.5.10-beta.1-dev.1}
+    build:
+      context: ./kubernetes-broker
+    restart: unless-stopped
+    ports:
+      - "${KUBERNETES_BROKER_BIND_IP:-127.0.0.1}:${KUBERNETES_BROKER_PORT:-8830}:8830"
+    environment:
+      HERMES_KUBERNETES_BROKER_TOKEN: ${HERMES_KUBERNETES_BROKER_TOKEN}
+      HERMES_EXECUTION_HMAC_KEY: ${HERMES_EXECUTION_HMAC_KEY}
+      HERMES_KUBERNETES_EXECUTION_ENABLED: ${HERMES_KUBERNETES_EXECUTION_ENABLED:-false}
+      HERMES_KUBERNETES_COMMAND_TIMEOUT: ${HERMES_KUBERNETES_COMMAND_TIMEOUT:-60}
+      HERMES_KUBECONFIG_ROOT: /credentials/kubeconfigs
+    volumes:
+      - ./data/kubeconfigs:/credentials/kubeconfigs:ro
+    networks: [app-net]
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+
   control-plane:
-    image: ${IMAGE_NAMESPACE:-afsharidevops}/hermes-control-plane-api:${VERSION:-0.5.10-alpha.2}
+    image: ${IMAGE_NAMESPACE:-afsharidevops}/hermes-control-plane-api:${VERSION:-0.5.10-beta.1-dev.1}
     build:
       context: ./control-plane
     restart: unless-stopped
@@ -166,8 +189,15 @@ services:
       HERMES_RUNTIME: docker
       HERMES_CONTROL_ADMIN_TOKEN: ${HERMES_CONTROL_ADMIN_TOKEN}
       HERMES_CONTROL_DB: /data/control-plane.sqlite3
+      HERMES_KUBERNETES_BROKER_URL: http://kubernetes-broker:8830
+      HERMES_KUBERNETES_BROKER_TOKEN: ${HERMES_KUBERNETES_BROKER_TOKEN}
+      HERMES_EXECUTION_HMAC_KEY: ${HERMES_EXECUTION_HMAC_KEY}
+      HERMES_EXECUTION_ENABLED: ${HERMES_EXECUTION_ENABLED:-false}
     volumes:
       - control-plane-data:/data
+    depends_on:
+      kubernetes-broker:
+        condition: service_healthy
     networks: [app-net]
     security_opt: ["no-new-privileges:true"]
     cap_drop: ["ALL"]
@@ -198,7 +228,7 @@ services:
 
   node-agent:
     profiles: ["node-agent"]
-    image: ${IMAGE_NAMESPACE:-afsharidevops}/hermes-control-plane-node-agent:${VERSION:-0.5.10-alpha.2}
+    image: ${IMAGE_NAMESPACE:-afsharidevops}/hermes-control-plane-node-agent:${VERSION:-0.5.10-beta.1-dev.1}
     build:
       context: ./node-agent
     restart: unless-stopped
