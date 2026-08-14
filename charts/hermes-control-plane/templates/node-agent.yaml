@@ -1,0 +1,23 @@
+{{- if .Values.nodeAgent.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "hermes.fullname" . }}-node-agent
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app.kubernetes.io/component: node-agent, app.kubernetes.io/instance: {{ .Release.Name }}}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/component: node-agent, app.kubernetes.io/instance: {{ .Release.Name }}}
+    spec:
+      serviceAccountName: default
+      containers:
+        - name: node-agent
+          image: "{{ .Values.imageNamespace }}/hermes-control-plane-node-agent:{{ .Values.imageTag }}"
+          imagePullPolicy: {{ .Values.imagePullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+{{- end }}

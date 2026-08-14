@@ -1,0 +1,225 @@
+name: hermes-control-plane
+
+services:
+  nine-router:
+    profiles: ["nine-router"]
+    image: ${NINEROUTER_IMAGE_REPOSITORY:-decolua/9router}:${NINEROUTER_IMAGE_TAG:-latest}
+    restart: unless-stopped
+    ports:
+      - "${NINEROUTER_BIND_IP:-127.0.0.1}:${NINEROUTER_PORT:-20128}:20128"
+    volumes:
+      - nine-router-data:/app/data
+    environment:
+      DATA_DIR: /app/data
+      PORT: "20128"
+      HOSTNAME: "0.0.0.0"
+      NODE_ENV: production
+      JWT_SECRET: ${NINEROUTER_JWT_SECRET}
+      INITIAL_PASSWORD: ${NINEROUTER_INITIAL_PASSWORD}
+      API_KEY_SECRET: ${NINEROUTER_API_KEY_SECRET}
+      MACHINE_ID_SALT: ${NINEROUTER_MACHINE_ID_SALT}
+      REQUIRE_API_KEY: ${NINEROUTER_REQUIRE_API_KEY:-false}
+      AUTH_COOKIE_SECURE: ${NINEROUTER_AUTH_COOKIE_SECURE:-false}
+      ENABLE_REQUEST_LOGS: "false"
+      OBSERVABILITY_ENABLED: "true"
+      BASE_URL: http://nine-router:20128
+      NEXT_PUBLIC_BASE_URL: ${NINEROUTER_PUBLIC_BASE_URL:-http://localhost:20128}
+    networks: [router-net]
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:20128').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+
+  omniroute:
+    profiles: ["omniroute"]
+    image: ${OMNIROUTE_IMAGE_REPOSITORY:-diegosouzapw/omniroute}:${OMNIROUTE_IMAGE_TAG:-latest}
+    restart: unless-stopped
+    stop_grace_period: 40s
+    ports:
+      - "${OMNIROUTE_BIND_IP:-127.0.0.1}:${OMNIROUTE_PORT:-20228}:20128"
+      - "${OMNIROUTE_API_BIND_IP:-127.0.0.1}:${OMNIROUTE_API_PORT:-20229}:20129"
+    volumes:
+      - omniroute-data:/app/data
+    environment:
+      DATA_DIR: /app/data
+      PORT: "20128"
+      DASHBOARD_PORT: "20128"
+      API_PORT: "20129"
+      API_HOST: "0.0.0.0"
+      HOSTNAME: "0.0.0.0"
+      NODE_ENV: production
+      JWT_SECRET: ${OMNIROUTE_JWT_SECRET}
+      INITIAL_PASSWORD: ${OMNIROUTE_INITIAL_PASSWORD}
+      API_KEY_SECRET: ${OMNIROUTE_API_KEY_SECRET}
+      OMNIROUTE_API_KEY: ${OMNIROUTE_MANAGEMENT_API_KEY}
+      STORAGE_ENCRYPTION_KEY: ${OMNIROUTE_STORAGE_ENCRYPTION_KEY}
+      STORAGE_ENCRYPTION_KEY_VERSION: ${OMNIROUTE_STORAGE_ENCRYPTION_KEY_VERSION:-v1}
+      MACHINE_ID_SALT: ${OMNIROUTE_MACHINE_ID_SALT}
+      OMNIROUTE_WS_BRIDGE_SECRET: ${OMNIROUTE_WS_BRIDGE_SECRET}
+      REQUIRE_API_KEY: ${OMNIROUTE_REQUIRE_API_KEY:-false}
+      AUTH_COOKIE_SECURE: ${OMNIROUTE_AUTH_COOKIE_SECURE:-false}
+      NEXT_PUBLIC_BASE_URL: ${OMNIROUTE_PUBLIC_BASE_URL:-http://localhost:20228}
+      BASE_URL: http://omniroute:20128
+      ALLOW_API_KEY_REVEAL: ${OMNIROUTE_ALLOW_API_KEY_REVEAL:-false}
+      OMNIROUTE_MEMORY_MB: ${OMNIROUTE_MEMORY_MB:-512}
+    networks: [router-net]
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:20128/api/monitoring/health').then(r=>process.exit(r.status<500?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+
+  router-gateway:
+    image: ${IMAGE_NAMESPACE:-afsharidevops}/hermes-control-plane-router-gateway:${VERSION:-0.5.10-alpha.1}
+    build:
+      context: ./router-gateway
+    restart: unless-stopped
+    ports:
+      - "${ROUTER_GATEWAY_BIND_IP:-127.0.0.1}:${ROUTER_GATEWAY_PORT:-8790}:8090"
+    environment:
+      HERMES_ROUTER_PROVIDER: ${HERMES_ROUTER_PROVIDER:-nine-router}
+      ROUTER_GATEWAY_ADMIN_TOKEN: ${ROUTER_GATEWAY_ADMIN_TOKEN}
+      NINE_ROUTER_BASE_URL: http://nine-router:20128/v1
+      NINE_ROUTER_HEALTH_URL: http://nine-router:20128/api/health
+      NINE_ROUTER_API_KEY: ${NINE_ROUTER_UPSTREAM_API_KEY:-}
+      OMNIROUTE_BASE_URL: http://omniroute:20129/v1
+      OMNIROUTE_HEALTH_URL: http://omniroute:20128/api/monitoring/health
+      OMNIROUTE_UPSTREAM_API_KEY: ${OMNIROUTE_UPSTREAM_API_KEY:-}
+    volumes:
+      - router-gateway-data:/data
+    networks: [router-net, app-net]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+
+  smart-router-init:
+    image: alpine:3.22
+    user: "0:0"
+    command: ["sh", "-c", "mkdir -p /data && chown 10001:10001 /data && chmod 0700 /data"]
+    volumes:
+      - smart-router-data:/data
+    cap_drop: ["ALL"]
+    cap_add: ["CHOWN", "DAC_OVERRIDE", "FOWNER"]
+    security_opt: ["no-new-privileges:true"]
+    networks: [app-net]
+
+  smart-router:
+    image: ${IMAGE_NAMESPACE:-afsharidevops}/hermes-control-plane-smart-router:${VERSION:-0.5.10-alpha.1}
+    build:
+      context: ./smart-router
+    restart: unless-stopped
+    ports:
+      - "${SMART_ROUTER_BIND_IP:-127.0.0.1}:${SMART_ROUTER_PORT:-8787}:8080"
+    environment:
+      SMART_ROUTER_DASHBOARD_ENABLED: "true"
+      SMART_ROUTER_CONTROL_PLANE_ENABLED: "true"
+      SMART_ROUTER_CONTROL_DATABASE_URL: sqlite:////data/control.sqlite3
+      SMART_ROUTER_DATABASE_PATH: /data/router.sqlite3
+      SMART_ROUTER_COST_DATABASE_PATH: /data/cost-ledger.sqlite3
+      SMART_ROUTER_MODE: ${SMART_ROUTER_MODE:-observe}
+      SMART_ROUTER_POLICY: ${SMART_ROUTER_POLICY:-heuristic}
+      SMART_ROUTER_HMAC_SECRET: ${SMART_ROUTER_HMAC_SECRET}
+      SMART_ROUTER_CLIENT_API_KEY: ${SMART_ROUTER_CLIENT_API_KEY}
+      SMART_ROUTER_ADMIN_API_KEY: ${SMART_ROUTER_ADMIN_API_KEY}
+      SMART_ROUTER_BOOTSTRAP_ADMIN_USER: ${SMART_ROUTER_BOOTSTRAP_ADMIN_USER:-admin}
+      SMART_ROUTER_BOOTSTRAP_ADMIN_PASSWORD: ${SMART_ROUTER_BOOTSTRAP_ADMIN_PASSWORD}
+      SMART_ROUTER_REQUIRE_AUTH: "true"
+      SMART_ROUTER_UPSTREAM_BASE_URL: http://router-gateway:8090/v1
+      SMART_ROUTER_UPSTREAM_HEALTH_URL: http://router-gateway:8090/health
+      SMART_ROUTER_UPSTREAM_API_KEY: ""
+      SMART_ROUTER_PROVIDER_HEALTH_ENABLED: "true"
+      SMART_ROUTER_OBSERVE_MODEL: ${SMART_ROUTER_OBSERVE_MODEL:-hermes/observe}
+      SMART_ROUTER_FAST_MODEL: ${SMART_ROUTER_FAST_MODEL:-hermes/fast}
+      SMART_ROUTER_STANDARD_MODEL: ${SMART_ROUTER_STANDARD_MODEL:-hermes/standard}
+      SMART_ROUTER_STRONG_MODEL: ${SMART_ROUTER_STRONG_MODEL:-hermes/strong}
+      SMART_ROUTER_CODING_MODEL: ${SMART_ROUTER_CODING_MODEL:-hermes/coding}
+      SMART_ROUTER_VISION_MODEL: ${SMART_ROUTER_VISION_MODEL:-hermes/vision}
+      SMART_ROUTER_FAST_SUPPORTS_TOOLS: "false"
+      SMART_ROUTER_FAST_SUPPORTS_VISION: "false"
+      SMART_ROUTER_STANDARD_SUPPORTS_TOOLS: "true"
+      SMART_ROUTER_STANDARD_SUPPORTS_VISION: "false"
+      SMART_ROUTER_STRONG_SUPPORTS_TOOLS: "true"
+      SMART_ROUTER_STRONG_SUPPORTS_VISION: "true"
+      SMART_ROUTER_POLICY_VERSION: "4"
+    volumes:
+      - smart-router-data:/data
+      - ./smart-router/policy:/policy:ro
+    depends_on:
+      smart-router-init:
+        condition: service_completed_successfully
+      router-gateway:
+        condition: service_healthy
+    networks: [app-net]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+
+  control-plane:
+    image: ${IMAGE_NAMESPACE:-afsharidevops}/hermes-control-plane-api:${VERSION:-0.5.10-alpha.1}
+    build:
+      context: ./control-plane
+    restart: unless-stopped
+    ports:
+      - "${CONTROL_PLANE_BIND_IP:-127.0.0.1}:${CONTROL_PLANE_PORT:-8800}:8800"
+    environment:
+      HERMES_RUNTIME: docker
+      HERMES_CONTROL_ADMIN_TOKEN: ${HERMES_CONTROL_ADMIN_TOKEN}
+      HERMES_CONTROL_DB: /data/control-plane.sqlite3
+    volumes:
+      - control-plane-data:/data
+    networks: [app-net]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+
+  hermes:
+    profiles: ["hermes"]
+    image: ${HERMES_IMAGE_REPOSITORY:-nousresearch/hermes-agent}:${HERMES_IMAGE_TAG:-latest}
+    restart: unless-stopped
+    command: gateway run
+    shm_size: "1gb"
+    ports:
+      - "${HERMES_BIND_IP:-127.0.0.1}:${HERMES_API_PORT:-8642}:8642"
+      - "${HERMES_BIND_IP:-127.0.0.1}:${HERMES_DASHBOARD_PORT:-9119}:9119"
+    volumes:
+      - hermes-data:/opt/data
+      - ./plugins/stack-package-policy:/opt/data/plugins/stack-package-policy:ro
+      - ./plugins/stack-execution-policy:/opt/data/plugins/stack-execution-policy:ro
+    environment:
+      HERMES_HOME: /opt/data
+      HERMES_DASHBOARD: ${HERMES_DASHBOARD:-0}
+      HERMES_UID: ${HERMES_UID:-10000}
+      HERMES_GID: ${HERMES_GID:-10000}
+      HERMES_DISABLE_LAZY_INSTALLS: "1"
+      EXECUTION_FEATURES: ""
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks: [app-net]
+
+  node-agent:
+    profiles: ["node-agent"]
+    image: ${IMAGE_NAMESPACE:-afsharidevops}/hermes-control-plane-node-agent:${VERSION:-0.5.10-alpha.1}
+    build:
+      context: ./node-agent
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8810:8810"
+    environment:
+      HERMES_AGENT_NAME: local-docker-agent
+    networks: [app-net]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+
+networks:
+  app-net:
+    driver: bridge
+  router-net:
+    driver: bridge
+
+volumes:
+  nine-router-data:
+  omniroute-data:
+  router-gateway-data:
+  smart-router-data:
+  control-plane-data:
+  hermes-data:

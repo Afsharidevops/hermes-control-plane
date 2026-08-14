@@ -1,0 +1,77 @@
+imageNamespace: afsharidevops
+imageTag: 0.5.10-alpha.1
+imagePullPolicy: IfNotPresent
+
+router:
+  activeProvider: nine-router
+
+routers:
+  nineRouter:
+    enabled: true
+    image: decolua/9router:latest
+  omniroute:
+    enabled: false
+    image: diegosouzapw/omniroute:latest
+
+controlPlane:
+  enabled: true
+  service:
+    type: ClusterIP
+    port: 8800
+
+routerGateway:
+  enabled: true
+  service:
+    type: ClusterIP
+    port: 8090
+
+smartRouter:
+  enabled: true
+  service:
+    type: ClusterIP
+    port: 8080
+
+hermesAgent:
+  enabled: false
+  image: nousresearch/hermes-agent:latest
+
+nodeAgent:
+  enabled: false
+
+# Alpha bootstrap only. Prefer an externally managed Secret before production.
+secrets:
+  existingSecret: ""
+  controlAdminToken: ""
+  routerGatewayAdminToken: ""
+  smartRouterHmacSecret: ""
+  smartRouterClientApiKey: ""
+  smartRouterAdminApiKey: ""
+  smartRouterBootstrapAdminPassword: ""
+  nineRouterInitialPassword: ""
+  nineRouterJwtSecret: ""
+  nineRouterApiKeySecret: ""
+  nineRouterMachineIdSalt: ""
+  omnirouteInitialPassword: ""
+  omnirouteJwtSecret: ""
+  omnirouteApiKeySecret: ""
+  omnirouteManagementApiKey: ""
+  omnirouteStorageEncryptionKey: ""
+  omnirouteMachineIdSalt: ""
+  omnirouteWsBridgeSecret: ""
+
+persistence:
+  enabled: false
+  size: 5Gi
+  storageClass: ""
+
+ingress:
+  enabled: false
+  className: ""
+  host: hermes.example.com
+  tls: false
+  secretName: ""
+
+resources: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}

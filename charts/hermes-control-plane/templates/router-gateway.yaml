@@ -1,0 +1,58 @@
+{{- if .Values.routerGateway.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "hermes.fullname" . }}-router-gateway
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: router-gateway
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/component: router-gateway
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      securityContext:
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: router-gateway
+          image: "{{ .Values.imageNamespace }}/hermes-control-plane-router-gateway:{{ .Values.imageTag }}"
+          imagePullPolicy: {{ .Values.imagePullPolicy }}
+          ports: [{name: http, containerPort: 8090}]
+          env:
+            - {name: HERMES_ROUTER_PROVIDER, value: {{ .Values.router.activeProvider | quote }}}
+            - {name: NINE_ROUTER_BASE_URL, value: "http://{{ include "hermes.fullname" . }}-nine-router:20128/v1"}
+            - {name: NINE_ROUTER_HEALTH_URL, value: "http://{{ include "hermes.fullname" . }}-nine-router:20128/api/health"}
+            - {name: OMNIROUTE_BASE_URL, value: "http://{{ include "hermes.fullname" . }}-omniroute:20129/v1"}
+            - {name: OMNIROUTE_HEALTH_URL, value: "http://{{ include "hermes.fullname" . }}-omniroute:20128/api/monitoring/health"}
+            - name: ROUTER_GATEWAY_ADMIN_TOKEN
+              valueFrom: {secretKeyRef: {name: {{ include "hermes.secretName" . }}, key: router-gateway-admin-token}}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          volumeMounts: [{name: data, mountPath: /data}]
+          readinessProbe: {httpGet: {path: /health, port: http}, initialDelaySeconds: 3, periodSeconds: 10}
+      volumes:
+        - name: data
+          {{- if .Values.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "hermes.fullname" . }}-router-gateway
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "hermes.fullname" . }}-router-gateway
+spec:
+  type: {{ .Values.routerGateway.service.type }}
+  selector:
+    app.kubernetes.io/component: router-gateway
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  ports: [{name: http, port: {{ .Values.routerGateway.service.port }}, targetPort: http}]
+{{- end }}

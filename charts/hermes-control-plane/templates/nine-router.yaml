@@ -1,0 +1,49 @@
+{{- if .Values.routers.nineRouter.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "hermes.fullname" . }}-nine-router
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app.kubernetes.io/component: nine-router, app.kubernetes.io/instance: {{ .Release.Name }}}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/component: nine-router, app.kubernetes.io/instance: {{ .Release.Name }}}
+    spec:
+      containers:
+        - name: nine-router
+          image: {{ .Values.routers.nineRouter.image | quote }}
+          imagePullPolicy: {{ .Values.imagePullPolicy }}
+          ports: [{name: http, containerPort: 20128}]
+          env:
+            - {name: DATA_DIR, value: /app/data}
+            - {name: PORT, value: "20128"}
+            - {name: HOSTNAME, value: "0.0.0.0"}
+            - {name: NODE_ENV, value: production}
+            - name: INITIAL_PASSWORD
+              valueFrom: {secretKeyRef: {name: {{ include "hermes.secretName" . }}, key: nine-router-initial-password}}
+            - name: JWT_SECRET
+              valueFrom: {secretKeyRef: {name: {{ include "hermes.secretName" . }}, key: nine-router-jwt-secret}}
+            - name: API_KEY_SECRET
+              valueFrom: {secretKeyRef: {name: {{ include "hermes.secretName" . }}, key: nine-router-api-key-secret}}
+            - name: MACHINE_ID_SALT
+              valueFrom: {secretKeyRef: {name: {{ include "hermes.secretName" . }}, key: nine-router-machine-id-salt}}
+          volumeMounts: [{name: data, mountPath: /app/data}]
+      volumes:
+        - name: data
+          {{- if .Values.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "hermes.fullname" . }}-nine-router
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "hermes.fullname" . }}-nine-router
+spec:
+  selector: {app.kubernetes.io/component: nine-router, app.kubernetes.io/instance: {{ .Release.Name }}}
+  ports: [{name: http, port: 20128, targetPort: http}]
+{{- end }}

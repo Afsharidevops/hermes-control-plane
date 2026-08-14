@@ -1,0 +1,55 @@
+{{- if .Values.controlPlane.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "hermes.fullname" . }}-control-plane
+  labels: {{- include "hermes.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: control-plane
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/component: control-plane
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      securityContext:
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: control-plane
+          image: "{{ .Values.imageNamespace }}/hermes-control-plane-api:{{ .Values.imageTag }}"
+          imagePullPolicy: {{ .Values.imagePullPolicy }}
+          ports: [{name: http, containerPort: 8800}]
+          env:
+            - {name: HERMES_RUNTIME, value: kubernetes}
+            - name: HERMES_CONTROL_ADMIN_TOKEN
+              valueFrom: {secretKeyRef: {name: {{ include "hermes.secretName" . }}, key: control-admin-token}}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          volumeMounts: [{name: data, mountPath: /data}]
+          readinessProbe: {httpGet: {path: /health, port: http}, initialDelaySeconds: 3, periodSeconds: 10}
+      volumes:
+        - name: data
+          {{- if .Values.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "hermes.fullname" . }}-control-plane
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "hermes.fullname" . }}-control-plane
+spec:
+  type: {{ .Values.controlPlane.service.type }}
+  selector:
+    app.kubernetes.io/component: control-plane
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  ports: [{name: http, port: {{ .Values.controlPlane.service.port }}, targetPort: http}]
+{{- end }}

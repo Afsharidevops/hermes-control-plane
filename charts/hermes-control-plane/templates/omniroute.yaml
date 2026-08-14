@@ -1,0 +1,60 @@
+{{- if .Values.routers.omniroute.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "hermes.fullname" . }}-omniroute
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app.kubernetes.io/component: omniroute, app.kubernetes.io/instance: {{ .Release.Name }}}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/component: omniroute, app.kubernetes.io/instance: {{ .Release.Name }}}
+    spec:
+      containers:
+        - name: omniroute
+          image: {{ .Values.routers.omniroute.image | quote }}
+          imagePullPolicy: {{ .Values.imagePullPolicy }}
+          ports: [{name: dashboard, containerPort: 20128}, {name: api, containerPort: 20129}]
+          env:
+            - {name: DATA_DIR, value: /app/data}
+            - {name: PORT, value: "20128"}
+            - {name: DASHBOARD_PORT, value: "20128"}
+            - {name: API_PORT, value: "20129"}
+            - {name: API_HOST, value: "0.0.0.0"}
+            - {name: HOSTNAME, value: "0.0.0.0"}
+            - {name: NODE_ENV, value: production}
+            - name: INITIAL_PASSWORD
+              valueFrom: {secretKeyRef: {name: {{ include "hermes.secretName" . }}, key: omniroute-initial-password}}
+            - name: JWT_SECRET
+              valueFrom: {secretKeyRef: {name: {{ include "hermes.secretName" . }}, key: omniroute-jwt-secret}}
+            - name: API_KEY_SECRET
+              valueFrom: {secretKeyRef: {name: {{ include "hermes.secretName" . }}, key: omniroute-api-key-secret}}
+            - name: OMNIROUTE_API_KEY
+              valueFrom: {secretKeyRef: {name: {{ include "hermes.secretName" . }}, key: omniroute-management-api-key}}
+            - name: STORAGE_ENCRYPTION_KEY
+              valueFrom: {secretKeyRef: {name: {{ include "hermes.secretName" . }}, key: omniroute-storage-encryption-key}}
+            - name: MACHINE_ID_SALT
+              valueFrom: {secretKeyRef: {name: {{ include "hermes.secretName" . }}, key: omniroute-machine-id-salt}}
+            - name: OMNIROUTE_WS_BRIDGE_SECRET
+              valueFrom: {secretKeyRef: {name: {{ include "hermes.secretName" . }}, key: omniroute-ws-bridge-secret}}
+          volumeMounts: [{name: data, mountPath: /app/data}]
+      volumes:
+        - name: data
+          {{- if .Values.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "hermes.fullname" . }}-omniroute
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "hermes.fullname" . }}-omniroute
+spec:
+  selector: {app.kubernetes.io/component: omniroute, app.kubernetes.io/instance: {{ .Release.Name }}}
+  ports:
+    - {name: dashboard, port: 20128, targetPort: dashboard}
+    - {name: api, port: 20129, targetPort: api}
+{{- end }}

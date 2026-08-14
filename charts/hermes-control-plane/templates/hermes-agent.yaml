@@ -1,0 +1,23 @@
+{{- if .Values.hermesAgent.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "hermes.fullname" . }}-agent
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app.kubernetes.io/component: hermes-agent, app.kubernetes.io/instance: {{ .Release.Name }}}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/component: hermes-agent, app.kubernetes.io/instance: {{ .Release.Name }}}
+    spec:
+      containers:
+        - name: hermes
+          image: {{ .Values.hermesAgent.image | quote }}
+          command: ["gateway", "run"]
+          env:
+            - {name: HERMES_HOME, value: /opt/data}
+            - {name: HERMES_DISABLE_LAZY_INSTALLS, value: "1"}
+          volumeMounts: [{name: data, mountPath: /opt/data}]
+      volumes: [{name: data, emptyDir: {}}]
+{{- end }}

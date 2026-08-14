@@ -1,0 +1,75 @@
+{{- if .Values.smartRouter.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "hermes.fullname" . }}-smart-router
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: smart-router
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/component: smart-router
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      securityContext:
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: smart-router
+          image: "{{ .Values.imageNamespace }}/hermes-control-plane-smart-router:{{ .Values.imageTag }}"
+          imagePullPolicy: {{ .Values.imagePullPolicy }}
+          ports: [{name: http, containerPort: 8080}]
+          env:
+            - {name: SMART_ROUTER_DASHBOARD_ENABLED, value: "true"}
+            - {name: SMART_ROUTER_CONTROL_PLANE_ENABLED, value: "true"}
+            - {name: SMART_ROUTER_DATABASE_PATH, value: "/data/router.sqlite3"}
+            - {name: SMART_ROUTER_CONTROL_DATABASE_URL, value: "sqlite:////data/control.sqlite3"}
+            - {name: SMART_ROUTER_UPSTREAM_BASE_URL, value: "http://{{ include "hermes.fullname" . }}-router-gateway:8090/v1"}
+            - {name: SMART_ROUTER_UPSTREAM_HEALTH_URL, value: "http://{{ include "hermes.fullname" . }}-router-gateway:8090/health"}
+            - {name: SMART_ROUTER_OBSERVE_MODEL, value: "hermes/observe"}
+            - {name: SMART_ROUTER_FAST_MODEL, value: "hermes/fast"}
+            - {name: SMART_ROUTER_STANDARD_MODEL, value: "hermes/standard"}
+            - {name: SMART_ROUTER_STRONG_MODEL, value: "hermes/strong"}
+            - {name: SMART_ROUTER_CODING_MODEL, value: "hermes/coding"}
+            - {name: SMART_ROUTER_VISION_MODEL, value: "hermes/vision"}
+            - {name: SMART_ROUTER_REQUIRE_AUTH, value: "true"}
+            - name: SMART_ROUTER_HMAC_SECRET
+              valueFrom: {secretKeyRef: {name: {{ include "hermes.secretName" . }}, key: smart-router-hmac-secret}}
+            - name: SMART_ROUTER_CLIENT_API_KEY
+              valueFrom: {secretKeyRef: {name: {{ include "hermes.secretName" . }}, key: smart-router-client-api-key}}
+            - name: SMART_ROUTER_ADMIN_API_KEY
+              valueFrom: {secretKeyRef: {name: {{ include "hermes.secretName" . }}, key: smart-router-admin-api-key}}
+            - name: SMART_ROUTER_BOOTSTRAP_ADMIN_PASSWORD
+              valueFrom: {secretKeyRef: {name: {{ include "hermes.secretName" . }}, key: smart-router-bootstrap-admin-password}}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          volumeMounts:
+            - {name: data, mountPath: /data}
+            - {name: tmp, mountPath: /tmp}
+          readinessProbe: {httpGet: {path: /health, port: http}, initialDelaySeconds: 5, periodSeconds: 10}
+      volumes:
+        - name: data
+          {{- if .Values.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "hermes.fullname" . }}-smart-router
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        - {name: tmp, emptyDir: {}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "hermes.fullname" . }}-smart-router
+spec:
+  type: {{ .Values.smartRouter.service.type }}
+  selector:
+    app.kubernetes.io/component: smart-router
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  ports: [{name: http, port: {{ .Values.smartRouter.service.port }}, targetPort: http}]
+{{- end }}

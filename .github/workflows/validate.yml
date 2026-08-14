@@ -1,0 +1,27 @@
+name: validate
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  foundation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Compile new Python services
+        run: python -m compileall -q control-plane/src router-gateway/src node-agent/src
+      - name: Validate Compose
+        run: |
+          cp .env.example .env
+          sed -i 's/CHANGE_ME/0123456789abcdef0123456789abcdef0123456789abcdef/g' .env
+          docker compose --env-file .env config >/dev/null
+      - name: Helm lint
+        uses: azure/setup-helm@v4
+      - run: helm lint charts/hermes-control-plane
