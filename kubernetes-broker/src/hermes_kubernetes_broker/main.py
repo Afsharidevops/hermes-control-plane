@@ -98,7 +98,18 @@ def _kubeconfig_for(snapshot: dict[str, Any]) -> Path | None:
     if root not in resolved.parents:
         raise HTTPException(422, "invalid kubeconfig path")
     expected = str(metadata.get("sha256") or "")
-    actual = hashlib.sha256(resolved.read_bytes()).hexdigest()
+    try:
+        actual = hashlib.sha256(resolved.read_bytes()).hexdigest()
+    except PermissionError as exc:
+        raise HTTPException(
+            409,
+            "kubeconfig material is not readable by Kubernetes Broker"
+        ) from exc
+    except OSError as exc:
+        raise HTTPException(
+            409,
+            f"kubeconfig material could not be read: {type(exc).__name__}"
+        ) from exc
     if not expected or not hmac.compare_digest(expected, actual):
         raise HTTPException(409, "kubeconfig fingerprint does not match approved target snapshot")
     return resolved

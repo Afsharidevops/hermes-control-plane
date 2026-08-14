@@ -51,6 +51,17 @@ init_env() {
     info "created .env"
   fi
   load_env
+
+  # Docker bind mounts preserve host ownership. Run the Kubernetes Broker
+  # as the invoking non-root user so imported mode-0600 kubeconfigs remain
+  # readable without making credential material world-readable.
+  if [[ -z "${HERMES_KUBERNETES_BROKER_UID:-}" ]]; then
+    set_env HERMES_KUBERNETES_BROKER_UID "$(id -u)"
+  fi
+  if [[ -z "${HERMES_KUBERNETES_BROKER_GID:-}" ]]; then
+    set_env HERMES_KUBERNETES_BROKER_GID "$(id -g)"
+  fi
+
   declare -A sizes=(
     [HERMES_CONTROL_ADMIN_TOKEN]=32
     [HERMES_KUBERNETES_BROKER_TOKEN]=32
