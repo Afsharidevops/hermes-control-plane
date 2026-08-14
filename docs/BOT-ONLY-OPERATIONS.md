@@ -119,3 +119,19 @@ Router Gateway
 
 `./hermesctl router probe` reports each authentication/routing hop without
 printing credentials.
+
+
+## Automatic OmniRoute credential provisioning
+
+OmniRoute follows the same no-copy/paste policy as 9router. When OmniRoute is
+active, `./hermesctl up` uses the loopback management session to create a
+dedicated non-management Router Gateway API key and stores it only in local
+`.env`.
+
+```text
+NINE_ROUTER_UPSTREAM_API_KEY  -> 9router runtime access
+OMNIROUTE_UPSTREAM_API_KEY    -> OmniRoute runtime access
+```
+
+The two credentials are independent and are provisioned only when their router
+is enabled. `HERMES_ENABLE_BOTH_ROUTERS=true` provisions both.

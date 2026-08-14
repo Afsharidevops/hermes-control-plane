@@ -51,8 +51,11 @@ jobs:
           assert "plugins enable control-plane-chatops" in ctl
           assert "--entrypoint /opt/hermes/.venv/bin/hermes" in ctl
           assert "ensure_nine_router_api_key" in ctl
+          assert "ensure_omniroute_api_key" in ctl
+          assert "omniroute_key_valid" in ctl
           assert "/api/auth/login" in ctl
           assert "/api/keys" in ctl
+          assert "OMNIROUTE_UPSTREAM_API_KEY" in compose
           assert "HERMES_KUBERNETES_BROKER_UID" in compose
           print("bot/credential wiring: ok")
           PY

@@ -33,6 +33,8 @@ for marker in [
     '/api/auth/login',
     '/api/keys',
     'ensure_nine_router_api_key',
+    'ensure_omniroute_api_key',
+    'omniroute_key_valid',
     'cmd_router_provision',
 ]:
     if marker not in ctl:
@@ -41,6 +43,8 @@ env_example=(root/'.env.example').read_text()
 for marker in [
     'NINEROUTER_AUTO_PROVISION_API_KEY=true',
     'NINEROUTER_MANAGED_API_KEY_NAME=hermes-control-plane-router-gateway',
+    'OMNIROUTE_AUTO_PROVISION_API_KEY=true',
+    'OMNIROUTE_MANAGED_API_KEY_NAME=hermes-control-plane-router-gateway',
 ]:
     if marker not in env_example:
         raise SystemExit(f'missing 9router provisioning env marker: {marker}')

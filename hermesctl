@@ -194,6 +194,150 @@ ensure_chatops_plugin() {
   fi
 }
 
+omniroute_host_url() {
+  printf 'http://%s:%s' "${OMNIROUTE_PROVISION_HOST:-127.0.0.1}" "${OMNIROUTE_PORT:-20228}"
+}
+
+omniroute_api_host_url() {
+  printf 'http://%s:%s' "${OMNIROUTE_PROVISION_HOST:-127.0.0.1}" "${OMNIROUTE_API_PORT:-20229}"
+}
+
+wait_omniroute() {
+  need curl
+  local timeout="${1:-75}" elapsed=0 base
+  base="$(omniroute_host_url)"
+  while (( elapsed < timeout )); do
+    if curl -fsS "${base}/api/monitoring/health" >/dev/null 2>&1 \
+       || curl -fsS "${base}/api/init" >/dev/null 2>&1 \
+       || curl -fsS "${base}/" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+    elapsed=$((elapsed+1))
+  done
+  return 1
+}
+
+omniroute_key_valid() {
+  need curl
+  local key="${1:-}" base code
+  [[ -n "$key" ]] || return 1
+  base="$(omniroute_api_host_url)"
+  code="$(curl -sS --compressed -o /dev/null -w '%{http_code}' \
+    -H "Authorization: Bearer ${key}" \
+    "${base}/v1/models" 2>/dev/null || true)"
+  [[ "$code" == "200" ]]
+}
+
+ensure_omniroute_api_key() {
+  need curl
+  need python3
+  load_env
+
+  if [[ "${OMNIROUTE_AUTO_PROVISION_API_KEY:-true}" != "true" ]]; then
+    [[ -n "${OMNIROUTE_UPSTREAM_API_KEY:-}" ]] \
+      || fail "OmniRoute automatic API-key provisioning is disabled and OMNIROUTE_UPSTREAM_API_KEY is empty"
+    omniroute_key_valid "${OMNIROUTE_UPSTREAM_API_KEY}" \
+      || fail "configured OmniRoute Router Gateway API key is not accepted"
+    echo "[ok] OmniRoute Router Gateway API key is configured"
+    return 0
+  fi
+
+  if omniroute_key_valid "${OMNIROUTE_UPSTREAM_API_KEY:-}"; then
+    echo "[ok] managed OmniRoute API key is already valid"
+    return 0
+  fi
+
+  info "provisioning dedicated OmniRoute API key for Router Gateway"
+
+  if ! wait_omniroute 90; then
+    fail "OmniRoute did not become reachable for API-key provisioning"
+  fi
+
+  [[ -n "${OMNIROUTE_INITIAL_PASSWORD:-}" ]] \
+    || fail "OMNIROUTE_INITIAL_PASSWORD is missing; cannot authenticate to OmniRoute management API"
+
+  local tmpdir cookie login_json key_json login_code key_code managed_name provisioned_key base
+  tmpdir="$(mktemp -d)"
+  chmod 700 "$tmpdir"
+  cookie="$tmpdir/cookies"
+  login_json="$tmpdir/login.json"
+  key_json="$tmpdir/key.json"
+  managed_name="${OMNIROUTE_MANAGED_API_KEY_NAME:-hermes-control-plane-router-gateway}"
+  base="$(omniroute_host_url)"
+
+  # One login attempt only. OmniRoute has brute-force lockout protection.
+  login_code="$(
+    python3 - "${OMNIROUTE_INITIAL_PASSWORD}" <<'PYLOGIN' |
+import json, sys
+print(json.dumps({"password": sys.argv[1]}))
+PYLOGIN
+    curl -sS \
+      -c "$cookie" \
+      -o "$login_json" \
+      -w '%{http_code}' \
+      -H 'Content-Type: application/json' \
+      --data-binary @- \
+      "${base}/api/auth/login" || true
+  )"
+
+  if [[ "$login_code" != "200" ]]; then
+    rm -rf "$tmpdir"
+    fail "OmniRoute management login failed with HTTP ${login_code:-unreachable}; provisioning stops after one attempt to avoid lockout"
+  fi
+
+  # Server-to-server call deliberately sends no Origin header. OmniRoute's
+  # management mutation origin guard permits this path while cookie auth still
+  # authenticates the request.
+  key_code="$(
+    python3 - "$managed_name" <<'PYKEY' |
+import json, sys
+# 'chat' is a non-management runtime scope. OmniRoute also adds its own
+# self-service usage scope during key creation.
+print(json.dumps({"name": sys.argv[1], "scopes": ["chat"]}))
+PYKEY
+    curl -sS \
+      -b "$cookie" \
+      -o "$key_json" \
+      -w '%{http_code}' \
+      -H 'Content-Type: application/json' \
+      --data-binary @- \
+      "${base}/api/keys" || true
+  )"
+
+  if [[ "$key_code" != "201" ]]; then
+    rm -rf "$tmpdir"
+    fail "OmniRoute API-key creation failed with HTTP ${key_code:-unreachable}"
+  fi
+
+  provisioned_key="$(
+    python3 - "$key_json" <<'PYREAD'
+import json, sys
+data=json.load(open(sys.argv[1]))
+key=data.get("key")
+if not isinstance(key, str) or len(key.strip()) < 16 or any(ch.isspace() for ch in key):
+    raise SystemExit(2)
+print(key.strip())
+PYREAD
+  )" || {
+    rm -rf "$tmpdir"
+    fail "OmniRoute API-key creation returned an invalid response"
+  }
+
+  rm -rf "$tmpdir"
+
+  set_env OMNIROUTE_UPSTREAM_API_KEY "$provisioned_key"
+  chmod 600 "$ENV_FILE"
+  load_env
+
+  if ! omniroute_key_valid "${OMNIROUTE_UPSTREAM_API_KEY}"; then
+    fail "OmniRoute created a managed Router Gateway key but rejected it during /v1/models verification"
+  fi
+
+  echo "[ok] provisioned and verified dedicated OmniRoute Router Gateway API key"
+  echo "     key material stored only in local .env"
+}
+
 nine_router_host_url() {
   printf 'http://%s:%s' "${NINEROUTER_PROVISION_HOST:-127.0.0.1}" "${NINEROUTER_PORT:-20128}"
 }
@@ -331,11 +475,18 @@ bootstrap_selected_router() {
   need docker
   load_env
   local provider="${HERMES_ROUTER_PROVIDER:-nine-router}"
+  local both="${HERMES_ENABLE_BOTH_ROUTERS:-false}"
 
-  if [[ "$provider" == "nine-router" || "${HERMES_ENABLE_BOTH_ROUTERS:-false}" == "true" ]]; then
+  if [[ "$provider" == "nine-router" || "$both" == "true" ]]; then
     info "starting 9router bootstrap phase"
     "${COMPOSE[@]}" --profile nine-router up -d nine-router
     ensure_nine_router_api_key
+  fi
+
+  if [[ "$provider" == "omniroute" || "$both" == "true" ]]; then
+    info "starting OmniRoute bootstrap phase"
+    "${COMPOSE[@]}" --profile omniroute up -d omniroute
+    ensure_omniroute_api_key
   fi
 }
 
@@ -426,7 +577,9 @@ cmd_router_list() {
 cmd_router_probe() {
   need curl
   load_env
-  local failed=0 code
+  local failed=0 code provider both
+  provider="${HERMES_ROUTER_PROVIDER:-nine-router}"
+  both="${HERMES_ENABLE_BOTH_ROUTERS:-false}"
 
   code="$(curl -sS -o /dev/null -w '%{http_code}' \
     -H "Authorization: Bearer ${SMART_ROUTER_CLIENT_API_KEY}" \
@@ -450,11 +603,20 @@ cmd_router_probe() {
     failed=1
   fi
 
-  if [[ "${HERMES_ROUTER_PROVIDER:-nine-router}" == "nine-router" ]]; then
+  if [[ "$provider" == "nine-router" || "$both" == "true" ]]; then
     if nine_router_key_valid "${NINE_ROUTER_UPSTREAM_API_KEY:-}"; then
       echo "[ok] 9router managed API key"
     else
       echo "[fail] 9router managed API key"
+      failed=1
+    fi
+  fi
+
+  if [[ "$provider" == "omniroute" || "$both" == "true" ]]; then
+    if omniroute_key_valid "${OMNIROUTE_UPSTREAM_API_KEY:-}"; then
+      echo "[ok] OmniRoute managed API key"
+    else
+      echo "[fail] OmniRoute managed API key"
       failed=1
     fi
   fi
@@ -464,9 +626,9 @@ cmd_router_probe() {
     "http://${SMART_ROUTER_BIND_IP:-127.0.0.1}:${SMART_ROUTER_PORT:-8787}/v1/models" \
     2>/dev/null || true)"
   if [[ "$code" == "200" ]]; then
-    echo "[ok] end-to-end model route"
+    echo "[ok] end-to-end model route via ${provider}"
   else
-    echo "[fail] end-to-end model route: HTTP ${code:-unreachable}"
+    echo "[fail] end-to-end model route via ${provider}: HTTP ${code:-unreachable}"
     failed=1
   fi
 
@@ -475,15 +637,27 @@ cmd_router_probe() {
 
 cmd_router_provision() {
   need docker
-  local provider="${1:-nine-router}"
-  [[ "$provider" == "nine-router" ]] || fail "automatic provisioning is currently implemented for nine-router"
+  local provider="${1:-${HERMES_ROUTER_PROVIDER:-nine-router}}"
+  [[ "$provider" == "nine-router" || "$provider" == "omniroute" ]] \
+    || fail "usage: ./hermesctl router provision nine-router|omniroute"
   load_env
-  info "starting 9router for managed credential provisioning"
-  "${COMPOSE[@]}" --profile nine-router up -d nine-router
-  ensure_nine_router_api_key
+
+  case "$provider" in
+    nine-router)
+      info "starting 9router for managed credential provisioning"
+      "${COMPOSE[@]}" --profile nine-router up -d nine-router
+      ensure_nine_router_api_key
+      ;;
+    omniroute)
+      info "starting OmniRoute for managed credential provisioning"
+      "${COMPOSE[@]}" --profile omniroute up -d omniroute
+      ensure_omniroute_api_key
+      ;;
+  esac
+
   load_env
-  info "recreating Router Gateway and Smart Router with managed 9router credential"
-  "${COMPOSE[@]}" --profile nine-router up -d --force-recreate router-gateway smart-router
+  info "recreating Router Gateway and Smart Router with managed ${provider} credential"
+  "${COMPOSE[@]}" --profile "$provider" up -d --force-recreate router-gateway smart-router
   sleep 5
   cmd_router_probe
 }
@@ -497,14 +671,18 @@ cmd_router_set() {
   set_env HERMES_ROUTER_PROVIDER "$provider"
   load_env
   info "starting provider $provider"
-  if [[ "$provider" == "nine-router" ]]; then
-    "${COMPOSE[@]}" --profile nine-router up -d nine-router
-    ensure_nine_router_api_key
-    load_env
-    "${COMPOSE[@]}" --profile nine-router up -d --force-recreate router-gateway
-  else
-    "${COMPOSE[@]}" --profile "$provider" up -d "$provider" router-gateway
-  fi
+  case "$provider" in
+    nine-router)
+      "${COMPOSE[@]}" --profile nine-router up -d nine-router
+      ensure_nine_router_api_key
+      ;;
+    omniroute)
+      "${COMPOSE[@]}" --profile omniroute up -d omniroute
+      ensure_omniroute_api_key
+      ;;
+  esac
+  load_env
+  "${COMPOSE[@]}" --profile "$provider" up -d --force-recreate router-gateway
   for _ in $(seq 1 45); do
     if curl -fsS "http://${ROUTER_GATEWAY_BIND_IP:-127.0.0.1}:${ROUTER_GATEWAY_PORT:-8790}/health" >/dev/null 2>&1; then break; fi
     sleep 1
@@ -801,7 +979,17 @@ cmd_doctor() {
     if [[ -n "${NINE_ROUTER_UPSTREAM_API_KEY:-}" ]]; then
       echo "[ok] managed 9router Router Gateway credential present"
     else
-      echo "[info] managed 9router credential will be created automatically on ./hermesctl up"
+      echo "[info] managed 9router credential will be created automatically when 9router is enabled"
+    fi
+    if [[ "${OMNIROUTE_AUTO_PROVISION_API_KEY:-true}" == "true" ]]; then
+      echo "[ok] OmniRoute API-key auto-provisioning enabled"
+    else
+      echo "[warn] OmniRoute API-key auto-provisioning disabled"
+    fi
+    if [[ -n "${OMNIROUTE_UPSTREAM_API_KEY:-}" ]]; then
+      echo "[ok] managed OmniRoute Router Gateway credential present"
+    else
+      echo "[info] managed OmniRoute credential will be created automatically when OmniRoute is enabled"
     fi
   fi
 }
@@ -826,7 +1014,7 @@ Commands:
   bot check                    Check ChatOps plugin + Smart Router model wiring
   doctor                       Check local prerequisites/config
   router list                  Show configured router health and active provider
-  router provision nine-router Provision/repair dedicated 9router API key automatically
+  router provision <provider>  Provision/repair dedicated router API key automatically
   router probe                 Verify every router authentication/routing hop
   router set nine-router       Start/select 9router
   router set omniroute         Start/select OmniRoute
@@ -861,7 +1049,7 @@ case "${1:-}" in
   router)
     case "${2:-}" in
       list) cmd_router_list ;;
-      provision) cmd_router_provision "${3:-nine-router}" ;;
+      provision) cmd_router_provision "${3:-${HERMES_ROUTER_PROVIDER:-nine-router}}" ;;
       probe) cmd_router_probe ;;
       set) cmd_router_set "${3:-}" ;;
       *) usage; exit 2 ;;
