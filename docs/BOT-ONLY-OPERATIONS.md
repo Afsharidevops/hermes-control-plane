@@ -135,3 +135,19 @@ OMNIROUTE_UPSTREAM_API_KEY    -> OmniRoute runtime access
 
 The two credentials are independent and are provisioned only when their router
 is enabled. `HERMES_ENABLE_BOTH_ROUTERS=true` provisions both.
+
+
+## Idempotent router credentials
+
+Router switching never provisions a new runtime credential merely because the
+provider was stopped or is still starting. Hermes Control Plane waits for
+provider readiness and rotates credentials only after an explicit 401/403.
+
+To remove duplicate managed keys created by older beta builds:
+
+```bash
+./hermesctl router cleanup-keys all
+```
+
+The cleanup verifies the currently configured key first and deletes only other
+keys with the exact reserved managed name.

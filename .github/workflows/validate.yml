@@ -51,6 +51,9 @@ jobs:
           assert "plugins enable control-plane-chatops" in ctl
           assert "--entrypoint /opt/hermes/.venv/bin/hermes" in ctl
           assert "ensure_nine_router_api_key" in ctl
+          assert "nine_router_key_http_status" in ctl
+          assert "omniroute_key_http_status" in ctl
+          assert "cmd_router_cleanup_keys" in ctl
           assert "ensure_omniroute_api_key" in ctl
           assert "omniroute_key_valid" in ctl
           assert "/api/auth/login" in ctl

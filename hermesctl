@@ -218,15 +218,19 @@ wait_omniroute() {
   return 1
 }
 
-omniroute_key_valid() {
+omniroute_key_http_status() {
   need curl
   local key="${1:-}" base code
-  [[ -n "$key" ]] || return 1
+  [[ -n "$key" ]] || { printf '000'; return 0; }
   base="$(omniroute_api_host_url)"
   code="$(curl -sS --compressed -o /dev/null -w '%{http_code}' \
     -H "Authorization: Bearer ${key}" \
     "${base}/v1/models" 2>/dev/null || true)"
-  [[ "$code" == "200" ]]
+  printf '%s' "${code:-000}"
+}
+
+omniroute_key_valid() {
+  [[ "$(omniroute_key_http_status "${1:-}")" == "200" ]]
 }
 
 ensure_omniroute_api_key() {
@@ -243,16 +247,30 @@ ensure_omniroute_api_key() {
     return 0
   fi
 
-  if omniroute_key_valid "${OMNIROUTE_UPSTREAM_API_KEY:-}"; then
-    echo "[ok] managed OmniRoute API key is already valid"
-    return 0
+  # If we already hold a managed key, wait for OmniRoute to be ready BEFORE
+  # deciding whether it is valid. A stopped/starting provider must never look
+  # like an authentication failure and trigger credential rotation.
+  if [[ -n "${OMNIROUTE_UPSTREAM_API_KEY:-}" ]]; then
+    if ! wait_omniroute 90; then
+      fail "OmniRoute did not become ready; refusing to rotate the existing managed API key"
+    fi
+    local existing_status
+    existing_status="$(omniroute_key_http_status "${OMNIROUTE_UPSTREAM_API_KEY}")"
+    if [[ "$existing_status" == "200" ]]; then
+      echo "[ok] managed OmniRoute API key is already valid"
+      return 0
+    fi
+    if [[ "$existing_status" != "401" && "$existing_status" != "403" ]]; then
+      fail "OmniRoute key validation returned HTTP ${existing_status}; refusing credential rotation on a transient/non-authentication error"
+    fi
+    info "existing OmniRoute managed key was explicitly rejected (${existing_status}); rotating it"
+  else
+    if ! wait_omniroute 90; then
+      fail "OmniRoute did not become reachable for API-key provisioning"
+    fi
   fi
 
   info "provisioning dedicated OmniRoute API key for Router Gateway"
-
-  if ! wait_omniroute 90; then
-    fail "OmniRoute did not become reachable for API-key provisioning"
-  fi
 
   [[ -n "${OMNIROUTE_INITIAL_PASSWORD:-}" ]] \
     || fail "OMNIROUTE_INITIAL_PASSWORD is missing; cannot authenticate to OmniRoute management API"
@@ -357,15 +375,19 @@ wait_nine_router() {
   return 1
 }
 
-nine_router_key_valid() {
+nine_router_key_http_status() {
   need curl
   local key="${1:-}" base code
-  [[ -n "$key" ]] || return 1
+  [[ -n "$key" ]] || { printf '000'; return 0; }
   base="$(nine_router_host_url)"
   code="$(curl -sS --compressed -o /dev/null -w '%{http_code}' \
     -H "Authorization: Bearer ${key}" \
     "${base}/v1/models" 2>/dev/null || true)"
-  [[ "$code" == "200" ]]
+  printf '%s' "${code:-000}"
+}
+
+nine_router_key_valid() {
+  [[ "$(nine_router_key_http_status "${1:-}")" == "200" ]]
 }
 
 ensure_nine_router_api_key() {
@@ -382,16 +404,30 @@ ensure_nine_router_api_key() {
     return 0
   fi
 
-  if nine_router_key_valid "${NINE_ROUTER_UPSTREAM_API_KEY:-}"; then
-    echo "[ok] managed 9router API key is already valid"
-    return 0
+  # Wait for 9router readiness before validating an existing key. Otherwise a
+  # provider that was just restarted can return connection errors and be
+  # mistaken for a revoked key, creating duplicate managed credentials.
+  if [[ -n "${NINE_ROUTER_UPSTREAM_API_KEY:-}" ]]; then
+    if ! wait_nine_router 75; then
+      fail "9router did not become ready; refusing to rotate the existing managed API key"
+    fi
+    local existing_status
+    existing_status="$(nine_router_key_http_status "${NINE_ROUTER_UPSTREAM_API_KEY}")"
+    if [[ "$existing_status" == "200" ]]; then
+      echo "[ok] managed 9router API key is already valid"
+      return 0
+    fi
+    if [[ "$existing_status" != "401" && "$existing_status" != "403" ]]; then
+      fail "9router key validation returned HTTP ${existing_status}; refusing credential rotation on a transient/non-authentication error"
+    fi
+    info "existing 9router managed key was explicitly rejected (${existing_status}); rotating it"
+  else
+    if ! wait_nine_router 75; then
+      fail "9router did not become reachable for API-key provisioning"
+    fi
   fi
 
   info "provisioning dedicated 9router API key for Router Gateway"
-
-  if ! wait_nine_router 75; then
-    fail "9router did not become reachable for API-key provisioning"
-  fi
 
   [[ -n "${NINEROUTER_INITIAL_PASSWORD:-}" ]] \
     || fail "NINEROUTER_INITIAL_PASSWORD is missing; cannot authenticate to 9router management API"
@@ -635,6 +671,218 @@ cmd_router_probe() {
   return "$failed"
 }
 
+managed_key_stale_ids() {
+  # Args: provider current_key managed_name key-list-json
+  # Prints stale IDs only. Never prints raw key material.
+  python3 - "$@" <<'PYCLEAN'
+import json, sys
+
+provider, current, managed, path = sys.argv[1:5]
+data = json.load(open(path))
+keys = data.get("keys", data if isinstance(data, list) else [])
+if not isinstance(keys, list):
+    raise SystemExit(3)
+
+same = [k for k in keys if isinstance(k, dict) and k.get("name") == managed]
+if len(same) <= 1:
+    raise SystemExit(0)
+
+def matches_current(k):
+    raw = k.get("key")
+    if not isinstance(raw, str):
+        return False
+    if provider == "nine-router":
+        return raw == current
+    # OmniRoute deliberately masks keys in management responses:
+    # first 8 chars + **** + last 4 chars.
+    return len(current) >= 12 and raw.startswith(current[:8]) and raw.endswith(current[-4:])
+
+keepers = [k for k in same if matches_current(k)]
+if len(keepers) != 1:
+    # Safety first: if the active key cannot be identified unambiguously, do
+    # not delete anything.
+    raise SystemExit(4)
+
+keep_id = str(keepers[0].get("id", ""))
+if not keep_id:
+    raise SystemExit(5)
+
+for k in same:
+    kid = str(k.get("id", ""))
+    if kid and kid != keep_id:
+        print(kid)
+PYCLEAN
+}
+
+cleanup_nine_router_duplicate_keys() {
+  need curl; need python3
+  load_env
+  [[ -n "${NINE_ROUTER_UPSTREAM_API_KEY:-}" ]] || {
+    echo "[ok] no managed 9router key configured; nothing to clean"
+    return 0
+  }
+  wait_nine_router 75 || fail "9router did not become ready for duplicate-key cleanup"
+  nine_router_key_valid "${NINE_ROUTER_UPSTREAM_API_KEY}" \
+    || fail "current 9router managed key is not valid; refusing duplicate cleanup"
+
+  local tmpdir cookie login_json keys_json code base name stale_file
+  tmpdir="$(mktemp -d)"; chmod 700 "$tmpdir"
+  cookie="$tmpdir/cookies"; login_json="$tmpdir/login.json"
+  keys_json="$tmpdir/keys.json"; stale_file="$tmpdir/stale"
+  base="$(nine_router_host_url)"
+  name="${NINEROUTER_MANAGED_API_KEY_NAME:-hermes-control-plane-router-gateway}"
+
+  code="$(
+    python3 - "${NINEROUTER_INITIAL_PASSWORD}" <<'PYLOGIN' |
+import json, sys
+print(json.dumps({"password": sys.argv[1]}))
+PYLOGIN
+    curl -sS -c "$cookie" -o "$login_json" -w '%{http_code}' \
+      -H 'Content-Type: application/json' --data-binary @- \
+      "${base}/api/auth/login" || true
+  )"
+  if [[ "$code" != "200" ]]; then
+    rm -rf "$tmpdir"
+    fail "9router management login failed; duplicate cleanup aborted without deleting keys"
+  fi
+
+  code="$(curl -sS -b "$cookie" -o "$keys_json" -w '%{http_code}' \
+    "${base}/api/keys" || true)"
+  if [[ "$code" != "200" ]]; then
+    rm -rf "$tmpdir"
+    fail "9router key listing failed with HTTP ${code:-unreachable}"
+  fi
+
+  if ! managed_key_stale_ids nine-router "${NINE_ROUTER_UPSTREAM_API_KEY}" "$name" "$keys_json" >"$stale_file"; then
+    rc=$?
+    rm -rf "$tmpdir"
+    if [[ "$rc" == "4" ]]; then
+      fail "could not identify the current 9router key unambiguously; no duplicate keys were deleted"
+    fi
+    fail "could not reconcile 9router managed keys; no keys were deleted"
+  fi
+
+  local count=0 id delcode
+  while IFS= read -r id; do
+    [[ -n "$id" ]] || continue
+    delcode="$(curl -sS -b "$cookie" -o /dev/null -w '%{http_code}' \
+      -X DELETE "${base}/api/keys/${id}" || true)"
+    if [[ "$delcode" == "200" ]]; then
+      count=$((count+1))
+    else
+      rm -rf "$tmpdir"
+      fail "9router duplicate-key deletion failed with HTTP ${delcode:-unreachable}"
+    fi
+  done <"$stale_file"
+  rm -rf "$tmpdir"
+  echo "[ok] 9router managed-key reconciliation complete; removed ${count} stale duplicate(s)"
+}
+
+cleanup_omniroute_duplicate_keys() {
+  need curl; need python3
+  load_env
+  [[ -n "${OMNIROUTE_UPSTREAM_API_KEY:-}" ]] || {
+    echo "[ok] no managed OmniRoute key configured; nothing to clean"
+    return 0
+  }
+  wait_omniroute 90 || fail "OmniRoute did not become ready for duplicate-key cleanup"
+  omniroute_key_valid "${OMNIROUTE_UPSTREAM_API_KEY}" \
+    || fail "current OmniRoute managed key is not valid; refusing duplicate cleanup"
+
+  local tmpdir cookie login_json keys_json code base name stale_file
+  tmpdir="$(mktemp -d)"; chmod 700 "$tmpdir"
+  cookie="$tmpdir/cookies"; login_json="$tmpdir/login.json"
+  keys_json="$tmpdir/keys.json"; stale_file="$tmpdir/stale"
+  base="$(omniroute_host_url)"
+  name="${OMNIROUTE_MANAGED_API_KEY_NAME:-hermes-control-plane-router-gateway}"
+
+  code="$(
+    python3 - "${OMNIROUTE_INITIAL_PASSWORD}" <<'PYLOGIN' |
+import json, sys
+print(json.dumps({"password": sys.argv[1]}))
+PYLOGIN
+    curl -sS -c "$cookie" -o "$login_json" -w '%{http_code}' \
+      -H 'Content-Type: application/json' --data-binary @- \
+      "${base}/api/auth/login" || true
+  )"
+  if [[ "$code" != "200" ]]; then
+    rm -rf "$tmpdir"
+    fail "OmniRoute management login failed; duplicate cleanup aborted without deleting keys"
+  fi
+
+  code="$(curl -sS -b "$cookie" -o "$keys_json" -w '%{http_code}' \
+    "${base}/api/keys" || true)"
+  if [[ "$code" != "200" ]]; then
+    rm -rf "$tmpdir"
+    fail "OmniRoute key listing failed with HTTP ${code:-unreachable}"
+  fi
+
+  if ! managed_key_stale_ids omniroute "${OMNIROUTE_UPSTREAM_API_KEY}" "$name" "$keys_json" >"$stale_file"; then
+    rc=$?
+    rm -rf "$tmpdir"
+    if [[ "$rc" == "4" ]]; then
+      fail "could not identify the current OmniRoute key unambiguously; no duplicate keys were deleted"
+    fi
+    fail "could not reconcile OmniRoute managed keys; no keys were deleted"
+  fi
+
+  local count=0 id delcode
+  while IFS= read -r id; do
+    [[ -n "$id" ]] || continue
+    delcode="$(curl -sS -b "$cookie" -o /dev/null -w '%{http_code}' \
+      -X DELETE "${base}/api/keys/${id}" || true)"
+    if [[ "$delcode" == "200" ]]; then
+      count=$((count+1))
+    else
+      rm -rf "$tmpdir"
+      fail "OmniRoute duplicate-key deletion failed with HTTP ${delcode:-unreachable}"
+    fi
+  done <"$stale_file"
+  rm -rf "$tmpdir"
+  echo "[ok] OmniRoute managed-key reconciliation complete; removed ${count} stale duplicate(s)"
+}
+
+cmd_router_cleanup_keys() {
+  need docker
+  local provider="${1:-all}"
+  load_env
+
+  case "$provider" in
+    nine-router)
+      "${COMPOSE[@]}" --profile nine-router up -d nine-router
+      wait_nine_router 75 || fail "9router did not become ready"
+      cleanup_nine_router_duplicate_keys
+      ;;
+    omniroute)
+      "${COMPOSE[@]}" --profile omniroute up -d omniroute
+      wait_omniroute 90 || fail "OmniRoute did not become ready"
+      cleanup_omniroute_duplicate_keys
+      ;;
+    all)
+      local active="${HERMES_ROUTER_PROVIDER:-nine-router}"
+      "${COMPOSE[@]}" --profile nine-router up -d nine-router
+      wait_nine_router 75 || fail "9router did not become ready"
+      cleanup_nine_router_duplicate_keys
+
+      "${COMPOSE[@]}" --profile omniroute up -d omniroute
+      wait_omniroute 90 || fail "OmniRoute did not become ready"
+      cleanup_omniroute_duplicate_keys
+
+      if [[ "${HERMES_ENABLE_BOTH_ROUTERS:-false}" != "true" ]]; then
+        if [[ "$active" == "nine-router" ]]; then
+          "${COMPOSE[@]}" --profile omniroute stop omniroute >/dev/null 2>&1 || true
+        else
+          "${COMPOSE[@]}" --profile nine-router stop nine-router >/dev/null 2>&1 || true
+        fi
+      fi
+      ;;
+    *)
+      fail "usage: ./hermesctl router cleanup-keys nine-router|omniroute|all"
+      ;;
+  esac
+}
+
+
 cmd_router_provision() {
   need docker
   local provider="${1:-${HERMES_ROUTER_PROVIDER:-nine-router}}"
@@ -646,11 +894,13 @@ cmd_router_provision() {
     nine-router)
       info "starting 9router for managed credential provisioning"
       "${COMPOSE[@]}" --profile nine-router up -d nine-router
+      wait_nine_router 75 || fail "9router did not become ready after start"
       ensure_nine_router_api_key
       ;;
     omniroute)
       info "starting OmniRoute for managed credential provisioning"
       "${COMPOSE[@]}" --profile omniroute up -d omniroute
+      wait_omniroute 90 || fail "OmniRoute did not become ready after start"
       ensure_omniroute_api_key
       ;;
   esac
@@ -674,10 +924,12 @@ cmd_router_set() {
   case "$provider" in
     nine-router)
       "${COMPOSE[@]}" --profile nine-router up -d nine-router
+      wait_nine_router 75 || fail "9router did not become ready after start"
       ensure_nine_router_api_key
       ;;
     omniroute)
       "${COMPOSE[@]}" --profile omniroute up -d omniroute
+      wait_omniroute 90 || fail "OmniRoute did not become ready after start"
       ensure_omniroute_api_key
       ;;
   esac
@@ -1050,6 +1302,7 @@ case "${1:-}" in
     case "${2:-}" in
       list) cmd_router_list ;;
       provision) cmd_router_provision "${3:-${HERMES_ROUTER_PROVIDER:-nine-router}}" ;;
+      cleanup-keys) cmd_router_cleanup_keys "${3:-all}" ;;
       probe) cmd_router_probe ;;
       set) cmd_router_set "${3:-}" ;;
       *) usage; exit 2 ;;

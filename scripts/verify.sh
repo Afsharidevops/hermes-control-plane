@@ -29,6 +29,10 @@ if 'ensure_hermes_router_model' not in ctl:
     raise SystemExit('hermesctl does not synchronize Hermes Smart Router model config')
 if 'plugins list --plain --no-bundled' not in ctl:
     raise SystemExit('bot checker still relies on truncating rich plugin table')
+
+for marker in ['nine_router_key_http_status','omniroute_key_http_status','cmd_router_cleanup_keys','managed_key_stale_ids']:
+    if marker not in ctl:
+        raise SystemExit(f'missing router idempotency marker: {marker}')
 for marker in [
     '/api/auth/login',
     '/api/keys',
