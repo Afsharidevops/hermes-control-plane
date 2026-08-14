@@ -42,11 +42,17 @@ jobs:
               "./plugins/control-plane-chatops:/opt/data/plugins/control-plane-chatops:ro",
               "TELEGRAM_BOT_TOKEN:",
               "TELEGRAM_ALLOWED_USERS:",
+              "OPENAI_BASE_URL: http://smart-router:8080/v1",
+              "OPENAI_API_KEY: ${SMART_ROUTER_CLIENT_API_KEY}",
+              "HERMES_MODEL:",
           ]
           for item in required:
               assert item in compose, item
           assert "plugins enable control-plane-chatops" in ctl
           assert "--entrypoint /opt/hermes/.venv/bin/hermes" in ctl
+          assert "ensure_nine_router_api_key" in ctl
+          assert "/api/auth/login" in ctl
+          assert "/api/keys" in ctl
           assert "HERMES_KUBERNETES_BROKER_UID" in compose
           print("bot/credential wiring: ok")
           PY

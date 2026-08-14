@@ -136,6 +136,53 @@ hermes_cli_run() {
     hermes "$@"
 }
 
+hermes_python_run() {
+  "${COMPOSE[@]}" --profile hermes run --rm --no-deps -T \
+    --entrypoint /opt/hermes/.venv/bin/python \
+    -e TELEGRAM_BOT_TOKEN= \
+    -e TELEGRAM_ALLOWED_USERS= \
+    hermes "$@"
+}
+
+ensure_hermes_router_model() {
+  need docker
+  load_env
+  info "synchronizing Hermes model endpoint with internal Smart Router"
+  hermes_python_run - <<'PYMODEL'
+from pathlib import Path
+import os, shutil, time, yaml
+path=Path('/opt/data/config.yaml')
+data={}
+if path.exists():
+    loaded=yaml.safe_load(path.read_text())
+    if isinstance(loaded,dict): data=loaded
+old=data.get('model')
+model=dict(old) if isinstance(old,dict) else {}
+desired={
+    'provider':'custom',
+    'default':os.environ.get('HERMES_MODEL','auto') or 'auto',
+    'base_url':'http://smart-router:8080/v1',
+    'api_mode':'chat_completions',
+}
+changed=False
+for k,v in desired.items():
+    if model.get(k)!=v:
+        model[k]=v; changed=True
+# Keep the routing client secret only in the process environment.
+if model.get('api_key'):
+    model['api_key']=''; changed=True
+if data.get('model')!=model:
+    data['model']=model; changed=True
+if changed:
+    if path.exists():
+        shutil.copy2(path,path.with_name(f'config.yaml.pre-hcp-model-{int(time.time())}.bak'))
+    path.write_text(yaml.safe_dump(data,sort_keys=False))
+    print('Hermes model configuration updated: Smart Router + model=auto')
+else:
+    print('Hermes model configuration already synchronized.')
+PYMODEL
+}
+
 ensure_chatops_plugin() {
   need docker
   load_env
@@ -144,6 +191,151 @@ ensure_chatops_plugin() {
   # CLI-only entrypoint so enabling it never launches a transient gateway.
   if ! hermes_cli_run plugins enable control-plane-chatops >/dev/null; then
     fail "could not enable control-plane-chatops plugin; run ./hermesctl bot check"
+  fi
+}
+
+nine_router_host_url() {
+  printf 'http://%s:%s' "${NINEROUTER_PROVISION_HOST:-127.0.0.1}" "${NINEROUTER_PORT:-20128}"
+}
+
+wait_nine_router() {
+  need curl
+  local timeout="${1:-60}" elapsed=0 base
+  base="$(nine_router_host_url)"
+  while (( elapsed < timeout )); do
+    if curl -fsS "${base}/api/health" >/dev/null 2>&1 \
+       || curl -fsS "${base}/" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+    elapsed=$((elapsed+1))
+  done
+  return 1
+}
+
+nine_router_key_valid() {
+  need curl
+  local key="${1:-}" base code
+  [[ -n "$key" ]] || return 1
+  base="$(nine_router_host_url)"
+  code="$(curl -sS --compressed -o /dev/null -w '%{http_code}' \
+    -H "Authorization: Bearer ${key}" \
+    "${base}/v1/models" 2>/dev/null || true)"
+  [[ "$code" == "200" ]]
+}
+
+ensure_nine_router_api_key() {
+  need curl
+  need python3
+  load_env
+
+  if [[ "${NINEROUTER_AUTO_PROVISION_API_KEY:-true}" != "true" ]]; then
+    [[ -n "${NINE_ROUTER_UPSTREAM_API_KEY:-}" ]] \
+      || fail "9router automatic API-key provisioning is disabled and NINE_ROUTER_UPSTREAM_API_KEY is empty"
+    nine_router_key_valid "${NINE_ROUTER_UPSTREAM_API_KEY}" \
+      || fail "configured 9router API key is not accepted"
+    echo "[ok] 9router API key is configured"
+    return 0
+  fi
+
+  if nine_router_key_valid "${NINE_ROUTER_UPSTREAM_API_KEY:-}"; then
+    echo "[ok] managed 9router API key is already valid"
+    return 0
+  fi
+
+  info "provisioning dedicated 9router API key for Router Gateway"
+
+  if ! wait_nine_router 75; then
+    fail "9router did not become reachable for API-key provisioning"
+  fi
+
+  [[ -n "${NINEROUTER_INITIAL_PASSWORD:-}" ]] \
+    || fail "NINEROUTER_INITIAL_PASSWORD is missing; cannot authenticate to 9router management API"
+
+  local tmpdir cookie login_json key_json login_code key_code managed_name provisioned_key base
+  tmpdir="$(mktemp -d)"
+  chmod 700 "$tmpdir"
+  cookie="$tmpdir/cookies"
+  login_json="$tmpdir/login.json"
+  key_json="$tmpdir/key.json"
+  managed_name="${NINEROUTER_MANAGED_API_KEY_NAME:-hermes-control-plane-router-gateway}"
+  base="$(nine_router_host_url)"
+
+  login_code="$(
+    python3 - "${NINEROUTER_INITIAL_PASSWORD}" <<'PYLOGIN' |
+import json, sys
+print(json.dumps({"password": sys.argv[1]}))
+PYLOGIN
+    curl -sS \
+      -c "$cookie" \
+      -o "$login_json" \
+      -w '%{http_code}' \
+      -H 'Content-Type: application/json' \
+      --data-binary @- \
+      "${base}/api/auth/login" || true
+  )"
+
+  if [[ "$login_code" != "200" ]]; then
+    rm -rf "$tmpdir"
+    fail "9router management login failed with HTTP ${login_code:-unreachable}; provisioning stops after one attempt to avoid dashboard lockout"
+  fi
+
+  key_code="$(
+    python3 - "$managed_name" <<'PYKEY' |
+import json, sys
+print(json.dumps({"name": sys.argv[1]}))
+PYKEY
+    curl -sS \
+      -b "$cookie" \
+      -o "$key_json" \
+      -w '%{http_code}' \
+      -H 'Content-Type: application/json' \
+      --data-binary @- \
+      "${base}/api/keys" || true
+  )"
+
+  if [[ "$key_code" != "201" ]]; then
+    rm -rf "$tmpdir"
+    fail "9router API-key creation failed with HTTP ${key_code:-unreachable}"
+  fi
+
+  provisioned_key="$(
+    python3 - "$key_json" <<'PYREAD'
+import json, sys
+data=json.load(open(sys.argv[1]))
+key=data.get("key")
+if not isinstance(key, str) or len(key.strip()) < 16 or any(ch.isspace() for ch in key):
+    raise SystemExit(2)
+print(key.strip())
+PYREAD
+  )" || {
+    rm -rf "$tmpdir"
+    fail "9router API-key creation returned an invalid response"
+  }
+
+  rm -rf "$tmpdir"
+
+  set_env NINE_ROUTER_UPSTREAM_API_KEY "$provisioned_key"
+  chmod 600 "$ENV_FILE"
+  load_env
+
+  if ! nine_router_key_valid "${NINE_ROUTER_UPSTREAM_API_KEY}"; then
+    fail "9router created a managed key but rejected it during verification"
+  fi
+
+  echo "[ok] provisioned and verified dedicated 9router Router Gateway API key"
+  echo "     key material stored only in local .env"
+}
+
+bootstrap_selected_router() {
+  need docker
+  load_env
+  local provider="${HERMES_ROUTER_PROVIDER:-nine-router}"
+
+  if [[ "$provider" == "nine-router" || "${HERMES_ENABLE_BOTH_ROUTERS:-false}" == "true" ]]; then
+    info "starting 9router bootstrap phase"
+    "${COMPOSE[@]}" --profile nine-router up -d nine-router
+    ensure_nine_router_api_key
   fi
 }
 
@@ -158,9 +350,13 @@ cmd_up() {
   if [[ "$mode" == "--pull" ]]; then
     info "pulling published images for Hermes Control Plane ($provider)"
     "${COMPOSE[@]}" "${args[@]}" pull
+    bootstrap_selected_router
+    ensure_hermes_router_model
     ensure_chatops_plugin
     "${COMPOSE[@]}" "${args[@]}" up -d --no-build
   elif [[ -z "$mode" ]]; then
+    bootstrap_selected_router
+    ensure_hermes_router_model
     ensure_chatops_plugin
     info "starting Hermes Control Plane with active router: $provider"
     "${COMPOSE[@]}" "${args[@]}" up -d --build
@@ -227,6 +423,71 @@ cmd_router_list() {
     "http://${ROUTER_GATEWAY_BIND_IP:-127.0.0.1}:${ROUTER_GATEWAY_PORT:-8790}/management/providers" | python3 -m json.tool
 }
 
+cmd_router_probe() {
+  need curl
+  load_env
+  local failed=0 code
+
+  code="$(curl -sS -o /dev/null -w '%{http_code}' \
+    -H "Authorization: Bearer ${SMART_ROUTER_CLIENT_API_KEY}" \
+    "http://${SMART_ROUTER_BIND_IP:-127.0.0.1}:${SMART_ROUTER_PORT:-8787}/dashboard/api/summary?hours=1" \
+    2>/dev/null || true)"
+  if [[ "$code" == "200" ]]; then
+    echo "[ok] Smart Router client authentication"
+  else
+    echo "[fail] Smart Router client authentication: HTTP ${code:-unreachable}"
+    failed=1
+  fi
+
+  code="$(curl -sS -o /dev/null -w '%{http_code}' \
+    -H "Authorization: Bearer ${ROUTER_GATEWAY_ADMIN_TOKEN}" \
+    "http://${ROUTER_GATEWAY_BIND_IP:-127.0.0.1}:${ROUTER_GATEWAY_PORT:-8790}/management/providers" \
+    2>/dev/null || true)"
+  if [[ "$code" == "200" ]]; then
+    echo "[ok] Router Gateway management API"
+  else
+    echo "[fail] Router Gateway management API: HTTP ${code:-unreachable}"
+    failed=1
+  fi
+
+  if [[ "${HERMES_ROUTER_PROVIDER:-nine-router}" == "nine-router" ]]; then
+    if nine_router_key_valid "${NINE_ROUTER_UPSTREAM_API_KEY:-}"; then
+      echo "[ok] 9router managed API key"
+    else
+      echo "[fail] 9router managed API key"
+      failed=1
+    fi
+  fi
+
+  code="$(curl -sS --compressed -o /dev/null -w '%{http_code}' \
+    -H "Authorization: Bearer ${SMART_ROUTER_CLIENT_API_KEY}" \
+    "http://${SMART_ROUTER_BIND_IP:-127.0.0.1}:${SMART_ROUTER_PORT:-8787}/v1/models" \
+    2>/dev/null || true)"
+  if [[ "$code" == "200" ]]; then
+    echo "[ok] end-to-end model route"
+  else
+    echo "[fail] end-to-end model route: HTTP ${code:-unreachable}"
+    failed=1
+  fi
+
+  return "$failed"
+}
+
+cmd_router_provision() {
+  need docker
+  local provider="${1:-nine-router}"
+  [[ "$provider" == "nine-router" ]] || fail "automatic provisioning is currently implemented for nine-router"
+  load_env
+  info "starting 9router for managed credential provisioning"
+  "${COMPOSE[@]}" --profile nine-router up -d nine-router
+  ensure_nine_router_api_key
+  load_env
+  info "recreating Router Gateway and Smart Router with managed 9router credential"
+  "${COMPOSE[@]}" --profile nine-router up -d --force-recreate router-gateway smart-router
+  sleep 5
+  cmd_router_probe
+}
+
 cmd_router_set() {
   need docker; need curl
   local provider="${1:-}"
@@ -236,7 +497,14 @@ cmd_router_set() {
   set_env HERMES_ROUTER_PROVIDER "$provider"
   load_env
   info "starting provider $provider"
-  "${COMPOSE[@]}" --profile "$provider" up -d "$provider" router-gateway
+  if [[ "$provider" == "nine-router" ]]; then
+    "${COMPOSE[@]}" --profile nine-router up -d nine-router
+    ensure_nine_router_api_key
+    load_env
+    "${COMPOSE[@]}" --profile nine-router up -d --force-recreate router-gateway
+  else
+    "${COMPOSE[@]}" --profile "$provider" up -d "$provider" router-gateway
+  fi
   for _ in $(seq 1 45); do
     if curl -fsS "http://${ROUTER_GATEWAY_BIND_IP:-127.0.0.1}:${ROUTER_GATEWAY_PORT:-8790}/health" >/dev/null 2>&1; then break; fi
     sleep 1
@@ -417,11 +685,19 @@ PYBOT
       load_env
       echo "Hermes Telegram gateway token saved to local .env."
       if command -v docker >/dev/null 2>&1; then
+        ensure_hermes_router_model
         ensure_chatops_plugin
         if "${COMPOSE[@]}" --profile hermes ps --status running --services 2>/dev/null | grep -qx hermes; then
           info "recreating Hermes so Telegram/plugin configuration is loaded"
           "${COMPOSE[@]}" --profile hermes up -d --force-recreate hermes
         fi
+      fi
+      ;;
+    model-sync)
+      ensure_hermes_router_model
+      if "${COMPOSE[@]}" --profile hermes ps --status running --services 2>/dev/null | grep -qx hermes; then
+        info "recreating Hermes with synchronized Smart Router model configuration"
+        "${COMPOSE[@]}" --profile hermes up -d --force-recreate hermes
       fi
       ;;
     check)
@@ -442,13 +718,27 @@ PYBOT
         return 1
       fi
       local plugin_line
-      plugin_line="$(hermes_cli_run plugins list 2>&1 | grep -i "control-plane-chatops" | head -1 || true)"
+      plugin_line="$(hermes_cli_run plugins list --plain --no-bundled 2>&1 | grep -i "control-plane-chatops" | head -1 || true)"
       if [[ -n "$plugin_line" ]]; then
-        echo "[ok] plugin discovered: $plugin_line"
+        echo "[ok] plugin discovered: control-plane-chatops"
       else
         echo "[fail] plugin is mounted but Hermes does not discover it"
-        echo "Run: HERMES_PLUGINS_DEBUG=1 ./hermesctl bot check"
         return 1
+      fi
+      local model_summary
+      model_summary="$("${COMPOSE[@]}" --profile hermes exec -T hermes /opt/hermes/.venv/bin/python - <<'PYMODELCHK'
+from pathlib import Path
+import yaml
+data=yaml.safe_load(Path('/opt/data/config.yaml').read_text()) or {}
+m=data.get('model') if isinstance(data,dict) else {}
+print(f"{m.get('provider','')}|{m.get('default','')}|{m.get('base_url','')}|{m.get('api_mode','')}" if isinstance(m,dict) else 'invalid')
+PYMODELCHK
+)"
+      if [[ "$model_summary" == "custom|auto|http://smart-router:8080/v1|chat_completions" ]]; then
+        echo "[ok] Hermes main model routed through Smart Router with model=auto"
+      else
+        echo "[warn] Hermes model configuration not synchronized; fixing it"
+        ensure_hermes_router_model
       fi
       if grep -qE '^[[:space:]]*-[[:space:]]*control-plane-chatops[[:space:]]*$' <(
           "${COMPOSE[@]}" --profile hermes exec -T hermes sh -lc \
@@ -460,7 +750,7 @@ PYBOT
         ensure_chatops_plugin
       fi
       ;;
-    *) fail "usage: ./hermesctl bot allow <telegram-user-id>|telegram|status|check" ;;
+    *) fail "usage: ./hermesctl bot allow <telegram-user-id>|telegram|model-sync|status|check" ;;
   esac
 }
 
@@ -498,6 +788,21 @@ cmd_doctor() {
     else
       echo "[warn] Telegram bot allowlist incomplete; run ./hermesctl bot allow <numeric-id>"
     fi
+    if [[ -n "${SMART_ROUTER_CLIENT_API_KEY:-}" ]]; then
+      echo "[ok] Smart Router stack client credential configured"
+    else
+      echo "[fail] SMART_ROUTER_CLIENT_API_KEY missing"
+    fi
+    if [[ "${NINEROUTER_AUTO_PROVISION_API_KEY:-true}" == "true" ]]; then
+      echo "[ok] 9router API-key auto-provisioning enabled"
+    else
+      echo "[warn] 9router API-key auto-provisioning disabled"
+    fi
+    if [[ -n "${NINE_ROUTER_UPSTREAM_API_KEY:-}" ]]; then
+      echo "[ok] managed 9router Router Gateway credential present"
+    else
+      echo "[info] managed 9router credential will be created automatically on ./hermesctl up"
+    fi
   fi
 }
 
@@ -516,10 +821,13 @@ Commands:
   execution status             Show execution gates
   bot allow <telegram-id>      Allow a numeric Telegram user to request bot-only mutations
   bot telegram                 Configure Telegram bot token with hidden input
+  bot model-sync               Route Hermes main model through internal Smart Router
   bot status                   Show bot/gateway configuration status (never tokens)
-  bot check                    Check runtime ChatOps plugin discovery
+  bot check                    Check ChatOps plugin + Smart Router model wiring
   doctor                       Check local prerequisites/config
   router list                  Show configured router health and active provider
+  router provision nine-router Provision/repair dedicated 9router API key automatically
+  router probe                 Verify every router authentication/routing hop
   router set nine-router       Start/select 9router
   router set omniroute         Start/select OmniRoute
   version                      Show repository/configured/running versions
@@ -553,6 +861,8 @@ case "${1:-}" in
   router)
     case "${2:-}" in
       list) cmd_router_list ;;
+      provision) cmd_router_provision "${3:-nine-router}" ;;
+      probe) cmd_router_probe ;;
       set) cmd_router_set "${3:-}" ;;
       *) usage; exit 2 ;;
     esac

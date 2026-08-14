@@ -228,6 +228,10 @@ services:
       HERMES_GID: ${HERMES_GID:-10000}
       HERMES_DISABLE_LAZY_INSTALLS: "1"
       EXECUTION_FEATURES: ""
+      # Hermes model traffic enters the internal Smart Router.
+      OPENAI_BASE_URL: http://smart-router:8080/v1
+      OPENAI_API_KEY: ${SMART_ROUTER_CLIENT_API_KEY}
+      HERMES_MODEL: ${HERMES_MODEL:-auto}
       HERMES_CONTROL_PLANE_URL: http://control-plane:8800
       HERMES_BOT_SERVICE_TOKEN: ${HERMES_BOT_SERVICE_TOKEN}
       HERMES_CONTROL_PLANE_BOT_USERS: ${HERMES_CONTROL_PLANE_BOT_USERS:-}

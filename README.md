@@ -161,3 +161,5 @@ CI runs the Control Plane safety/beta flow tests, Kubernetes Broker policy/ticke
 ## Security status
 
 The Control Plane API does not accept raw kubeconfig material. Kubernetes/Helm mutation requires live broker preview plus the exact approved ChangeSet and is disabled by default. Read `SECURITY.md` before enabling execution.
+
+9router Router Gateway API credentials are provisioned automatically by `./hermesctl up`; no dashboard key copy/paste is required.

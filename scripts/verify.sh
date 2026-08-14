@@ -17,12 +17,33 @@ for marker in [
     './plugins/control-plane-chatops:/opt/data/plugins/control-plane-chatops:ro',
     'TELEGRAM_BOT_TOKEN:',
     'TELEGRAM_ALLOWED_USERS:',
+    'OPENAI_BASE_URL: http://smart-router:8080/v1',
+    'OPENAI_API_KEY: ${SMART_ROUTER_CLIENT_API_KEY}',
     'HERMES_KUBERNETES_BROKER_UID',
 ]:
     if marker not in compose:
         raise SystemExit(f'missing compose wiring: {marker}')
 if 'plugins enable control-plane-chatops' not in ctl:
     raise SystemExit('hermesctl does not auto-enable ChatOps plugin')
+if 'ensure_hermes_router_model' not in ctl:
+    raise SystemExit('hermesctl does not synchronize Hermes Smart Router model config')
+if 'plugins list --plain --no-bundled' not in ctl:
+    raise SystemExit('bot checker still relies on truncating rich plugin table')
+for marker in [
+    '/api/auth/login',
+    '/api/keys',
+    'ensure_nine_router_api_key',
+    'cmd_router_provision',
+]:
+    if marker not in ctl:
+        raise SystemExit(f'missing automatic 9router provisioning marker: {marker}')
+env_example=(root/'.env.example').read_text()
+for marker in [
+    'NINEROUTER_AUTO_PROVISION_API_KEY=true',
+    'NINEROUTER_MANAGED_API_KEY_NAME=hermes-control-plane-router-gateway',
+]:
+    if marker not in env_example:
+        raise SystemExit(f'missing 9router provisioning env marker: {marker}')
 if '--entrypoint /opt/hermes/.venv/bin/hermes' not in ctl:
     raise SystemExit('Hermes plugin CLI helper does not bypass gateway entrypoint')
 if "'dev/**'" not in workflow:

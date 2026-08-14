@@ -86,3 +86,36 @@ Only the long-running `hermes` service may poll Telegram. Administrative
 `hermes plugins ...` commands are executed with a CLI-only Docker entrypoint so
 they never start a second gateway. A Telegram HTTP 409 `getUpdates` conflict is
 therefore treated as a deployment/runtime conflict, not as normal operation.
+
+
+## Hermes model routing
+
+Hermes uses the internal Smart Router at `http://smart-router:8080/v1` with
+`model=auto`. The routing client credential stays in the process environment.
+
+```bash
+./hermesctl router probe
+./hermesctl bot model-sync
+./hermesctl bot check
+```
+
+
+## Automatic 9router credential provisioning
+
+No dashboard copy/paste is required. `./hermesctl up` automatically obtains a
+dedicated Router Gateway API key through 9router's authenticated management API
+and stores it only in the local `.env`.
+
+```text
+Hermes
+  -> Smart Router client credential
+Smart Router
+  -> Router Gateway
+Router Gateway
+  -> managed 9router API key
+9router
+  -> configured AI providers
+```
+
+`./hermesctl router probe` reports each authentication/routing hop without
+printing credentials.
