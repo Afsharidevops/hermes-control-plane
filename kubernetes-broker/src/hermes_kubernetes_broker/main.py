@@ -361,8 +361,57 @@ def _execute_plan(plan: dict[str, Any]) -> dict[str, Any]:
         ns = _namespace(params.get("namespace"))
         _enforce_namespace(snapshot, ns)
         _enforce_manifest_scope(snapshot, docs, ns)
-        result = _run(["kubectl", "apply", "--server-side", "--field-manager=hermes-control-plane", "-n", ns, "-f", "-", "-o", "name"], snapshot, manifest, timeout=max(COMMAND_TIMEOUT, 120))
-        return {"operation": operation, "result": result}
+        result = _run(
+            [
+                "kubectl", "apply",
+                "--server-side",
+                "--field-manager=hermes-control-plane",
+                "-n", ns,
+                "-f", "-",
+                "-o", "name",
+            ],
+            snapshot,
+            manifest,
+            timeout=max(COMMAND_TIMEOUT, 120),
+        )
+
+        # Post-apply convergence verification:
+        # kubectl diff returns 0 only when live state matches the exact
+        # approved manifest. A remaining diff makes execution fail.
+        convergence = _run(
+            [
+                "kubectl", "diff",
+                "--server-side",
+                "--field-manager=hermes-control-plane",
+                "-n", ns,
+                "-f", "-",
+            ],
+            snapshot,
+            manifest,
+            timeout=max(COMMAND_TIMEOUT, 120),
+            allowed_codes={0},
+        )
+
+        resources = [
+            {
+                "apiVersion": doc.get("apiVersion"),
+                "kind": doc.get("kind"),
+                "name": (doc.get("metadata") or {}).get("name"),
+                "namespace": (doc.get("metadata") or {}).get("namespace", ns),
+            }
+            for doc in docs
+        ]
+
+        return {
+            "operation": operation,
+            "result": result,
+            "verification": {
+                "converged": True,
+                "method": "kubectl-diff",
+                "diff": convergence,
+                "resources": resources,
+            },
+        }
     if operation in {"helm.install", "helm.upgrade"}:
         release, chart, namespace, args = _helm_base(params)
         _enforce_namespace(snapshot, namespace)

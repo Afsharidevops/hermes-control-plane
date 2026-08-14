@@ -44,3 +44,50 @@ def test_namespace_resource_requires_cluster_scope():
 def test_helm_chart_cannot_be_flag():
     with pytest.raises(Exception):
         main._validate_helm_chart("--post-renderer")
+
+
+def test_manifest_execution_verifies_convergence(monkeypatch):
+    calls = []
+
+    def fake_run(args, snapshot, stdin=None, timeout=None, allowed_codes=None):
+        calls.append({
+            "args": args,
+            "stdin": stdin,
+            "allowed_codes": allowed_codes,
+        })
+        return {"returncode": 0, "output": "", "duration": 0.01}
+
+    monkeypatch.setattr(main, "_run", fake_run)
+
+    plan = {
+        "schema_version": 2,
+        "operation": "kubernetes.manifest.apply",
+        "adapter": "kubernetes",
+        "target_id": "test",
+        "parameters": {
+            "namespace": "default",
+            "manifest": (
+                "apiVersion: v1\n"
+                "kind: ConfigMap\n"
+                "metadata:\n"
+                "  name: execution-test\n"
+                "  namespace: default\n"
+                "data:\n"
+                "  value: test\n"
+            ),
+        },
+        "policy_generation": 1,
+        "target_snapshot": {
+            "kind": "kubernetes",
+            "connection_mode": "agent",
+            "scope": {},
+        },
+    }
+
+    result = main._execute_plan(plan)
+
+    assert calls[0]["args"][1] == "apply"
+    assert calls[1]["args"][1] == "diff"
+    assert calls[1]["allowed_codes"] == {0}
+    assert result["verification"]["converged"] is True
+    assert result["verification"]["method"] == "kubectl-diff"

@@ -158,7 +158,18 @@ def _changeset_dict(row: Any) -> dict[str, Any]:
     item["execution"] = json.loads(item.pop("execution_json", None) or "null")
     item["approval_required"] = bool(item["approval_required"])
     enabled = os.getenv("HERMES_EXECUTION_ENABLED", "false").lower() == "true"
-    item["executable"] = enabled and item["adapter"] in {"kubernetes", "helm"}
+    execution_state_ready = (
+        item["state"] == "APPROVED"
+        or (
+            item["state"] == "PREVIEWED"
+            and not item["approval_required"]
+        )
+    )
+    item["executable"] = (
+        enabled
+        and item["adapter"] in {"kubernetes", "helm"}
+        and execution_state_ready
+    )
     item["execution_note"] = "beta.1 execution requires live preview, approval when required, target snapshot match, and a signed one-time broker ticket"
     return item
 

@@ -82,10 +82,23 @@ def test_approved_exact_plan_executes_with_signed_ticket(client: TestClient, mon
         "operation": "kubernetes.manifest.apply", "adapter": "kubernetes", "target_id": target["id"],
         "requested_by": "ui:requester", "parameters": {"manifest": "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: demo\n"}
     }).json()
-    assert client.post(f"/v1/changesets/{chg['id']}/preview-live", headers=AUTH).status_code == 200
+    preview = client.post(f"/v1/changesets/{chg['id']}/preview-live", headers=AUTH)
+    assert preview.status_code == 200
+    assert preview.json()["state"] == "PREVIEWED"
+    assert preview.json()["executable"] is False
+
     assert client.post(f"/v1/changesets/{chg['id']}/request-approval", headers=AUTH).status_code == 200
-    approval = client.post(f"/v1/changesets/{chg['id']}/approve", headers=AUTH, json={"approver": "ui:approver", "plan_hash": chg["plan_hash"]})
+
+    approval = client.post(
+        f"/v1/changesets/{chg['id']}/approve",
+        headers=AUTH,
+        json={"approver": "ui:approver", "plan_hash": chg["plan_hash"]},
+    )
     assert approval.status_code == 201
+
+    approved = client.get(f"/v1/changesets/{chg['id']}").json()
+    assert approved["state"] == "APPROVED"
+    assert approved["executable"] is True
     executed = client.post(f"/v1/changesets/{chg['id']}/execute", headers=AUTH, json={"actor": "ui:executor"})
     assert executed.status_code == 200, executed.text
     assert executed.json()["state"] == "EXECUTED"
@@ -109,8 +122,10 @@ def test_live_preview_policy_denial_is_terminal(client: TestClient, monkeypatch)
     preview = client.post(f"/v1/changesets/{chg['id']}/preview-live", headers=AUTH)
     assert preview.status_code == 403
     assert preview.json()["detail"] == "Secret is denied by the beta.1 safety floor"
+    monkeypatch.setenv("HERMES_EXECUTION_ENABLED", "true")
     stored = client.get(f"/v1/changesets/{chg['id']}").json()
     assert stored["state"] == "POLICY_DENIED"
+    assert stored["executable"] is False
     assert stored["preview"]["details"]["status_code"] == 403
     audit = client.get("/v1/audit").json()
     assert any(x["event_type"] == "changeset.policy_denied" and x["subject_id"] == chg["id"] for x in audit)
