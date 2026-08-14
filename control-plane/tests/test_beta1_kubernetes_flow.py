@@ -90,3 +90,47 @@ def test_approved_exact_plan_executes_with_signed_ticket(client: TestClient, mon
     assert executed.status_code == 200, executed.text
     assert executed.json()["state"] == "EXECUTED"
     assert calls[-1][0] == "/v1/execute"
+
+
+def test_live_preview_policy_denial_is_terminal(client: TestClient, monkeypatch):
+    from fastapi import HTTPException
+
+    target = setup_target(client)
+
+    async def fake_post(path, payload):
+        assert path == "/v1/preview"
+        raise HTTPException(403, "Secret is denied by the beta.1 safety floor")
+
+    monkeypatch.setattr(cp.kubernetes_broker, "post", fake_post)
+    chg = client.post("/v1/changesets", headers=AUTH, json={
+        "operation": "kubernetes.manifest.apply", "adapter": "kubernetes", "target_id": target["id"],
+        "requested_by": "ui:requester", "parameters": {"namespace": "default", "manifest": "apiVersion: v1\nkind: Secret\nmetadata:\n  name: nope\n"}
+    }).json()
+    preview = client.post(f"/v1/changesets/{chg['id']}/preview-live", headers=AUTH)
+    assert preview.status_code == 403
+    assert preview.json()["detail"] == "Secret is denied by the beta.1 safety floor"
+    stored = client.get(f"/v1/changesets/{chg['id']}").json()
+    assert stored["state"] == "POLICY_DENIED"
+    assert stored["preview"]["details"]["status_code"] == 403
+    audit = client.get("/v1/audit").json()
+    assert any(x["event_type"] == "changeset.policy_denied" and x["subject_id"] == chg["id"] for x in audit)
+
+
+def test_live_preview_validation_failure_is_terminal(client: TestClient, monkeypatch):
+    from fastapi import HTTPException
+
+    target = setup_target(client)
+
+    async def fake_post(path, payload):
+        raise HTTPException(422, "invalid Helm chart reference")
+
+    monkeypatch.setattr(cp.kubernetes_broker, "post", fake_post)
+    chg = client.post("/v1/changesets", headers=AUTH, json={
+        "operation": "helm.install", "adapter": "helm", "target_id": target["id"],
+        "requested_by": "ui:requester", "parameters": {"release": "demo", "chart": "-bad", "namespace": "default"}
+    }).json()
+    preview = client.post(f"/v1/changesets/{chg['id']}/preview-live", headers=AUTH)
+    assert preview.status_code == 422
+    stored = client.get(f"/v1/changesets/{chg['id']}").json()
+    assert stored["state"] == "PREVIEW_FAILED"
+    assert stored["preview"]["details"]["detail"] == "invalid Helm chart reference"

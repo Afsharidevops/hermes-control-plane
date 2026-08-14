@@ -36,6 +36,10 @@ from .risk import approval_required, classify
 
 VERSION = "0.5.10-beta.1-dev.1"
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+TERMINAL_CHANGESET_STATES = {
+    "REJECTED", "CANCELLED", "EXPIRED", "EXECUTED", "FAILED",
+    "POLICY_DENIED", "PREVIEW_FAILED",
+}
 
 
 @asynccontextmanager
@@ -163,7 +167,7 @@ def _changeset(conn, changeset_id: str):
     row = conn.execute("SELECT * FROM changesets WHERE id=?", (changeset_id,)).fetchone()
     if not row:
         raise HTTPException(status_code=404, detail="changeset not found")
-    if row["expires_at"] and int(row["expires_at"]) < int(time.time()) and row["state"] not in {"REJECTED", "CANCELLED", "EXPIRED", "EXECUTED", "FAILED"}:
+    if row["expires_at"] and int(row["expires_at"]) < int(time.time()) and row["state"] not in TERMINAL_CHANGESET_STATES:
         conn.execute("UPDATE changesets SET state='EXPIRED', updated_at=? WHERE id=?", (int(time.time()), changeset_id))
         db.audit(conn, "changeset.expired", "system", "changeset", changeset_id, {"plan_hash": row["plan_hash"]})
         conn.commit()
@@ -504,7 +508,10 @@ def update_target(target_id: str, payload: TargetUpdate, authorization: str | No
 def delete_target(target_id: str, authorization: str | None = Header(default=None)) -> None:
     _require_admin(authorization)
     with closing(db.connect()) as conn:
-        if conn.execute("SELECT 1 FROM changesets WHERE target_id=? AND state NOT IN ('REJECTED','CANCELLED','EXPIRED') LIMIT 1", (target_id,)).fetchone():
+        if conn.execute(
+            "SELECT 1 FROM changesets WHERE target_id=? AND state NOT IN ('REJECTED','CANCELLED','EXPIRED','EXECUTED','FAILED','POLICY_DENIED','PREVIEW_FAILED') LIMIT 1",
+            (target_id,),
+        ).fetchone():
             raise HTTPException(status_code=409, detail="target has active ChangeSets")
         cur = conn.execute("DELETE FROM targets WHERE id=?", (target_id,))
         if not cur.rowcount:
@@ -627,7 +634,7 @@ def reject_changeset(changeset_id: str, payload: RejectDecision, authorization: 
     now = int(time.time())
     with closing(db.connect()) as conn:
         row = _changeset(conn, changeset_id)
-        if row["state"] in {"REJECTED", "CANCELLED", "EXPIRED"}:
+        if row["state"] in TERMINAL_CHANGESET_STATES:
             raise HTTPException(status_code=409, detail=f"ChangeSet already terminal: {row['state']}")
         conn.execute("UPDATE changesets SET state='REJECTED',updated_at=? WHERE id=?", (now, changeset_id))
         conn.execute("UPDATE approvals SET status='REJECTED',decided_at=?,reason=? WHERE changeset_id=? AND status='APPROVED'", (now, payload.reason, changeset_id))
@@ -643,7 +650,7 @@ def cancel_changeset(changeset_id: str, payload: RejectDecision, authorization: 
     now = int(time.time())
     with closing(db.connect()) as conn:
         row = _changeset(conn, changeset_id)
-        if row["state"] in {"REJECTED", "CANCELLED", "EXPIRED"}:
+        if row["state"] in TERMINAL_CHANGESET_STATES:
             raise HTTPException(status_code=409, detail=f"ChangeSet already terminal: {row['state']}")
         conn.execute("UPDATE changesets SET state='CANCELLED',updated_at=? WHERE id=?", (now, changeset_id))
         conn.execute("UPDATE approvals SET status='CANCELLED',decided_at=?,reason=? WHERE changeset_id=? AND status='APPROVED'", (now, payload.reason, changeset_id))
@@ -682,7 +689,32 @@ async def preview_changeset_live(changeset_id: str, authorization: str | None = 
         current = _target_snapshot(conn, row["target_id"])
         if current != plan.get("target_snapshot"):
             raise HTTPException(status_code=409, detail="target or credential metadata changed after planning; create a new ChangeSet")
-    result = await kubernetes_broker.post("/v1/preview", {"plan": plan})
+    try:
+        result = await kubernetes_broker.post("/v1/preview", {"plan": plan})
+    except HTTPException as exc:
+        now = int(time.time())
+        state = "POLICY_DENIED" if exc.status_code == 403 else "PREVIEW_FAILED"
+        failure = {
+            "summary": "Live broker preview denied" if state == "POLICY_DENIED" else "Live broker preview failed",
+            "details": {"status_code": exc.status_code, "detail": exc.detail},
+            "generated_at": now,
+            "source": "kubernetes-broker",
+        }
+        with closing(db.connect()) as conn:
+            conn.execute(
+                "UPDATE changesets SET preview_json=?,state=?,updated_at=? WHERE id=?",
+                (json.dumps(failure, sort_keys=True), state, now, changeset_id),
+            )
+            db.audit(
+                conn,
+                "changeset.policy_denied" if state == "POLICY_DENIED" else "changeset.preview_failed",
+                "kubernetes-broker",
+                "changeset",
+                changeset_id,
+                {"plan_hash": row["plan_hash"], "status_code": exc.status_code, "detail": exc.detail},
+            )
+            conn.commit()
+        raise
     now = int(time.time())
     preview = {"summary": result.get("summary", "Live broker preview completed"), "details": result, "generated_at": now, "source": "kubernetes-broker"}
     with closing(db.connect()) as conn:

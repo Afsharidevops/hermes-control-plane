@@ -18,6 +18,16 @@ def _headers() -> dict[str, str]:
     return {"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"}
 
 
+def _response_detail(response: httpx.Response) -> Any:
+    try:
+        detail: Any = response.json()
+    except ValueError:
+        return response.text[:2000]
+    while isinstance(detail, dict) and "detail" in detail and len(detail) == 1:
+        detail = detail["detail"]
+    return detail
+
+
 async def post(path: str, payload: dict[str, Any]) -> dict[str, Any]:
     try:
         async with httpx.AsyncClient(timeout=TIMEOUT) as client:
@@ -25,12 +35,10 @@ async def post(path: str, payload: dict[str, Any]) -> dict[str, Any]:
     except httpx.HTTPError as exc:
         raise HTTPException(502, f"Kubernetes Broker unavailable: {type(exc).__name__}") from exc
     if response.status_code >= 400:
-        detail: Any
-        try:
-            detail = response.json()
-        except ValueError:
-            detail = response.text[:2000]
-        raise HTTPException(response.status_code if response.status_code < 500 else 502, detail)
+        raise HTTPException(
+            response.status_code if response.status_code < 500 else 502,
+            _response_detail(response),
+        )
     return response.json()
 
 
