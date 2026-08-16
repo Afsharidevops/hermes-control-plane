@@ -937,6 +937,8 @@ async def execute_changeset(changeset_id: str, payload: ExecuteDecision, authori
             preconditions["live_state_hash"] = preview_details["live_state_hash"]
         if preview_details.get("release_snapshot_hash"):
             preconditions["release_snapshot_hash"] = preview_details["release_snapshot_hash"]
+        if preview_details.get("toolchain_binding_hash"):
+            preconditions["toolchain_binding_hash"] = preview_details["toolchain_binding_hash"]
         try:
             ticket, signature = issue_ticket(
                 changeset_id,

@@ -260,3 +260,116 @@ def test_run_json_rejects_oversized_structured_output(monkeypatch):
     with pytest.raises(Exception) as exc:
         main._run_json(["kubectl", "get", "deployments", "-A", "-o", "json"], {"kind": "kubernetes"})
     assert "structured Kubernetes command output exceeds" in str(exc.value)
+
+
+def test_dynamic_kubectl_selects_exact_server_minor(monkeypatch, tmp_path):
+    root = tmp_path / "kubectl"
+    for minor in (33, 34, 35, 36):
+        binary = root / f"1.{minor}" / "kubectl"
+        binary.parent.mkdir(parents=True)
+        binary.write_bytes(f"kubectl-{minor}".encode())
+        binary.chmod(0o755)
+
+    class Proc:
+        returncode = 0
+        stderr = ""
+        def __init__(self, stdout):
+            self.stdout = stdout
+
+    def fake_run(args, **kwargs):
+        exe = str(args[0])
+        if args[1:] == ["version", "-o", "json"]:
+            return Proc(json.dumps({"serverVersion": {"gitVersion": "v1.35.4"}, "clientVersion": {"gitVersion": "v1.34.10"}}))
+        if args[1:] == ["version", "--client", "-o", "json"]:
+            minor = exe.split("/")[-2]
+            return Proc(json.dumps({"clientVersion": {"gitVersion": f"v{minor}.99"}}))
+        raise AssertionError(args)
+
+    monkeypatch.setattr(main, "KUBECTL_ROOT", root)
+    monkeypatch.setattr(main, "KUBECTL_BOOTSTRAP", str(root / "1.34" / "kubectl"))
+    monkeypatch.setattr(main, "DYNAMIC_KUBECTL_ENABLED", True)
+    monkeypatch.setattr(main, "KUBECTL_SELECTION_MODE", "exact-preferred")
+    monkeypatch.setattr(main, "_env", lambda snapshot: {})
+    monkeypatch.setattr(main.subprocess, "run", fake_run)
+    main._TOOLCHAIN_CACHE.clear()
+
+    selected = main._kubectl_toolchain({"kind": "kubernetes", "snapshot_hash": "a" * 64})
+    assert selected["client_minor"] == 35
+    assert selected["server_minor"] == 35
+    assert selected["path"].endswith("/1.35/kubectl")
+    assert len(selected["binding_hash"]) == 64
+
+
+def test_dynamic_kubectl_uses_compatible_fallback(monkeypatch, tmp_path):
+    root = tmp_path / "kubectl"
+    for minor in (34, 36):
+        binary = root / f"1.{minor}" / "kubectl"
+        binary.parent.mkdir(parents=True)
+        binary.write_bytes(f"kubectl-{minor}".encode())
+        binary.chmod(0o755)
+
+    class Proc:
+        returncode = 0
+        stderr = ""
+        def __init__(self, stdout):
+            self.stdout = stdout
+
+    def fake_run(args, **kwargs):
+        exe = str(args[0])
+        if args[1:] == ["version", "-o", "json"]:
+            return Proc(json.dumps({"serverVersion": {"gitVersion": "v1.35.4"}}))
+        if args[1:] == ["version", "--client", "-o", "json"]:
+            minor = exe.split("/")[-2]
+            return Proc(json.dumps({"clientVersion": {"gitVersion": f"v{minor}.99"}}))
+        raise AssertionError(args)
+
+    monkeypatch.setattr(main, "KUBECTL_ROOT", root)
+    monkeypatch.setattr(main, "KUBECTL_BOOTSTRAP", str(root / "1.34" / "kubectl"))
+    monkeypatch.setattr(main, "DYNAMIC_KUBECTL_ENABLED", True)
+    monkeypatch.setattr(main, "KUBECTL_SELECTION_MODE", "exact-preferred")
+    monkeypatch.setattr(main, "_env", lambda snapshot: {})
+    monkeypatch.setattr(main.subprocess, "run", fake_run)
+    main._TOOLCHAIN_CACHE.clear()
+
+    selected = main._kubectl_toolchain({"kind": "kubernetes", "snapshot_hash": "b" * 64})
+    assert selected["server_minor"] == 35
+    assert selected["client_minor"] == 34
+
+
+def test_dynamic_kubectl_fails_closed_without_compatible_binary(monkeypatch, tmp_path):
+    root = tmp_path / "kubectl"
+    binary = root / "1.33" / "kubectl"
+    binary.parent.mkdir(parents=True)
+    binary.write_bytes(b"kubectl-33")
+    binary.chmod(0o755)
+
+    class Proc:
+        returncode = 0
+        stderr = ""
+        stdout = json.dumps({"serverVersion": {"gitVersion": "v1.36.2"}})
+
+    monkeypatch.setattr(main, "KUBECTL_ROOT", root)
+    monkeypatch.setattr(main, "KUBECTL_BOOTSTRAP", str(binary))
+    monkeypatch.setattr(main, "DYNAMIC_KUBECTL_ENABLED", True)
+    monkeypatch.setattr(main, "KUBECTL_SELECTION_MODE", "exact-preferred")
+    monkeypatch.setattr(main, "_env", lambda snapshot: {})
+    monkeypatch.setattr(main.subprocess, "run", lambda *args, **kwargs: Proc())
+    main._TOOLCHAIN_CACHE.clear()
+
+    with pytest.raises(Exception) as exc:
+        main._kubectl_toolchain({"kind": "kubernetes", "snapshot_hash": "c" * 64})
+    assert "no compatible kubectl" in str(exc.value)
+
+
+def test_execution_rejects_toolchain_binding_drift(monkeypatch):
+    monkeypatch.setattr(main, "TOKEN", "test-token")
+    monkeypatch.setattr(main, "EXECUTION_ENABLED", True)
+    monkeypatch.setattr(main, "_verify_ticket", lambda ticket, signature: (
+        {"operation": "kubernetes.manifest.apply", "target_snapshot": {"kind": "kubernetes"}},
+        {"toolchain_binding_hash": "a" * 64},
+    ))
+    monkeypatch.setattr(main, "_kubectl_toolchain", lambda snapshot, **kwargs: {"binding_hash": "b" * 64})
+    req = main.ExecuteRequest(ticket={}, signature="0" * 64)
+    with pytest.raises(Exception) as exc:
+        main.execute(req, authorization="Bearer test-token")
+    assert "kubectl toolchain changed after preview" in str(exc.value)

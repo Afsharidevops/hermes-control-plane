@@ -160,6 +160,12 @@ services:
     image: ${IMAGE_NAMESPACE:-afsharidevops}/hermes-control-plane-kubernetes-broker:${VERSION:-0.5.10-rc.1}
     build:
       context: ./kubernetes-broker
+      args:
+        KUBECTL_V1_33: ${KUBECTL_V1_33:-v1.33.13}
+        KUBECTL_V1_34: ${KUBECTL_V1_34:-v1.34.10}
+        KUBECTL_V1_35: ${KUBECTL_V1_35:-v1.35.6}
+        KUBECTL_V1_36: ${KUBECTL_V1_36:-v1.36.2}
+        KUBECTL_BOOTSTRAP_MINOR: ${KUBECTL_BOOTSTRAP_MINOR:-1.34}
     restart: unless-stopped
     # Docker bind mounts preserve host ownership. Run the broker as the
     # local operator UID/GID so mode-0600 kubeconfigs remain private/readable.
@@ -172,6 +178,9 @@ services:
       HERMES_KUBERNETES_EXECUTION_ENABLED: ${HERMES_KUBERNETES_EXECUTION_ENABLED:-false}
       HERMES_KUBERNETES_COMMAND_TIMEOUT: ${HERMES_KUBERNETES_COMMAND_TIMEOUT:-60}
       HERMES_KUBECONFIG_ROOT: /credentials/kubeconfigs
+      HERMES_DYNAMIC_KUBECTL_ENABLED: ${HERMES_DYNAMIC_KUBECTL_ENABLED:-true}
+      HERMES_KUBECTL_SELECTION_MODE: ${HERMES_KUBECTL_SELECTION_MODE:-exact-preferred}
+      HERMES_KUBECTL_CACHE_TTL_SECONDS: ${HERMES_KUBECTL_CACHE_TTL_SECONDS:-10}
     volumes:
       - ./data/kubeconfigs:/credentials/kubeconfigs:ro
     networks: [app-net]

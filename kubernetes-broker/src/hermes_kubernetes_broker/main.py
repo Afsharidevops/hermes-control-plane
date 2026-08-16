@@ -7,6 +7,7 @@ import os
 import re
 import subprocess
 import tempfile
+import shutil
 import time
 import threading
 from pathlib import Path
@@ -23,6 +24,13 @@ EXECUTION_KEY = os.getenv("HERMES_EXECUTION_HMAC_KEY", "")
 EXECUTION_ENABLED = os.getenv("HERMES_KUBERNETES_EXECUTION_ENABLED", "false").lower() == "true"
 COMMAND_TIMEOUT = int(os.getenv("HERMES_KUBERNETES_COMMAND_TIMEOUT", "60"))
 STRUCTURED_OUTPUT_LIMIT = int(os.getenv("HERMES_KUBERNETES_STRUCTURED_OUTPUT_LIMIT_BYTES", str(8 * 1024 * 1024)))
+KUBECTL_ROOT = Path(os.getenv("HERMES_KUBECTL_ROOT", "/opt/hermes/kubectl"))
+KUBECTL_BOOTSTRAP = os.getenv("HERMES_KUBECTL_BOOTSTRAP", "/usr/local/bin/kubectl")
+KUBECTL_SELECTION_MODE = os.getenv("HERMES_KUBECTL_SELECTION_MODE", "exact-preferred").strip().lower()
+DYNAMIC_KUBECTL_ENABLED = os.getenv("HERMES_DYNAMIC_KUBECTL_ENABLED", "true").lower() == "true" and KUBECTL_ROOT.is_dir()
+KUBECTL_CACHE_TTL = int(os.getenv("HERMES_KUBECTL_CACHE_TTL_SECONDS", "10"))
+_TOOLCHAIN_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_TOOLCHAIN_LOCK = threading.Lock()
 _USED_TICKETS: set[str] = set()
 _USED_LOCK = threading.Lock()
 
@@ -126,12 +134,121 @@ def _env(snapshot: dict[str, Any]) -> dict[str, str]:
     return env
 
 
+def _minor_from_version(value: str) -> int:
+    match = re.match(r"^v?1\.(\d+)(?:\.|$)", str(value or ""))
+    if not match:
+        raise HTTPException(502, f"could not parse Kubernetes version {value!r}")
+    return int(match.group(1))
+
+
+def _kubectl_inventory() -> dict[int, Path]:
+    inventory: dict[int, Path] = {}
+    if not KUBECTL_ROOT.is_dir():
+        return inventory
+    for child in KUBECTL_ROOT.iterdir():
+        if not child.is_dir() or not re.fullmatch(r"1\.\d+", child.name):
+            continue
+        binary = child / "kubectl"
+        if binary.is_file() and os.access(binary, os.X_OK):
+            inventory[int(child.name.split(".", 1)[1])] = binary
+    return inventory
+
+
+def _probe_server_version(snapshot: dict[str, Any]) -> str:
+    bootstrap = Path(KUBECTL_BOOTSTRAP)
+    if not bootstrap.is_file():
+        fallback = shutil.which("kubectl")
+        if not fallback:
+            raise HTTPException(503, "no kubectl bootstrap binary is available")
+        bootstrap = Path(fallback)
+    try:
+        proc = subprocess.run(
+            [str(bootstrap), "version", "-o", "json"],
+            text=True,
+            capture_output=True,
+            env=_env(snapshot),
+            timeout=COMMAND_TIMEOUT,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise HTTPException(504, f"kubectl version probe timed out after {COMMAND_TIMEOUT}s") from exc
+    if proc.returncode != 0:
+        output = (proc.stdout or "") + (("\n" + proc.stderr) if proc.stderr else "")
+        raise HTTPException(422, {"message": "Kubernetes version probe failed", "returncode": proc.returncode, "output": output[-100_000:]})
+    try:
+        data = json.loads(proc.stdout or "")
+        return str((data.get("serverVersion") or {}).get("gitVersion") or "")
+    except json.JSONDecodeError as exc:
+        raise HTTPException(502, "kubectl version probe returned invalid JSON") from exc
+
+
+def _kubectl_toolchain(snapshot: dict[str, Any], *, refresh: bool = False) -> dict[str, Any] | None:
+    if not DYNAMIC_KUBECTL_ENABLED:
+        return None
+    cache_key = str(snapshot.get("snapshot_hash") or sha256_hex(snapshot))
+    now = time.monotonic()
+    with _TOOLCHAIN_LOCK:
+        cached = _TOOLCHAIN_CACHE.get(cache_key)
+        if cached and not refresh and now - cached[0] <= KUBECTL_CACHE_TTL:
+            return dict(cached[1])
+
+    inventory = _kubectl_inventory()
+    if not inventory:
+        raise HTTPException(503, "dynamic kubectl is enabled but no versioned kubectl binaries are installed")
+    server_version = _probe_server_version(snapshot)
+    server_minor = _minor_from_version(server_version)
+    compatible = sorted((minor for minor in inventory if abs(minor - server_minor) <= 1), key=lambda m: (m != server_minor, abs(m - server_minor), m > server_minor, m))
+    if KUBECTL_SELECTION_MODE == "exact" and server_minor not in inventory:
+        raise HTTPException(409, f"no exact kubectl 1.{server_minor} binary is installed for Kubernetes {server_version}")
+    if not compatible:
+        available = ", ".join(f"1.{x}" for x in sorted(inventory)) or "none"
+        raise HTTPException(409, f"no compatible kubectl is installed for Kubernetes {server_version}; installed minors: {available}")
+    chosen_minor = server_minor if server_minor in inventory else compatible[0]
+    binary = inventory[chosen_minor]
+    try:
+        proc = subprocess.run([str(binary), "version", "--client", "-o", "json"], text=True, capture_output=True, timeout=COMMAND_TIMEOUT, check=False)
+    except subprocess.TimeoutExpired as exc:
+        raise HTTPException(504, "selected kubectl client version probe timed out") from exc
+    if proc.returncode != 0:
+        raise HTTPException(503, f"selected kubectl 1.{chosen_minor} is not runnable")
+    try:
+        client_version = str((json.loads(proc.stdout or "").get("clientVersion") or {}).get("gitVersion") or "")
+    except json.JSONDecodeError as exc:
+        raise HTTPException(503, "selected kubectl returned invalid client version JSON") from exc
+    client_minor = _minor_from_version(client_version)
+    if abs(client_minor - server_minor) > 1:
+        raise HTTPException(409, f"selected kubectl {client_version} is outside supported skew for Kubernetes {server_version}")
+    digest = hashlib.sha256(binary.read_bytes()).hexdigest()
+    result = {
+        "kind": "kubectl",
+        "path": str(binary),
+        "client_version": client_version,
+        "client_minor": client_minor,
+        "server_version": server_version,
+        "server_minor": server_minor,
+        "binary_sha256": digest,
+        "selection_mode": KUBECTL_SELECTION_MODE,
+    }
+    result["binding_hash"] = sha256_hex({k: v for k, v in result.items() if k not in {"path", "binding_hash"}})
+    with _TOOLCHAIN_LOCK:
+        _TOOLCHAIN_CACHE[cache_key] = (time.monotonic(), dict(result))
+    return result
+
+
+def _resolve_command(args: list[str], snapshot: dict[str, Any]) -> list[str]:
+    if args and args[0] == "kubectl":
+        toolchain = _kubectl_toolchain(snapshot)
+        if toolchain:
+            return [str(toolchain["path"]), *args[1:]]
+    return args
+
+
 def _run(args: list[str], snapshot: dict[str, Any], stdin: str | None = None, timeout: int | None = None, allowed_codes: set[int] | None = None) -> dict[str, Any]:
     allowed = allowed_codes or {0}
     started = time.monotonic()
     try:
         proc = subprocess.run(
-            args,
+            _resolve_command(args, snapshot),
             input=stdin,
             text=True,
             capture_output=True,
@@ -153,7 +270,7 @@ def _run_json(args: list[str], snapshot: dict[str, Any], timeout: int | None = N
     started = time.monotonic()
     try:
         proc = subprocess.run(
-            args,
+            _resolve_command(args, snapshot),
             text=True,
             capture_output=True,
             env=_env(snapshot),
@@ -821,7 +938,9 @@ def health() -> dict[str, Any]:
         "service": "hermes-kubernetes-broker",
         "version": VERSION,
         "execution_enabled": EXECUTION_ENABLED,
-        "kubectl": subprocess.run(["kubectl", "version", "--client", "-o", "json"], capture_output=True, text=True).returncode == 0,
+        "kubectl": bool(_kubectl_inventory()) if DYNAMIC_KUBECTL_ENABLED else subprocess.run(["kubectl", "version", "--client", "-o", "json"], capture_output=True, text=True).returncode == 0,
+        "dynamic_kubectl": DYNAMIC_KUBECTL_ENABLED,
+        "kubectl_minors": [f"1.{x}" for x in sorted(_kubectl_inventory())] if DYNAMIC_KUBECTL_ENABLED else [],
         "helm": subprocess.run(["helm", "version", "--short"], capture_output=True, text=True).returncode == 0,
     }
 
@@ -856,13 +975,19 @@ def discover(payload: DiscoveryRequest, authorization: str | None = Header(defau
     nodes = None
     if bool(scope.get("cluster_read", False)):
         nodes = _run_json(["kubectl", "get", "nodes", "-o", "json"], snapshot)
-    return {"version": version, "namespaces": namespaces, "nodes": nodes, "workloads": workloads, "policy_scope": scope, "secret_data_requested": False}
+    toolchain = _kubectl_toolchain(snapshot)
+    return {"version": version, "namespaces": namespaces, "nodes": nodes, "workloads": workloads, "policy_scope": scope, "secret_data_requested": False, "toolchain": toolchain}
 
 
 @app.post("/v1/preview")
 def preview_endpoint(payload: BrokerPlanRequest, authorization: str | None = Header(default=None)) -> dict[str, Any]:
     _require_token(authorization)
-    return preview(payload.plan)
+    result = preview(payload.plan)
+    toolchain = _kubectl_toolchain(_target(payload.plan))
+    if toolchain:
+        result["toolchain"] = {k: v for k, v in toolchain.items() if k != "path"}
+        result["toolchain_binding_hash"] = toolchain["binding_hash"]
+    return result
 
 
 @app.post("/v1/execute")
@@ -871,4 +996,9 @@ def execute(payload: ExecuteRequest, authorization: str | None = Header(default=
     if not EXECUTION_ENABLED:
         raise HTTPException(403, "Kubernetes execution is disabled; enable HERMES_KUBERNETES_EXECUTION_ENABLED only after policy review")
     plan, preconditions = _verify_ticket(payload.ticket, payload.signature)
+    expected_toolchain = str((preconditions or {}).get("toolchain_binding_hash") or "")
+    if expected_toolchain:
+        current = _kubectl_toolchain(_target(plan), refresh=True)
+        if not current or not hmac.compare_digest(expected_toolchain, str(current.get("binding_hash") or "")):
+            raise HTTPException(409, "kubectl toolchain changed after preview; create and approve a new ChangeSet")
     return _execute_plan(plan, preconditions)

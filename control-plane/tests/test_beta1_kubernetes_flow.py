@@ -73,9 +73,10 @@ def test_approved_exact_plan_executes_with_signed_ticket(client: TestClient, mon
     async def fake_post(path, payload):
         calls.append((path, payload))
         if path == "/v1/preview":
-            return {"summary": "server dry-run passed", "kind": "kubernetes-manifest"}
+            return {"summary": "server dry-run passed", "kind": "kubernetes-manifest", "toolchain_binding_hash": "c" * 64}
         if path == "/v1/execute":
             assert payload["ticket"]["plan_hash"]
+            assert payload["ticket"]["preconditions"]["toolchain_binding_hash"] == "c" * 64
             assert len(payload["signature"]) == 64
             return {"operation": "kubernetes.manifest.apply", "result": {"returncode": 0, "output": "configmap/demo"}}
         raise AssertionError(path)
