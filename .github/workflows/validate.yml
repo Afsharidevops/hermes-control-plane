@@ -21,13 +21,19 @@ jobs:
       - name: Compile Python services
         run: python -m compileall -q control-plane/src router-gateway/src node-agent/src kubernetes-broker/src
 
-      - name: Test Control Plane safety core and beta Kubernetes flow
+      - name: Test Control Plane safety core
         run: |
-          python -m pip install --upgrade pip
-          pip install -r control-plane/requirements-dev.txt
-          pip install -r kubernetes-broker/requirements-dev.txt
-          PYTHONPATH=control-plane/src pytest -q control-plane/tests
-          PYTHONPATH=kubernetes-broker/src pytest -q kubernetes-broker/tests
+          python -m venv /tmp/hermes-control-plane-tests
+          /tmp/hermes-control-plane-tests/bin/python -m pip install --upgrade pip
+          /tmp/hermes-control-plane-tests/bin/pip install -r control-plane/requirements-dev.txt
+          PYTHONPATH=control-plane/src /tmp/hermes-control-plane-tests/bin/pytest -q control-plane/tests
+
+      - name: Test Kubernetes Broker policy and execution boundaries
+        run: |
+          python -m venv /tmp/hermes-kubernetes-broker-tests
+          /tmp/hermes-kubernetes-broker-tests/bin/python -m pip install --upgrade pip
+          /tmp/hermes-kubernetes-broker-tests/bin/pip install -r kubernetes-broker/requirements-dev.txt
+          PYTHONPATH=kubernetes-broker/src /tmp/hermes-kubernetes-broker-tests/bin/pytest -q kubernetes-broker/tests
 
       - name: Validate Compose and bot wiring
         run: |

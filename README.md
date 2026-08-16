@@ -34,7 +34,7 @@ Alpha.2 management/safety core (retained):
 
 Beta.1 work currently includes:
 
-- dedicated Kubernetes Broker with kubectl 1.36.x and Helm 4.x tooling
+- dedicated Kubernetes Broker with target-aware kubectl 1.33-1.36 client selection and Helm 4.x tooling
 - Kubernetes discovery and server-side manifest dry-run/diff
 - Helm install/upgrade dry-run and rollback planning
 - kubeconfig reference + local file fingerprint boundary for Docker/VM
@@ -138,9 +138,9 @@ Project-owned Docker Hub repositories are isolated from `hermes-linux-stack`:
 - `hermes-control-plane-smart-router`
 - `hermes-control-plane-execution-broker`
 - `hermes-control-plane-kubernetes-broker`
-
-The Kubernetes Broker re-enforces target scope (`namespace_allowlist`/`namespace_denylist`, optional kind allow/deny lists, and cluster-scoped permission) immediately before preview and execution.
 - `hermes-control-plane-node-agent`
+
+The Kubernetes Broker re-enforces target scope (`namespace_allowlist`/`namespace_denylist`, optional kind allow/deny lists, and cluster-scoped permission) immediately before preview and execution. It selects a compatible bundled kubectl per target and binds the selected client/server versions plus the kubectl binary hash into the preview/execution boundary.
 
 9router, OmniRoute, and Hermes Agent are upstream images and are not rebuilt here.
 

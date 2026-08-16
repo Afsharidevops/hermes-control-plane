@@ -2,6 +2,12 @@
 
 ## 0.5.10-rc.1 (development)
 
+- fix Kubernetes discovery JSON handling so large structured results are parsed from stdout without silent 100 KB truncation
+- add target-aware bundled kubectl 1.33-1.36 selection with exact-minor preference and supported one-minor fallback
+- bind Kubernetes server version, selected kubectl version, binary SHA-256, and toolchain binding hash into live preview and signed execution tickets
+- reject execution when the target/toolchain binding changes after preview, requiring a fresh preview and approval
+- validate 35 non-destructive security/authorization checks and 32 controlled execution/drift/replay/rollback checks on the disposable sandbox target
+- isolate Control Plane and Kubernetes Broker CI test environments because their dev requirement sets intentionally pin different pytest versions
 - fix RC.1 stabilization R1 combo bootstrap abort: tolerate EOF from tiny action files under `set -e` and newline-terminate reconciliation plan files
 - keep the R1 9router combo reconciliation design while ensuring first-run combo creation actually executes
 - preserve Hermes Smart Router authentication with `api_key: ${OPENAI_API_KEY}` rather than clearing the config reference
