@@ -1,4 +1,5 @@
 import importlib
+import json
 import os
 
 import pytest
@@ -229,3 +230,33 @@ def test_helm_precondition_uses_release_revision(monkeypatch):
     assert main._assert_helm_precondition(snapshot, "demo", "default", good)["revision"] == 2
     with pytest.raises(Exception):
         main._assert_helm_precondition(snapshot, "demo", "default", "0" * 64)
+
+
+def test_run_json_parses_large_stdout_and_ignores_stderr_warning(monkeypatch):
+    class Proc:
+        returncode = 0
+        stdout = json.dumps({"items": [{"metadata": {"name": "demo"}, "padding": "x" * 150_000}]})
+        stderr = "Warning: client/server version skew notice\n"
+
+    monkeypatch.setattr(main, "_env", lambda snapshot: {})
+    monkeypatch.setattr(main.subprocess, "run", lambda *args, **kwargs: Proc())
+
+    result = main._run_json(["kubectl", "get", "deployments", "-A", "-o", "json"], {"kind": "kubernetes"})
+
+    assert result["items"][0]["metadata"]["name"] == "demo"
+    assert len(result["items"][0]["padding"]) == 150_000
+
+
+def test_run_json_rejects_oversized_structured_output(monkeypatch):
+    class Proc:
+        returncode = 0
+        stdout = json.dumps({"padding": "x" * 256})
+        stderr = ""
+
+    monkeypatch.setattr(main, "STRUCTURED_OUTPUT_LIMIT", 64)
+    monkeypatch.setattr(main, "_env", lambda snapshot: {})
+    monkeypatch.setattr(main.subprocess, "run", lambda *args, **kwargs: Proc())
+
+    with pytest.raises(Exception) as exc:
+        main._run_json(["kubectl", "get", "deployments", "-A", "-o", "json"], {"kind": "kubernetes"})
+    assert "structured Kubernetes command output exceeds" in str(exc.value)

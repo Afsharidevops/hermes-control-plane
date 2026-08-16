@@ -22,6 +22,7 @@ TOKEN = os.getenv("HERMES_KUBERNETES_BROKER_TOKEN", "")
 EXECUTION_KEY = os.getenv("HERMES_EXECUTION_HMAC_KEY", "")
 EXECUTION_ENABLED = os.getenv("HERMES_KUBERNETES_EXECUTION_ENABLED", "false").lower() == "true"
 COMMAND_TIMEOUT = int(os.getenv("HERMES_KUBERNETES_COMMAND_TIMEOUT", "60"))
+STRUCTURED_OUTPUT_LIMIT = int(os.getenv("HERMES_KUBERNETES_STRUCTURED_OUTPUT_LIMIT_BYTES", str(8 * 1024 * 1024)))
 _USED_TICKETS: set[str] = set()
 _USED_LOCK = threading.Lock()
 
@@ -146,6 +147,43 @@ def _run(args: list[str], snapshot: dict[str, Any], stdin: str | None = None, ti
     if proc.returncode not in allowed:
         raise HTTPException(422, {"message": "Kubernetes command failed", **result})
     return result
+
+
+def _run_json(args: list[str], snapshot: dict[str, Any], timeout: int | None = None) -> Any:
+    started = time.monotonic()
+    try:
+        proc = subprocess.run(
+            args,
+            text=True,
+            capture_output=True,
+            env=_env(snapshot),
+            timeout=timeout or COMMAND_TIMEOUT,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise HTTPException(504, f"command timed out after {timeout or COMMAND_TIMEOUT}s") from exc
+
+    if proc.returncode != 0:
+        output = (proc.stdout or "") + (("\n" + proc.stderr) if proc.stderr else "")
+        result = {
+            "returncode": proc.returncode,
+            "output": output[-100_000:],
+            "duration": round(time.monotonic() - started, 3),
+        }
+        raise HTTPException(422, {"message": "Kubernetes command failed", **result})
+
+    stdout = proc.stdout or ""
+    stdout_bytes = len(stdout.encode("utf-8", errors="replace"))
+    if stdout_bytes > STRUCTURED_OUTPUT_LIMIT:
+        raise HTTPException(502, f"structured Kubernetes command output exceeds {STRUCTURED_OUTPUT_LIMIT} bytes")
+    try:
+        return json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        stderr_tail = (proc.stderr or "")[-4_000:]
+        detail = "Kubernetes command returned invalid JSON on stdout"
+        if stderr_tail:
+            detail += f"; stderr: {stderr_tail}"
+        raise HTTPException(502, detail) from exc
 
 
 def _namespace(value: Any) -> str:
@@ -792,40 +830,33 @@ def health() -> dict[str, Any]:
 def discover(payload: DiscoveryRequest, authorization: str | None = Header(default=None)) -> dict[str, Any]:
     _require_token(authorization)
     snapshot = _target(payload.target_snapshot)
-    version = _run(["kubectl", "version", "-o", "json"], snapshot)
+    version = _run_json(["kubectl", "version", "-o", "json"], snapshot)
     scope = _scope(snapshot)
     allow = [str(x).lower() for x in (scope.get("namespace_allowlist") or []) if str(x).strip()]
     deny = {str(x).lower() for x in (scope.get("namespace_denylist") or [])}
-
-    def parsed(result):
-        try:
-            return json.loads(result["output"])
-        except json.JSONDecodeError:
-            return {"raw": result["output"]}
 
     if allow and "*" not in allow:
         namespace_items = []
         workload_items = []
         for ns in allow:
             _enforce_namespace(snapshot, _namespace(ns))
-            ns_result = _run(["kubectl", "get", "namespace", ns, "-o", "json"], snapshot)
-            namespace_items.append(parsed(ns_result))
-            workloads_result = _run(["kubectl", "get", "deployments,statefulsets,daemonsets", "-n", ns, "-o", "json"], snapshot)
-            workload_items.extend(parsed(workloads_result).get("items", []))
+            namespace_items.append(_run_json(["kubectl", "get", "namespace", ns, "-o", "json"], snapshot))
+            workloads_result = _run_json(["kubectl", "get", "deployments,statefulsets,daemonsets", "-n", ns, "-o", "json"], snapshot)
+            workload_items.extend(workloads_result.get("items", []))
         namespaces = {"items": namespace_items, "policy_scoped": True}
         workloads = {"items": workload_items, "policy_scoped": True}
     else:
-        namespaces = parsed(_run(["kubectl", "get", "namespaces", "-o", "json"], snapshot))
+        namespaces = _run_json(["kubectl", "get", "namespaces", "-o", "json"], snapshot)
         if deny:
             namespaces["items"] = [x for x in namespaces.get("items", []) if str((x.get("metadata") or {}).get("name", "")).lower() not in deny]
-        workloads = parsed(_run(["kubectl", "get", "deployments,statefulsets,daemonsets", "-A", "-o", "json"], snapshot))
+        workloads = _run_json(["kubectl", "get", "deployments,statefulsets,daemonsets", "-A", "-o", "json"], snapshot)
         if deny:
             workloads["items"] = [x for x in workloads.get("items", []) if str((x.get("metadata") or {}).get("namespace", "")).lower() not in deny]
 
     nodes = None
     if bool(scope.get("cluster_read", False)):
-        nodes = parsed(_run(["kubectl", "get", "nodes", "-o", "json"], snapshot))
-    return {"version": parsed(version), "namespaces": namespaces, "nodes": nodes, "workloads": workloads, "policy_scope": scope, "secret_data_requested": False}
+        nodes = _run_json(["kubectl", "get", "nodes", "-o", "json"], snapshot)
+    return {"version": version, "namespaces": namespaces, "nodes": nodes, "workloads": workloads, "policy_scope": scope, "secret_data_requested": False}
 
 
 @app.post("/v1/preview")

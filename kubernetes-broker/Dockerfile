@@ -1,6 +1,6 @@
 FROM python:3.12-slim
 ARG TARGETARCH
-ARG KUBECTL_VERSION=v1.36.2
+ARG KUBECTL_VERSION=v1.34.10
 ARG HELM_VERSION=v4.2.2
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PYTHONPATH=/app/src HOME=/tmp/hermes HELM_CACHE_HOME=/tmp/hermes/helm/cache HELM_CONFIG_HOME=/tmp/hermes/helm/config HELM_DATA_HOME=/tmp/hermes/helm/data
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl tar gzip \
