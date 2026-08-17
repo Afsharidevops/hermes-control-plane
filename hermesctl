@@ -1185,6 +1185,75 @@ cmd_version() {
   esac
 }
 
+cmd_backup() {
+  need docker; need python3
+  load_env
+  mkdir -p "$ROOT/backups"
+  local stamp remote out
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  remote="/data/hermes-control-plane-backup-${stamp}.sqlite3"
+  out="$ROOT/backups/control-plane-${stamp}.sqlite3"
+  "${COMPOSE[@]}" ps --status running --services | grep -qx control-plane \
+    || fail "control-plane must be running for an online backup"
+  "${COMPOSE[@]}" exec -T control-plane python - "$remote" <<'PYBACKUP'
+import sqlite3, sys
+src=sqlite3.connect('/data/control-plane.sqlite3')
+dst=sqlite3.connect(sys.argv[1])
+try:
+    src.backup(dst)
+    dst.commit()
+finally:
+    dst.close(); src.close()
+check=sqlite3.connect(sys.argv[1]).execute('PRAGMA quick_check').fetchone()[0]
+if check != 'ok':
+    raise SystemExit(f'backup integrity failed: {check}')
+PYBACKUP
+  "${COMPOSE[@]}" cp "control-plane:${remote}" "$out" >/dev/null
+  "${COMPOSE[@]}" exec -T control-plane python -c "import os; os.unlink('${remote}')" >/dev/null 2>&1 || true
+  python3 "$ROOT/scripts/control-plane-db.py" check "$out" >/dev/null
+  echo "Backup: $out"
+}
+
+cmd_restore() {
+  need docker; need python3
+  local source="${1:-}"
+  [[ -f "$source" ]] || fail "usage: ./hermesctl restore <backup.sqlite3>"
+  source="$(python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$source")"
+  python3 "$ROOT/scripts/control-plane-db.py" check "$source" >/dev/null
+  load_env
+  info "creating pre-restore backup"
+  cmd_backup
+  local remote="/data/hermes-control-plane-restore.sqlite3"
+  "${COMPOSE[@]}" cp "$source" "control-plane:${remote}" >/dev/null
+  "${COMPOSE[@]}" stop control-plane >/dev/null
+  if ! "${COMPOSE[@]}" run --rm --no-deps --entrypoint python control-plane - <<'PYRESTORE'
+import os, sqlite3
+src_path='/data/hermes-control-plane-restore.sqlite3'
+dst_path='/data/control-plane.sqlite3'
+tmp_path='/data/control-plane.restore.tmp'
+src=sqlite3.connect(f'file:{src_path}?mode=ro', uri=True)
+dst=sqlite3.connect(tmp_path)
+try:
+    if src.execute('PRAGMA quick_check').fetchone()[0] != 'ok':
+        raise SystemExit('restore source integrity check failed')
+    src.backup(dst); dst.commit()
+finally:
+    dst.close(); src.close()
+check=sqlite3.connect(tmp_path).execute('PRAGMA quick_check').fetchone()[0]
+if check != 'ok':
+    raise SystemExit(f'restored database integrity failed: {check}')
+os.replace(tmp_path, dst_path)
+os.unlink(src_path)
+PYRESTORE
+  then
+    "${COMPOSE[@]}" up -d control-plane >/dev/null || true
+    fail "restore failed; existing database was preserved and a pre-restore backup was created"
+  fi
+  "${COMPOSE[@]}" up -d control-plane >/dev/null
+  cmd_wait 90
+  echo "[ok] restored Control Plane database from $source"
+}
+
 cmd_upgrade() {
   need docker
   local target="${1:-}"
@@ -1196,11 +1265,8 @@ cmd_upgrade() {
   info "verifying published release images for $target"
   docker buildx imagetools inspect "$ns/hermes-control-plane-api:$target" >/dev/null || fail "API image tag not found"
   docker buildx imagetools inspect "$ns/hermes-control-plane-kubernetes-broker:$target" >/dev/null || fail "Kubernetes Broker image tag not found"
-  mkdir -p "$ROOT/backups"
   if "${COMPOSE[@]}" ps --status running --services | grep -qx control-plane; then
-    local stamp
-    stamp="$(date -u +%Y%m%dT%H%M%SZ)"
-    "${COMPOSE[@]}" cp control-plane:/data/control-plane.sqlite3 "$ROOT/backups/control-plane-$stamp.sqlite3" >/dev/null 2>&1 || true
+    cmd_backup
   fi
   set_env VERSION "$target"
   if ! cmd_up --pull; then
@@ -1512,6 +1578,8 @@ Commands:
   version                      Show repository/configured/running versions
   version set <version>        Set .env VERSION explicitly
   upgrade <version>            Verify, backup, pull and upgrade a published release
+  backup                       Create and integrity-check an online Control Plane backup
+  restore <backup.sqlite3>     Restore a verified backup with a pre-restore safety backup
   kubeconfig import <n> <file> Import kubeconfig material locally and create a reference
   kubeconfig list              List kubeconfig credential references
   kubeconfig remove <id>       Remove unused kubeconfig reference and local material
@@ -1529,6 +1597,8 @@ case "${1:-}" in
   doctor) cmd_doctor ;;
   version) cmd_version "${2:-show}" "${3:-}" ;;
   upgrade) cmd_upgrade "${2:-}" ;;
+  backup) cmd_backup ;;
+  restore) cmd_restore "${2:-}" ;;
   kubeconfig)
     case "${2:-}" in
       import) cmd_kubeconfig_import "${3:-}" "${4:-}" ;;

@@ -13,8 +13,8 @@ jobs:
   foundation:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
 
@@ -34,6 +34,13 @@ jobs:
           /tmp/hermes-kubernetes-broker-tests/bin/python -m pip install --upgrade pip
           /tmp/hermes-kubernetes-broker-tests/bin/pip install -r kubernetes-broker/requirements-dev.txt
           PYTHONPATH=kubernetes-broker/src /tmp/hermes-kubernetes-broker-tests/bin/pytest -q kubernetes-broker/tests
+
+      - name: Test Smart Router regression suite
+        run: |
+          python -m venv /tmp/hermes-smart-router-tests
+          /tmp/hermes-smart-router-tests/bin/python -m pip install --upgrade pip
+          /tmp/hermes-smart-router-tests/bin/pip install -r smart-router/requirements-dev.txt
+          PYTHONPATH=smart-router/src /tmp/hermes-smart-router-tests/bin/pytest -q smart-router/tests
 
       - name: Validate Compose and bot wiring
         run: |
@@ -70,5 +77,5 @@ jobs:
           PY
 
       - name: Helm lint
-        uses: azure/setup-helm@v4
+        uses: azure/setup-helm@v5
       - run: helm lint charts/hermes-control-plane
