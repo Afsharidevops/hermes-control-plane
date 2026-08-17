@@ -104,6 +104,12 @@ def init_db() -> None:
                 expires_at INTEGER NOT NULL,
                 decided_at INTEGER,
                 reason TEXT,
+                policy_generation INTEGER NOT NULL DEFAULT 1,
+                policy_id TEXT NOT NULL DEFAULT 'risk-baseline',
+                policy_version INTEGER NOT NULL DEFAULT 1,
+                nonce TEXT,
+                mac TEXT,
+                consumed_at INTEGER,
                 FOREIGN KEY(changeset_id) REFERENCES changesets(id)
             );
 
@@ -115,6 +121,25 @@ def init_db() -> None:
                 subject_id TEXT NOT NULL,
                 payload_json TEXT NOT NULL,
                 created_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS system_state (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS agent_enrollment_tokens (
+                id TEXT PRIMARY KEY, name TEXT NOT NULL, token_hash TEXT NOT NULL UNIQUE, status TEXT NOT NULL,
+                expires_at INTEGER NOT NULL, created_at INTEGER NOT NULL, used_at INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS agents (
+                id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, token_hash TEXT NOT NULL UNIQUE, status TEXT NOT NULL,
+                capabilities_json TEXT NOT NULL, enrolled_at INTEGER NOT NULL, last_seen_at INTEGER, revoked_at INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS agent_nonces (
+                agent_id TEXT NOT NULL, nonce TEXT NOT NULL, seen_at INTEGER NOT NULL,
+                PRIMARY KEY(agent_id,nonce), FOREIGN KEY(agent_id) REFERENCES agents(id)
             );
             """
         )
@@ -153,6 +178,19 @@ def init_db() -> None:
             for name, ddl in additions.items():
                 if name not in cols:
                     conn.execute(f"ALTER TABLE integrations ADD COLUMN {name} {ddl}")
+
+        approval_cols = _columns(conn, "approvals")
+        approval_additions = {
+            "policy_generation": "INTEGER NOT NULL DEFAULT 1",
+            "policy_id": "TEXT NOT NULL DEFAULT 'risk-baseline'",
+            "policy_version": "INTEGER NOT NULL DEFAULT 1",
+            "nonce": "TEXT",
+            "mac": "TEXT",
+            "consumed_at": "INTEGER",
+        }
+        for name, ddl in approval_additions.items():
+            if name not in approval_cols:
+                conn.execute(f"ALTER TABLE approvals ADD COLUMN {name} {ddl}")
 
         if not _columns(conn, "changesets"):
             conn.execute(
@@ -229,7 +267,11 @@ def init_db() -> None:
                 (canonical, plan_hash, plan_hash, row["id"]),
             )
 
-        conn.execute("PRAGMA user_version = 3")
+        conn.execute(
+            "INSERT OR IGNORE INTO system_state (key,value,updated_at) VALUES ('policy_generation','1',?)",
+            (int(time.time()),),
+        )
+        conn.execute("PRAGMA user_version = 4")
         conn.commit()
 
 
@@ -238,3 +280,29 @@ def audit(conn: sqlite3.Connection, event_type: str, actor: str, subject_type: s
         "INSERT INTO audit_events (event_type,actor,subject_type,subject_id,payload_json,created_at) VALUES (?,?,?,?,?,?)",
         (event_type, actor, subject_type, subject_id, json.dumps(payload or {}, sort_keys=True), int(time.time())),
     )
+
+
+def get_policy_generation(conn: sqlite3.Connection) -> int:
+    row = conn.execute("SELECT value FROM system_state WHERE key='policy_generation'").fetchone()
+    if not row:
+        now = int(time.time())
+        conn.execute("INSERT INTO system_state (key,value,updated_at) VALUES ('policy_generation','1',?)", (now,))
+        return 1
+    return int(row["value"])
+
+
+def bump_policy_generation(conn: sqlite3.Connection, actor: str, reason: str) -> tuple[int, int]:
+    old = get_policy_generation(conn)
+    new = old + 1
+    now = int(time.time())
+    conn.execute("UPDATE system_state SET value=?,updated_at=? WHERE key='policy_generation'", (str(new), now))
+    conn.execute(
+        "UPDATE changesets SET state='STALE_POLICY',updated_at=? WHERE policy_generation<>? AND state IN ('PLANNED','PREVIEWED','AWAITING_APPROVAL','APPROVED')",
+        (now, new),
+    )
+    conn.execute(
+        "UPDATE approvals SET status='STALE_POLICY',decided_at=?,reason=? WHERE status='APPROVED' AND changeset_id IN (SELECT id FROM changesets WHERE state='STALE_POLICY')",
+        (now, f"policy generation advanced to {new}"),
+    )
+    audit(conn, "policy.generation_bumped", actor, "policy", "global", {"old_generation": old, "new_generation": new, "reason": reason})
+    return old, new

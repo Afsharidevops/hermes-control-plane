@@ -38,6 +38,40 @@ class CredentialRefUpdate(StrictModel):
     metadata: dict[str, Any] | None = None
 
 
+class CredentialRefRotate(StrictModel):
+    actor: str = Field(min_length=1, max_length=160)
+    metadata: dict[str, Any]
+
+
+class AgentEnrollmentTokenCreate(StrictModel):
+    name: str = Field(min_length=1, max_length=120)
+    ttl_seconds: int = Field(default=900, ge=60, le=86400)
+
+
+class AgentEnroll(StrictModel):
+    enrollment_token: str = Field(min_length=32, max_length=512)
+    capabilities: list[str] = Field(default_factory=list, max_length=128)
+
+
+class AgentHeartbeat(StrictModel):
+    nonce: str = Field(min_length=16, max_length=256)
+    capabilities: list[str] | None = Field(default=None, max_length=128)
+
+
+class AgentRevoke(StrictModel):
+    actor: str = Field(min_length=1, max_length=160)
+    reason: str = Field(min_length=1, max_length=1000)
+
+
+class AuditRetentionUpdate(StrictModel):
+    actor: str = Field(min_length=1, max_length=160)
+    days: int = Field(ge=1, le=3650)
+
+
+class AuditPrune(StrictModel):
+    actor: str = Field(min_length=1, max_length=160)
+
+
 class IntegrationCreate(StrictModel):
     name: str = Field(min_length=1, max_length=120)
     kind: IntegrationKind
@@ -90,8 +124,12 @@ class ChangeSetCreate(StrictModel):
     source_channel: Literal["ui", "telegram", "hermes-bot", "api", "cli"] = "api"
     source_revision: str | None = Field(default=None, max_length=256)
     parameters: dict[str, Any] = Field(default_factory=dict)
-    policy_generation: int = Field(default=1, ge=1)
     ttl_seconds: int = Field(default=900, ge=60, le=86400)
+
+
+class PolicyGenerationBump(StrictModel):
+    actor: str = Field(min_length=1, max_length=160)
+    reason: str = Field(min_length=1, max_length=1000)
 
 
 class PreviewCreate(StrictModel):

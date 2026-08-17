@@ -11,7 +11,7 @@ from urllib.parse import urlparse
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Query, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, PlainTextResponse
 
 from . import db
 from .canonical import canonical_json, sha256_hex
@@ -28,6 +28,7 @@ from .models import (
     IntegrationCreate,
     IntegrationUpdate,
     PreviewCreate,
+    PolicyGenerationBump,
     RejectDecision,
     RollbackPlanCreate,
     TargetCreate,
@@ -35,11 +36,11 @@ from .models import (
 )
 from .risk import approval_required, classify
 
-VERSION = "0.5.10-rc.1"
+VERSION = "0.5.10"
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 TERMINAL_CHANGESET_STATES = {
     "REJECTED", "CANCELLED", "EXPIRED", "EXECUTED", "FAILED",
-    "POLICY_DENIED", "PREVIEW_FAILED",
+    "POLICY_DENIED", "PREVIEW_FAILED", "STALE_POLICY",
 }
 INFRA_MUTATION_ADAPTERS = {"kubernetes", "helm"}
 BOT_SOURCE_CHANNELS = {"telegram", "hermes-bot", "api"}
@@ -174,6 +175,26 @@ def _credential_snapshot(conn, credential_ref: str | None) -> dict[str, Any] | N
     }
 
 
+_SECRET_METADATA_KEYS = {
+    "secret", "password", "passphrase", "token", "access_token", "refresh_token",
+    "private_key", "privatekey", "kubeconfig", "credential", "credentials", "raw", "content", "value",
+}
+
+
+def _validate_credential_metadata(metadata: dict[str, Any]) -> None:
+    def walk(value: Any, path: str = "metadata") -> None:
+        if isinstance(value, dict):
+            for key, child in value.items():
+                normalized = str(key).strip().lower().replace("-", "_")
+                if normalized in _SECRET_METADATA_KEYS or normalized.endswith("_secret") or normalized.endswith("_password") or normalized.endswith("_token") or normalized.endswith("_private_key"):
+                    raise HTTPException(status_code=422, detail=f"raw secret material is forbidden in credential reference {path}.{key}")
+                walk(child, f"{path}.{key}")
+        elif isinstance(value, list):
+            for idx, child in enumerate(value):
+                walk(child, f"{path}[{idx}]")
+    walk(metadata)
+
+
 def _target_snapshot(conn, target_id: str) -> dict[str, Any]:
     row = conn.execute("SELECT * FROM targets WHERE id=?", (target_id,)).fetchone()
     if not row:
@@ -257,6 +278,7 @@ def system() -> dict[str, Any]:
             "credential_refs": conn.execute("SELECT COUNT(*) FROM credential_refs").fetchone()[0],
             "changesets": conn.execute("SELECT COUNT(*) FROM changesets").fetchone()[0],
         }
+        policy_generation = db.get_policy_generation(conn)
     return {
         "name": "Hermes Control Plane",
         "version": VERSION,
@@ -264,6 +286,7 @@ def system() -> dict[str, Any]:
         "runtime": os.getenv("HERMES_RUNTIME", "docker"),
         "capabilities": ["integration-registry", "target-registry", "credential-references", "changeset-planning", "risk-engine", "approval-binding", "audit", "kubernetes-discovery", "kubernetes-server-dry-run", "kubernetes-guarded-delete", "kubernetes-rollback", "kubernetes-rollout-verification", "helm-server-dry-run", "helm-rollback", "signed-execution-tickets"],
         "execution_enabled": os.getenv("HERMES_EXECUTION_ENABLED", "false").lower() == "true",
+        "policy_generation": policy_generation,
         "mutation_control": {
             "kubernetes_helm": "bot-only",
             "approval": "approval-bot-only",
@@ -271,6 +294,15 @@ def system() -> dict[str, Any]:
         },
         "counts": counts,
     }
+
+
+@app.post("/v1/policy-generation/bump")
+def bump_policy_generation(payload: PolicyGenerationBump, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_admin(authorization)
+    with closing(db.connect()) as conn:
+        old, new = db.bump_policy_generation(conn, payload.actor, payload.reason)
+        conn.commit()
+    return {"old_generation": old, "policy_generation": new, "actor": payload.actor, "reason": payload.reason}
 
 
 @app.get("/v1/environments")
@@ -307,6 +339,8 @@ def update_environment(environment_id: str, payload: EnvironmentUpdate, authoriz
     updates = payload.model_dump(exclude_unset=True)
     if not updates:
         raise HTTPException(status_code=400, detail="no fields supplied")
+    if "metadata" in updates:
+        _validate_credential_metadata(updates["metadata"])
     with closing(db.connect()) as conn:
         _get_environment(conn, environment_id)
         if "labels" in updates:
@@ -343,6 +377,7 @@ def list_credential_refs() -> list[dict[str, Any]]:
 @app.post("/v1/credential-refs", status_code=201)
 def create_credential_ref(payload: CredentialRefCreate, authorization: str | None = Header(default=None)) -> dict[str, Any]:
     _require_admin(authorization)
+    _validate_credential_metadata(payload.metadata)
     cred_id = f"cred_{uuid.uuid4().hex[:16]}"
     now = int(time.time())
     with closing(db.connect()) as conn:
@@ -378,6 +413,30 @@ def update_credential_ref(credential_id: str, payload: CredentialRefUpdate, auth
         conn.commit()
         row = conn.execute("SELECT * FROM credential_refs WHERE id=?", (credential_id,)).fetchone()
     return _row_json(row, {"metadata_json": "metadata"})
+
+
+@app.post("/v1/credential-refs/{credential_id}/rotate")
+def rotate_credential_ref(credential_id: str, payload: CredentialRefUpdate, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_admin(authorization)
+    updates = payload.model_dump(exclude_unset=True)
+    metadata = updates.get("metadata")
+    if metadata is None:
+        raise HTTPException(status_code=422, detail="rotation requires replacement reference metadata/fingerprint")
+    _validate_credential_metadata(metadata)
+    now = int(time.time())
+    with closing(db.connect()) as conn:
+        row = conn.execute("SELECT * FROM credential_refs WHERE id=?", (credential_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="credential reference not found")
+        old_meta = json.loads(row["metadata_json"] or "{}")
+        conn.execute("UPDATE credential_refs SET status='configured',metadata_json=?,updated_at=? WHERE id=?", (json.dumps(metadata, sort_keys=True), now, credential_id))
+        db.audit(conn, "credential_ref.rotated", "admin", "credential_ref", credential_id, {
+            "old_fingerprint": old_meta.get("sha256") or old_meta.get("fingerprint"),
+            "new_fingerprint": metadata.get("sha256") or metadata.get("fingerprint"),
+        })
+        conn.commit()
+        updated = conn.execute("SELECT * FROM credential_refs WHERE id=?", (credential_id,)).fetchone()
+    return _row_json(updated, {"metadata_json": "metadata"})
 
 
 @app.delete("/v1/credential-refs/{credential_id}", status_code=204)
@@ -596,6 +655,14 @@ def get_changeset(changeset_id: str) -> dict[str, Any]:
     return _changeset_dict(row)
 
 
+def _require_current_policy_generation(conn, row: Any) -> int:
+    current = db.get_policy_generation(conn)
+    stored = int(row["policy_generation"] or 1)
+    if stored != current:
+        raise HTTPException(status_code=409, detail=f"ChangeSet policy generation {stored} is stale; current generation is {current}")
+    return current
+
+
 def _insert_changeset(
     conn,
     *,
@@ -657,7 +724,7 @@ def create_changeset(payload: ChangeSetCreate, authorization: str | None = Heade
             source_channel=payload.source_channel,
             source_revision=payload.source_revision,
             parameters=payload.parameters,
-            policy_generation=payload.policy_generation,
+            policy_generation=db.get_policy_generation(conn),
             ttl_seconds=payload.ttl_seconds,
         )
         conn.commit()
@@ -737,7 +804,7 @@ def create_rollback_plan(
             source_channel=payload.source_channel,
             source_revision=None,
             parameters=rb_params,
-            policy_generation=int(source["policy_generation"] or 1),
+            policy_generation=db.get_policy_generation(conn),
             ttl_seconds=payload.ttl_seconds,
         )
         db.audit(conn, "changeset.rollback_planned", payload.requested_by, "changeset", row["id"], {
@@ -754,6 +821,7 @@ def preview_changeset(changeset_id: str, payload: PreviewCreate, authorization: 
     with closing(db.connect()) as conn:
         row = _changeset(conn, changeset_id)
         _require_infra_actor(row, authorization)
+        _require_current_policy_generation(conn, row)
         if row["state"] not in {"PLANNED", "PREVIEWED"}:
             raise HTTPException(status_code=409, detail=f"cannot preview ChangeSet in state {row['state']}")
         preview = {"summary": payload.summary, "details": payload.details, "generated_at": now, "source": "planner"}
@@ -770,6 +838,7 @@ def request_approval(changeset_id: str, authorization: str | None = Header(defau
     with closing(db.connect()) as conn:
         row = _changeset(conn, changeset_id)
         _require_infra_actor(row, authorization)
+        _require_current_policy_generation(conn, row)
         if not row["approval_required"]:
             raise HTTPException(status_code=409, detail="risk engine does not require approval for this ChangeSet")
         if row["state"] != "PREVIEWED":
@@ -790,22 +859,34 @@ def approve_changeset(changeset_id: str, payload: ApprovalDecision, authorizatio
             _require_approval_bot(authorization)
         else:
             _require_admin(authorization)
+        _require_current_policy_generation(conn, row)
         if row["state"] != "AWAITING_APPROVAL":
             raise HTTPException(status_code=409, detail="ChangeSet is not awaiting approval")
         if payload.plan_hash != row["plan_hash"]:
             raise HTTPException(status_code=409, detail="approval hash does not match current ChangeSet plan")
         if row["risk"] in {"HIGH", "CRITICAL"} and payload.approver == row["requested_by"]:
             raise HTTPException(status_code=403, detail="requester cannot self-approve HIGH/CRITICAL ChangeSets")
+        if conn.execute(
+            "SELECT 1 FROM approvals WHERE changeset_id=? AND plan_hash=? AND approver=? AND status='APPROVED' AND expires_at>=?",
+            (changeset_id, row["plan_hash"], payload.approver, now),
+        ).fetchone():
+            raise HTTPException(status_code=409, detail="approver has already approved this exact plan")
         approval_id = f"apr_{uuid.uuid4().hex[:16]}"
         expires_at = min(now + payload.ttl_seconds, int(row["expires_at"] or now + payload.ttl_seconds))
         conn.execute(
             "INSERT INTO approvals (id,changeset_id,plan_hash,approver,status,issued_at,expires_at,decided_at) VALUES (?,?,?,?,?,?,?,?)",
             (approval_id, changeset_id, row["plan_hash"], payload.approver, "APPROVED", now, expires_at, now),
         )
-        conn.execute("UPDATE changesets SET state='APPROVED',updated_at=? WHERE id=?", (now, changeset_id))
-        db.audit(conn, "changeset.approved", payload.approver, "changeset", changeset_id, {"approval_id": approval_id, "plan_hash": row["plan_hash"], "expires_at": expires_at})
+        required_approvals = 2 if row["risk"] == "CRITICAL" else 1
+        approval_count = conn.execute(
+            "SELECT COUNT(DISTINCT approver) FROM approvals WHERE changeset_id=? AND plan_hash=? AND status='APPROVED' AND expires_at>=?",
+            (changeset_id, row["plan_hash"], now),
+        ).fetchone()[0]
+        next_state = "APPROVED" if approval_count >= required_approvals else "AWAITING_APPROVAL"
+        conn.execute("UPDATE changesets SET state=?,updated_at=? WHERE id=?", (next_state, now, changeset_id))
+        db.audit(conn, "changeset.approved", payload.approver, "changeset", changeset_id, {"approval_id": approval_id, "plan_hash": row["plan_hash"], "expires_at": expires_at, "approval_count": approval_count, "required_approvals": required_approvals})
         conn.commit()
-    return {"id": approval_id, "changeset_id": changeset_id, "plan_hash": payload.plan_hash, "approver": payload.approver, "status": "APPROVED", "issued_at": now, "expires_at": expires_at, "execution_enabled": os.getenv("HERMES_EXECUTION_ENABLED", "false").lower() == "true"}
+    return {"id": approval_id, "changeset_id": changeset_id, "plan_hash": payload.plan_hash, "approver": payload.approver, "status": "APPROVED", "issued_at": now, "expires_at": expires_at, "approval_count": approval_count, "required_approvals": required_approvals, "changeset_state": next_state, "execution_enabled": os.getenv("HERMES_EXECUTION_ENABLED", "false").lower() == "true"}
 
 
 @app.post("/v1/changesets/{changeset_id}/reject")
@@ -817,6 +898,7 @@ def reject_changeset(changeset_id: str, payload: RejectDecision, authorization: 
             _require_approval_bot(authorization)
         else:
             _require_admin(authorization)
+        _require_current_policy_generation(conn, row)
         if row["state"] in TERMINAL_CHANGESET_STATES:
             raise HTTPException(status_code=409, detail=f"ChangeSet already terminal: {row['state']}")
         conn.execute("UPDATE changesets SET state='REJECTED',updated_at=? WHERE id=?", (now, changeset_id))
@@ -916,6 +998,7 @@ async def execute_changeset(changeset_id: str, payload: ExecuteDecision, authori
     with closing(db.connect()) as conn:
         row = _changeset(conn, changeset_id)
         _require_infra_actor(row, authorization)
+        _require_current_policy_generation(conn, row)
         if row["state"] not in {"PREVIEWED", "APPROVED"}:
             raise HTTPException(status_code=409, detail="ChangeSet must have a live preview and any required approval before execution")
         plan = json.loads(row["plan_json"] or "{}")
@@ -928,9 +1011,13 @@ async def execute_changeset(changeset_id: str, payload: ExecuteDecision, authori
         if not preview or preview.get("source") != "kubernetes-broker":
             raise HTTPException(status_code=409, detail="a live Kubernetes Broker preview is required")
         if row["approval_required"]:
-            approval = conn.execute("SELECT * FROM approvals WHERE changeset_id=? AND plan_hash=? AND status='APPROVED' ORDER BY issued_at DESC LIMIT 1", (changeset_id, row["plan_hash"])).fetchone()
-            if not approval or int(approval["expires_at"]) < now:
-                raise HTTPException(status_code=409, detail="no valid approval is bound to this exact plan hash")
+            required_approvals = 2 if row["risk"] == "CRITICAL" else 1
+            approval_count = conn.execute(
+                "SELECT COUNT(DISTINCT approver) FROM approvals WHERE changeset_id=? AND plan_hash=? AND status='APPROVED' AND expires_at>=?",
+                (changeset_id, row["plan_hash"], now),
+            ).fetchone()[0]
+            if approval_count < required_approvals:
+                raise HTTPException(status_code=409, detail=f"{required_approvals} valid distinct approval(s) required for this exact plan hash")
         preview_details = (preview.get("details") or {}) if isinstance(preview, dict) else {}
         preconditions = {}
         if preview_details.get("live_state_hash"):
@@ -995,3 +1082,29 @@ def list_audit(limit: int = Query(default=200, ge=1, le=2000), subject_id: str |
         item["payload"] = json.loads(item.pop("payload_json") or "{}")
         out.append(item)
     return out
+
+
+@app.get("/v1/audit/export", response_class=PlainTextResponse)
+def export_audit(authorization: str | None = Header(default=None)) -> PlainTextResponse:
+    _require_admin(authorization)
+    with closing(db.connect()) as conn:
+        rows = conn.execute("SELECT * FROM audit_events ORDER BY id ASC").fetchall()
+    lines = []
+    for row in rows:
+        item = dict(row)
+        item["payload"] = json.loads(item.pop("payload_json") or "{}")
+        lines.append(json.dumps(item, sort_keys=True, separators=(",", ":")))
+    body = "\n".join(lines) + ("\n" if lines else "")
+    return PlainTextResponse(body, media_type="application/x-ndjson", headers={"X-Hermes-Audit-SHA256": sha256_hex(body)})
+
+
+@app.post("/v1/audit/retention")
+def enforce_audit_retention(days: int = Query(ge=1, le=3650), actor: str = Query(min_length=1, max_length=160), authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_admin(authorization)
+    cutoff = int(time.time()) - days * 86400
+    with closing(db.connect()) as conn:
+        cur = conn.execute("DELETE FROM audit_events WHERE created_at < ?", (cutoff,))
+        deleted = cur.rowcount
+        db.audit(conn, "audit.retention_enforced", actor, "audit", "global", {"days": days, "cutoff": cutoff, "deleted": deleted})
+        conn.commit()
+    return {"retention_days": days, "deleted": deleted, "cutoff": cutoff}
