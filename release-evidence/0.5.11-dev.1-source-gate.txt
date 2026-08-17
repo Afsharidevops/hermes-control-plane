@@ -1,15 +1,15 @@
 Hermes Control Plane 0.5.11-dev.1 source gate
 version=0.5.11-dev.1
-utc=2026-08-17T15:19:59Z
+utc=2026-08-17T15:26:49Z
 0.5.11-dev.1-source-security: PASS
 foundation files: ok
 bot/credential wiring: ok
 ...............................                                          [100%]
-31 passed in 2.13s
+31 passed in 2.14s
 ..................                                                       [100%]
-18 passed in 0.20s
-time="2026-08-17T18:50:03+03:30" level=warning msg="The \"HERMES_APPROVAL_HMAC_KEY\" variable is not set. Defaulting to a blank string."
-time="2026-08-17T18:50:03+03:30" level=warning msg="The \"HERMES_AGENT_TASK_HMAC_KEY\" variable is not set. Defaulting to a blank string."
+18 passed in 0.19s
+time="2026-08-17T18:56:52+03:30" level=warning msg="The \"HERMES_AGENT_TASK_HMAC_KEY\" variable is not set. Defaulting to a blank string."
+time="2026-08-17T18:56:52+03:30" level=warning msg="The \"HERMES_APPROVAL_HMAC_KEY\" variable is not set. Defaulting to a blank string."
 docker compose config: ok
 ==> Linting /home/afshari/Downloads/hermes-control-plane/charts/hermes-control-plane
 [INFO] Chart.yaml: icon is recommended

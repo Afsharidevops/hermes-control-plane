@@ -81,12 +81,15 @@ jobs:
 
       - name: Source security checks
         run: |
+          SECURITY_PY=/tmp/hermes-kubernetes-broker-tests/bin/python
+          test -x "$SECURITY_PY"
+          "$SECURITY_PY" -c 'import yaml; print("security gate PyYAML:", yaml.__version__)'
           case "$(cat VERSION)" in
             0.5.10)
-              python scripts/acceptance/source-security-gate.py
+              "$SECURITY_PY" scripts/acceptance/source-security-gate.py
               ;;
             0.5.11-dev.1)
-              python scripts/acceptance/dev1-source-security-gate.py
+              "$SECURITY_PY" scripts/acceptance/dev1-source-security-gate.py
               ;;
             *)
               echo "No source security gate configured for VERSION=$(cat VERSION)" >&2
