@@ -79,8 +79,20 @@ jobs:
           print("bot/credential wiring: ok")
           PY
 
-      - name: Stable source security checks
-        run: python scripts/acceptance/source-security-gate.py
+      - name: Source security checks
+        run: |
+          case "$(cat VERSION)" in
+            0.5.10)
+              python scripts/acceptance/source-security-gate.py
+              ;;
+            0.5.11-dev.1)
+              python scripts/acceptance/dev1-source-security-gate.py
+              ;;
+            *)
+              echo "No source security gate configured for VERSION=$(cat VERSION)" >&2
+              exit 1
+              ;;
+          esac
 
       - name: Helm lint
         uses: azure/setup-helm@v5
