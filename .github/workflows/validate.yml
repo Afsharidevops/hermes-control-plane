@@ -95,5 +95,6 @@ jobs:
           esac
 
       - name: Helm lint
-        uses: azure/setup-helm@v5
-      - run: helm lint charts/hermes-control-plane
+        run: |
+          helm version --short
+          helm lint charts/hermes-control-plane
