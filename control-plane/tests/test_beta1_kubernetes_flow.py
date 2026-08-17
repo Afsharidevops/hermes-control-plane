@@ -11,6 +11,7 @@ os.environ["HERMES_EXECUTION_HMAC_KEY"] = "ticket-key"
 os.environ["HERMES_KUBERNETES_BROKER_TOKEN"] = "broker-key"
 os.environ["HERMES_BOT_SERVICE_TOKEN"] = "test-bot"
 os.environ["HERMES_APPROVAL_BOT_TOKEN"] = "test-approval"
+os.environ["HERMES_APPROVAL_HMAC_KEY"] = "approval-hmac-key-0123456789abcdef0123456789abcdef"
 
 from hermes_control_plane import db  # noqa: E402
 from hermes_control_plane import main as cp  # noqa: E402

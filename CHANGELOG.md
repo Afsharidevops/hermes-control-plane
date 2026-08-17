@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.5.11-dev.1
+
+- add the compressed v0.5.11 completion roadmap
+- add audited Application registry CRUD
+- add shared adapter capability/security contract discovery
+- add policy-bound signed agent task envelopes with capability enforcement
+- add one-time agent task claim/replay protection and audited results
+- add Docker/Helm/hermesctl wiring for a separate agent-task HMAC key
+- add a dedicated 0.5.11-dev.1 source/security gate
+
+## 0.5.10 (stable candidate)
+
+- Server-authoritative policy generation with stale-plan invalidation.
+- Two-person CRITICAL exact-hash approval; approval nonce/HMAC integrity and one-use consumption.
+- Credential-reference secret rejection and audited rotation, including SSH/Kubernetes lifecycle coverage.
+- Agent one-time enrollment, replay protection, capability heartbeat and revocation.
+- Audit export/digest and retention controls.
+- Integrity-checked backup/restore and single-active failover acceptance.
+- Stable candidate image/runtime/migration gates and CI runtime-action maintenance.
+
+
 ## 0.5.10-rc.1 (development)
 
 - fix Kubernetes discovery JSON handling so large structured results are parsed from stdout without silent 100 KB truncation

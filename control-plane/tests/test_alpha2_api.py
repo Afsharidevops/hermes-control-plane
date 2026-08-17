@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 os.environ["HERMES_CONTROL_ADMIN_TOKEN"] = "test-admin"
 os.environ["HERMES_BOT_SERVICE_TOKEN"] = "test-bot"
 os.environ["HERMES_APPROVAL_BOT_TOKEN"] = "test-approval"
+os.environ["HERMES_APPROVAL_HMAC_KEY"] = "approval-hmac-key-0123456789abcdef0123456789abcdef"
 
 from hermes_control_plane import db  # noqa: E402
 from hermes_control_plane.main import app  # noqa: E402

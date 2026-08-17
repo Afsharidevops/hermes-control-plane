@@ -55,6 +55,8 @@ init_env() {
     [HERMES_CONTROL_ADMIN_TOKEN]=32
     [HERMES_BOT_SERVICE_TOKEN]=32
     [HERMES_APPROVAL_BOT_TOKEN]=32
+    [HERMES_APPROVAL_HMAC_KEY]=32
+    [HERMES_AGENT_TASK_HMAC_KEY]=32
     [HERMES_KUBERNETES_BROKER_TOKEN]=32
     [HERMES_EXECUTION_HMAC_KEY]=32
     [ROUTER_GATEWAY_ADMIN_TOKEN]=32
@@ -1254,6 +1256,21 @@ PYRESTORE
   echo "[ok] restored Control Plane database from $source"
 }
 
+cmd_agent_enroll() {
+  need curl; need python3
+  local name="${1:-}" ttl="${2:-900}"
+  [[ -n "$name" ]] || fail "usage: ./hermesctl agent enroll <name> [ttl-seconds]"
+  [[ "$ttl" =~ ^[0-9]+$ ]] || fail "ttl-seconds must be numeric"
+  load_env
+  python3 - "$name" "$ttl" <<'PYJSON' | curl -fsS -X POST \
+      -H "Authorization: Bearer ${HERMES_CONTROL_ADMIN_TOKEN}" -H 'Content-Type: application/json' \
+      --data-binary @- "http://${CONTROL_PLANE_BIND_IP:-127.0.0.1}:${CONTROL_PLANE_PORT:-8800}/v1/agents/enrollment-tokens" | python3 -m json.tool
+import json,sys
+print(json.dumps({"name":sys.argv[1],"ttl_seconds":int(sys.argv[2])}))
+PYJSON
+}
+
+
 cmd_upgrade() {
   need docker
   local target="${1:-}"
@@ -1307,7 +1324,7 @@ PYJSON
 cmd_kubeconfig_list() {
   need curl; need python3
   load_env
-  curl -fsS "http://${CONTROL_PLANE_BIND_IP:-127.0.0.1}:${CONTROL_PLANE_PORT:-8800}/v1/credential-refs" | python3 -c 'import json,sys; print(json.dumps([x for x in json.load(sys.stdin) if x.get("kind")=="kubeconfig"], indent=2))'
+  curl -fsS -H "Authorization: Bearer ${HERMES_CONTROL_ADMIN_TOKEN}" "http://${CONTROL_PLANE_BIND_IP:-127.0.0.1}:${CONTROL_PLANE_PORT:-8800}/v1/credential-refs" | python3 -c 'import json,sys; print(json.dumps([x for x in json.load(sys.stdin) if x.get("kind")=="kubeconfig"], indent=2))'
 }
 
 cmd_kubeconfig_remove() {
@@ -1580,6 +1597,7 @@ Commands:
   upgrade <version>            Verify, backup, pull and upgrade a published release
   backup                       Create and integrity-check an online Control Plane backup
   restore <backup.sqlite3>     Restore a verified backup with a pre-restore safety backup
+  agent enroll <name> [ttl]    Issue a one-time remote Agent enrollment token
   kubeconfig import <n> <file> Import kubeconfig material locally and create a reference
   kubeconfig list              List kubeconfig credential references
   kubeconfig remove <id>       Remove unused kubeconfig reference and local material
@@ -1599,6 +1617,12 @@ case "${1:-}" in
   upgrade) cmd_upgrade "${2:-}" ;;
   backup) cmd_backup ;;
   restore) cmd_restore "${2:-}" ;;
+  agent)
+    case "${2:-}" in
+      enroll) cmd_agent_enroll "${3:-}" "${4:-900}" ;;
+      *) fail "usage: ./hermesctl agent enroll <name> [ttl-seconds]" ;;
+    esac
+    ;;
   kubeconfig)
     case "${2:-}" in
       import) cmd_kubeconfig_import "${3:-}" "${4:-}" ;;

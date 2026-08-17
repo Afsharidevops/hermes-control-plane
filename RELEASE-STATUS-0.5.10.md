@@ -1,35 +1,42 @@
 # Hermes Control Plane 0.5.10 stable-candidate status
 
-This source tree is prepared with final `0.5.10` version metadata but is **not an official published stable release until the external acceptance and promotion gates below pass**.
+This source tree carries final `0.5.10` metadata and the complete checkpoint hardening implementation. It is a **local stable candidate**, not an official public `v0.5.10` release until the external runtime/promotion gates pass on the exact same commit.
 
-## Completed in this package
+## Implemented in this candidate
 
-- Server-authoritative persisted policy generation.
-- Stale policy generation invalidates active ChangeSets and bound approvals fail closed.
-- Policy generation is bound into canonical plan/hash.
-- Audited policy-generation bump endpoint.
-- CRITICAL changes require two distinct exact-hash approvers; requester self-approval remains forbidden.
-- Credential references reject raw secret-bearing metadata keys.
-- Explicit credential reference rotation with fingerprint audit.
-- Audit NDJSON export with SHA-256 response digest and retention operation.
-- SQLite online backup + integrity-checked restore tooling with pre-restore safety backup.
-- Existing target/credential/toolchain binding and execution default-off behavior retained.
-- GitHub Actions dependency maintenance already present in the checkpoint (`checkout@v7`, `setup-python@v7`, Helm setup v5).
+- Server-authoritative persistent policy generation bound into the canonical ChangeSet/hash.
+- Policy-generation bump invalidates active stale ChangeSets and approvals and emits an audit event.
+- CRITICAL changes require two distinct exact-hash approvers; HIGH/CRITICAL requester self-approval remains forbidden.
+- Approval records include policy generation/identity, expiry, nonce and HMAC integrity; required approvals are consumed before broker execution, blocking network-loss replay.
+- Credential references reject raw secret-bearing metadata and support audited external-reference/fingerprint rotation; Kubernetes and SSH reference lifecycles are tested.
+- Agent one-time enrollment, bearer identity, nonce replay rejection, capability advertisement and revocation.
+- Audit NDJSON export with SHA-256 digest plus audited retention pruning.
+- Online SQLite backup, integrity checking, pre-restore safety backup and operator restore command.
+- Single-active failover state preservation test and injected broker network-loss test.
+- Docker/Helm Bot + Approval Bot + approval-HMAC identity parity.
+- Stable pre-tag image candidate flow, source security gate, API-equivalence and Docker->Kubernetes migration checks.
+- GitHub Actions moved to current Node-24-generation majors and the full Smart Router regression suite is included in CI.
 
-## Locally verified gates
+## Locally verified
 
-Run `./scripts/stable-source-gate.sh` from the repository root. The package records local source/unit results in `release-evidence/`.
+Run:
 
-## External gates still required before official `v0.5.10`
+```bash
+./scripts/stable-source-gate.sh
+```
 
-These require infrastructure or credentials not available in the checkpoint execution environment:
+The evidence file is `release-evidence/stable-source-gate.txt`.
 
-1. Clean supported Linux VM Docker Compose install.
-2. Clean supported Kubernetes cluster Helm install.
-3. Docker-to-Kubernetes migration acceptance.
-4. Upgrade/rollback matrix from `v0.5.10-beta.1` and `v0.5.10-rc.1` using published candidate images.
-5. HA/failover and network-loss/failure-injection acceptance on real runtime topology.
-6. Multi-architecture candidate image build/publish verification (`linux/amd64`, `linux/arm64`).
-7. Merge validated source to `main`, rerun CI, create annotated `v0.5.10` tag, publish official images, and move `latest` only for stable-policy images.
+## External gates before the official tag
 
-Do not create the official stable tag until all seven external gates pass.
+These require Docker/Kubernetes/registry/GitHub resources not present in this execution environment:
+
+1. Publish all six `0.5.10-candidate.<sha>` multi-architecture images and run `scripts/acceptance/candidate-images.sh`.
+2. Clean Docker Compose install with both 9router and OmniRoute selection.
+3. Clean Helm install with persistent Control Plane storage and both router selections.
+4. Live Docker->Kubernetes state migration and API-equivalence checks.
+5. Upgrade/restore/rollback/re-upgrade from both `v0.5.10-beta.1` and `v0.5.10-rc.1`.
+6. Real-topology failover/network-loss smoke in the acceptance environment.
+7. Merge the exact validated commit to `main`, rerun CI, create annotated `v0.5.10`, and verify the official images.
+
+See `docs/STABLE-0.5.10-ACCEPTANCE.md`. Do not create the stable tag before these gates pass.

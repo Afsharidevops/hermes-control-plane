@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import os
+import secrets
 import time
 import uuid
 from contextlib import asynccontextmanager, closing
@@ -18,6 +21,15 @@ from .canonical import canonical_json, sha256_hex
 from . import kubernetes as kubernetes_broker
 from .tickets import issue_ticket
 from .models import (
+    AgentEnroll,
+    AgentEnrollmentTokenCreate,
+    AgentHeartbeat,
+    AgentRevoke,
+    AgentTaskClaim,
+    AgentTaskCreate,
+    AgentTaskResult,
+    ApplicationCreate,
+    ApplicationUpdate,
     ApprovalDecision,
     ChangeSetCreate,
     CredentialRefCreate,
@@ -36,7 +48,7 @@ from .models import (
 )
 from .risk import approval_required, classify
 
-VERSION = "0.5.10"
+VERSION = "0.5.11-dev.1"
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 TERMINAL_CHANGESET_STATES = {
     "REJECTED", "CANCELLED", "EXPIRED", "EXECUTED", "FAILED",
@@ -44,6 +56,21 @@ TERMINAL_CHANGESET_STATES = {
 }
 INFRA_MUTATION_ADAPTERS = {"kubernetes", "helm"}
 BOT_SOURCE_CHANNELS = {"telegram", "hermes-bot", "api"}
+
+ADAPTER_CAPABILITIES: dict[str, dict[str, Any]] = {
+    "kubernetes.discover": {"adapter": "kubernetes", "mode": "read", "default_risk": "READ", "reversible": False, "credential_class": "kubeconfig", "connection_modes": ["direct", "agent"], "approval": "none", "target_restrictions": ["namespace allowlist", "no Secret value reads"]},
+    "kubernetes.apply": {"adapter": "kubernetes", "mode": "write", "default_risk": "HIGH", "reversible": True, "credential_class": "kubeconfig", "connection_modes": ["direct", "agent"], "approval": "policy", "target_restrictions": ["namespace/resource allowlists", "RBAC escalation denied by default"]},
+    "helm.upgrade": {"adapter": "helm", "mode": "write", "default_risk": "HIGH", "reversible": True, "credential_class": "kubeconfig", "connection_modes": ["direct", "agent"], "approval": "policy", "target_restrictions": ["namespace allowlist"]},
+    "docker.read": {"adapter": "docker", "mode": "read", "default_risk": "READ", "reversible": False, "credential_class": "docker-socket-local", "connection_modes": ["agent"], "approval": "none", "target_restrictions": ["socket broker/agent only"]},
+    "docker.restart": {"adapter": "docker", "mode": "write", "default_risk": "LOW", "reversible": True, "credential_class": "docker-socket-local", "connection_modes": ["agent"], "approval": "policy", "target_restrictions": ["container allowlist"]},
+    "docker.deploy": {"adapter": "docker", "mode": "write", "default_risk": "HIGH", "reversible": True, "credential_class": "docker-socket-local", "connection_modes": ["agent"], "approval": "policy", "target_restrictions": ["structured deployment only", "privileged/root mounts denied by default"]},
+    "compose.apply": {"adapter": "compose", "mode": "write", "default_risk": "HIGH", "reversible": True, "credential_class": "docker-socket-local", "connection_modes": ["agent"], "approval": "policy", "target_restrictions": ["validated compose project"]},
+    "swarm.deploy": {"adapter": "swarm", "mode": "write", "default_risk": "HIGH", "reversible": True, "credential_class": "docker-socket-local", "connection_modes": ["agent"], "approval": "policy", "target_restrictions": ["stack/service allowlist"]},
+    "ssh.profile.verify": {"adapter": "ssh", "mode": "read", "default_risk": "READ", "reversible": False, "credential_class": "ssh", "connection_modes": ["direct", "agent"], "approval": "none", "target_restrictions": ["host fingerprint required"]},
+    "ssh.runbook.execute": {"adapter": "ssh", "mode": "write", "default_risk": "HIGH", "reversible": False, "credential_class": "ssh", "connection_modes": ["agent"], "approval": "policy", "target_restrictions": ["structured runbook only", "no unrestricted shell endpoint"]},
+    "github.gitops": {"adapter": "github", "mode": "write", "default_risk": "HIGH", "reversible": True, "credential_class": "token", "connection_modes": ["direct"], "approval": "policy", "target_restrictions": ["controlled files", "protected branch policy"]},
+    "gitlab.gitops": {"adapter": "gitlab", "mode": "write", "default_risk": "HIGH", "reversible": True, "credential_class": "token", "connection_modes": ["direct"], "approval": "policy", "target_restrictions": ["controlled files", "protected branch policy"]},
+}
 
 
 def _is_infra_mutation(adapter: str, operation: str) -> bool:
@@ -60,7 +87,7 @@ async def lifespan(_: FastAPI):
 app = FastAPI(
     title="Hermes Control Plane API",
     version=VERSION,
-    description="Kubernetes + Helm beta vertical slice for Hermes Control Plane",
+    description="Hermes Control Plane 0.5.11-dev.1 development API",
     lifespan=lifespan,
 )
 
@@ -85,6 +112,64 @@ def _bot_token() -> str:
 
 def _approval_bot_token() -> str:
     return os.getenv("HERMES_APPROVAL_BOT_TOKEN", "")
+
+
+def _approval_hmac_key() -> bytes:
+    key = os.getenv("HERMES_APPROVAL_HMAC_KEY", "").encode("utf-8")
+    if len(key) < 32:
+        raise HTTPException(status_code=503, detail="HERMES_APPROVAL_HMAC_KEY must be configured with at least 32 bytes")
+    return key
+
+
+def _agent_task_hmac_key() -> bytes:
+    key = os.getenv("HERMES_AGENT_TASK_HMAC_KEY", "").encode("utf-8")
+    if len(key) < 32:
+        raise HTTPException(status_code=503, detail="HERMES_AGENT_TASK_HMAC_KEY must be configured with at least 32 bytes")
+    return key
+
+def _agent_task_signature(envelope: dict[str, Any]) -> str:
+    return hmac.new(_agent_task_hmac_key(), canonical_json(envelope).encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _hash_token(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _approval_mac_payload(record: dict[str, Any]) -> bytes:
+    signed = {
+        "id": record["id"],
+        "changeset_id": record["changeset_id"],
+        "plan_hash": record["plan_hash"],
+        "approver": record["approver"],
+        "issued_at": int(record["issued_at"]),
+        "expires_at": int(record["expires_at"]),
+        "policy_generation": int(record["policy_generation"]),
+        "policy_id": record["policy_id"],
+        "policy_version": int(record["policy_version"]),
+        "nonce": record["nonce"],
+    }
+    return canonical_json(signed).encode("utf-8")
+
+
+def _approval_mac(record: dict[str, Any]) -> str:
+    return hmac.new(_approval_hmac_key(), _approval_mac_payload(record), hashlib.sha256).hexdigest()
+
+
+def _approval_is_valid(row: Any, *, changeset: Any, now: int) -> bool:
+    record = dict(row)
+    if record.get("status") != "APPROVED" or record.get("consumed_at") is not None:
+        return False
+    if int(record.get("expires_at") or 0) < now:
+        return False
+    if int(record.get("policy_generation") or 0) != int(changeset["policy_generation"]):
+        return False
+    if record.get("plan_hash") != changeset["plan_hash"] or not record.get("nonce") or not record.get("mac"):
+        return False
+    try:
+        expected = _approval_mac(record)
+    except (KeyError, TypeError, ValueError):
+        return False
+    return hmac.compare_digest(str(record["mac"]), expected)
 
 
 def _require_token(authorization: str | None, token: str, label: str) -> None:
@@ -159,6 +244,25 @@ def _integration_dict(row: Any) -> dict[str, Any]:
 
 def _target_dict(row: Any) -> dict[str, Any]:
     return _row_json(row, {"scope_json": "scope", "labels_json": "labels"})
+
+
+def _application_dict(row: Any) -> dict[str, Any]:
+    return _row_json(
+        row,
+        {
+            "values_files_json": "values_files",
+            "verification_checks_json": "verification_checks",
+            "rollback_strategy_json": "rollback_strategy",
+            "labels_json": "labels",
+        },
+    )
+
+def _agent_task_dict(row: Any) -> dict[str, Any]:
+    item = dict(row)
+    item["envelope"] = json.loads(item.pop("envelope_json") or "{}")
+    item["result"] = json.loads(item.pop("result_json") or "null")
+    item.pop("claim_nonce_hash", None)
+    return item
 
 
 def _credential_snapshot(conn, credential_ref: str | None) -> dict[str, Any] | None:
@@ -237,7 +341,7 @@ def _changeset_dict(row: Any) -> dict[str, Any]:
         and item["adapter"] in {"kubernetes", "helm"}
         and execution_state_ready
     )
-    item["execution_note"] = "beta.1 execution requires live preview, approval when required, target snapshot match, and a signed one-time broker ticket"
+    item["execution_note"] = "execution requires a live broker preview, current policy generation, integrity-bound approval when required, target snapshot match, and a signed one-time broker ticket"
     return item
 
 
@@ -277,14 +381,17 @@ def system() -> dict[str, Any]:
             "targets": conn.execute("SELECT COUNT(*) FROM targets").fetchone()[0],
             "credential_refs": conn.execute("SELECT COUNT(*) FROM credential_refs").fetchone()[0],
             "changesets": conn.execute("SELECT COUNT(*) FROM changesets").fetchone()[0],
+            "applications": conn.execute("SELECT COUNT(*) FROM applications").fetchone()[0],
+            "agents": conn.execute("SELECT COUNT(*) FROM agents").fetchone()[0],
+            "agent_tasks": conn.execute("SELECT COUNT(*) FROM agent_tasks").fetchone()[0],
         }
         policy_generation = db.get_policy_generation(conn)
     return {
         "name": "Hermes Control Plane",
         "version": VERSION,
-        "stage": "beta-dev",
+        "stage": "development",
         "runtime": os.getenv("HERMES_RUNTIME", "docker"),
-        "capabilities": ["integration-registry", "target-registry", "credential-references", "changeset-planning", "risk-engine", "approval-binding", "audit", "kubernetes-discovery", "kubernetes-server-dry-run", "kubernetes-guarded-delete", "kubernetes-rollback", "kubernetes-rollout-verification", "helm-server-dry-run", "helm-rollback", "signed-execution-tickets"],
+        "capabilities": ["integration-registry", "target-registry", "application-registry", "adapter-capability-contract", "credential-references", "changeset-planning", "risk-engine", "approval-binding", "audit", "agent-enrollment", "agent-signed-task-envelope", "kubernetes-discovery", "kubernetes-server-dry-run", "kubernetes-guarded-delete", "kubernetes-rollback", "kubernetes-rollout-verification", "helm-server-dry-run", "helm-rollback", "signed-execution-tickets"],
         "execution_enabled": os.getenv("HERMES_EXECUTION_ENABLED", "false").lower() == "true",
         "policy_generation": policy_generation,
         "mutation_control": {
@@ -303,6 +410,11 @@ def bump_policy_generation(payload: PolicyGenerationBump, authorization: str | N
         old, new = db.bump_policy_generation(conn, payload.actor, payload.reason)
         conn.commit()
     return {"old_generation": old, "policy_generation": new, "actor": payload.actor, "reason": payload.reason}
+
+
+@app.get("/v1/capabilities")
+def list_capabilities() -> list[dict[str, Any]]:
+    return [{"id": capability_id, **spec} for capability_id, spec in sorted(ADAPTER_CAPABILITIES.items())]
 
 
 @app.get("/v1/environments")
@@ -405,6 +517,7 @@ def update_credential_ref(credential_id: str, payload: CredentialRefUpdate, auth
         if not conn.execute("SELECT 1 FROM credential_refs WHERE id=?", (credential_id,)).fetchone():
             raise HTTPException(status_code=404, detail="credential reference not found")
         if "metadata" in updates:
+            _validate_credential_metadata(updates["metadata"])
             updates["metadata_json"] = json.dumps(updates.pop("metadata"), sort_keys=True)
         updates["updated_at"] = int(time.time())
         fields = list(updates)
@@ -450,6 +563,249 @@ def delete_credential_ref(credential_id: str, authorization: str | None = Header
             raise HTTPException(status_code=404, detail="credential reference not found")
         db.audit(conn, "credential_ref.deleted", "admin", "credential_ref", credential_id)
         conn.commit()
+
+
+@app.get("/v1/agents")
+def list_agents(authorization: str | None = Header(default=None)) -> list[dict[str, Any]]:
+    _require_admin(authorization)
+    with closing(db.connect()) as conn:
+        rows = conn.execute("SELECT id,name,status,capabilities_json,enrolled_at,last_seen_at,revoked_at FROM agents ORDER BY name").fetchall()
+    return [{**dict(row), "capabilities": json.loads(row["capabilities_json"] or "[]")} | {"capabilities_json": None} for row in rows]
+
+
+@app.post("/v1/agents/enrollment-tokens", status_code=201)
+def create_agent_enrollment_token(payload: AgentEnrollmentTokenCreate, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_admin(authorization)
+    now = int(time.time())
+    token_id = f"aen_{uuid.uuid4().hex[:16]}"
+    token = secrets.token_urlsafe(32)
+    expires_at = now + payload.ttl_seconds
+    with closing(db.connect()) as conn:
+        if conn.execute("SELECT 1 FROM agents WHERE name=?", (payload.name,)).fetchone():
+            raise HTTPException(status_code=409, detail="agent name is already enrolled")
+        conn.execute(
+            "INSERT INTO agent_enrollment_tokens (id,name,token_hash,status,expires_at,created_at) VALUES (?,?,?,?,?,?)",
+            (token_id, payload.name, _hash_token(token), "ISSUED", expires_at, now),
+        )
+        db.audit(conn, "agent.enrollment_token_issued", "admin", "agent_enrollment", token_id, {"name": payload.name, "expires_at": expires_at})
+        conn.commit()
+    return {"id": token_id, "name": payload.name, "enrollment_token": token, "expires_at": expires_at}
+
+
+@app.post("/v1/agents/enroll", status_code=201)
+def enroll_agent(payload: AgentEnroll) -> dict[str, Any]:
+    now = int(time.time())
+    token_hash = _hash_token(payload.enrollment_token)
+    with closing(db.connect()) as conn:
+        row = conn.execute("SELECT * FROM agent_enrollment_tokens WHERE token_hash=?", (token_hash,)).fetchone()
+        if not row or row["status"] != "ISSUED" or int(row["expires_at"]) < now:
+            raise HTTPException(status_code=401, detail="invalid, expired, or already-used enrollment token")
+        if conn.execute("SELECT 1 FROM agents WHERE name=?", (row["name"],)).fetchone():
+            raise HTTPException(status_code=409, detail="agent name is already enrolled")
+        agent_id = f"agt_{uuid.uuid4().hex[:16]}"
+        bearer = secrets.token_urlsafe(32)
+        conn.execute(
+            "INSERT INTO agents (id,name,token_hash,status,capabilities_json,enrolled_at) VALUES (?,?,?,?,?,?)",
+            (agent_id, row["name"], _hash_token(bearer), "ACTIVE", json.dumps(payload.capabilities, sort_keys=True), now),
+        )
+        conn.execute("UPDATE agent_enrollment_tokens SET status='USED',used_at=? WHERE id=? AND status='ISSUED'", (now, row["id"]))
+        db.audit(conn, "agent.enrolled", row["name"], "agent", agent_id, {"capabilities": payload.capabilities})
+        conn.commit()
+    return {"id": agent_id, "name": row["name"], "agent_token": bearer, "status": "ACTIVE", "capabilities": payload.capabilities, "enrolled_at": now}
+
+
+def _authorized_agent(conn, authorization: str | None) -> Any:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="missing agent bearer token")
+    token = authorization.removeprefix("Bearer ").strip()
+    row = conn.execute("SELECT * FROM agents WHERE token_hash=?", (_hash_token(token),)).fetchone()
+    if not row:
+        raise HTTPException(status_code=401, detail="invalid agent bearer token")
+    if row["status"] != "ACTIVE":
+        raise HTTPException(status_code=403, detail="agent identity is revoked")
+    return row
+
+
+@app.post("/v1/agents/heartbeat")
+def agent_heartbeat(payload: AgentHeartbeat, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    now = int(time.time())
+    with closing(db.connect()) as conn:
+        agent = _authorized_agent(conn, authorization)
+        try:
+            conn.execute("INSERT INTO agent_nonces (agent_id,nonce,seen_at) VALUES (?,?,?)", (agent["id"], payload.nonce, now))
+        except Exception as exc:
+            if "UNIQUE" in str(exc):
+                raise HTTPException(status_code=409, detail="agent nonce replay rejected") from exc
+            raise
+        capabilities = payload.capabilities if payload.capabilities is not None else json.loads(agent["capabilities_json"] or "[]")
+        conn.execute("UPDATE agents SET capabilities_json=?,last_seen_at=? WHERE id=?", (json.dumps(capabilities, sort_keys=True), now, agent["id"]))
+        db.audit(conn, "agent.heartbeat", agent["name"], "agent", agent["id"], {"nonce_sha256": _hash_token(payload.nonce), "capabilities": capabilities})
+        conn.commit()
+    return {"id": agent["id"], "status": "ACTIVE", "last_seen_at": now, "capabilities": capabilities}
+
+
+@app.post("/v1/agents/{agent_id}/revoke")
+def revoke_agent(agent_id: str, payload: AgentRevoke, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_admin(authorization)
+    now = int(time.time())
+    with closing(db.connect()) as conn:
+        row = conn.execute("SELECT * FROM agents WHERE id=?", (agent_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="agent not found")
+        conn.execute("UPDATE agents SET status='REVOKED',revoked_at=? WHERE id=?", (now, agent_id))
+        db.audit(conn, "agent.revoked", payload.actor, "agent", agent_id, {"reason": payload.reason})
+        conn.commit()
+    return {"id": agent_id, "status": "REVOKED", "revoked_at": now}
+
+
+@app.get("/v1/agent-tasks")
+def list_agent_tasks(authorization: str | None = Header(default=None)) -> list[dict[str, Any]]:
+    _require_admin(authorization)
+    with closing(db.connect()) as conn:
+        rows = conn.execute("SELECT * FROM agent_tasks ORDER BY issued_at DESC, id DESC").fetchall()
+    return [_agent_task_dict(row) for row in rows]
+
+
+@app.post("/v1/agents/{agent_id}/tasks", status_code=201)
+def issue_agent_task(agent_id: str, payload: AgentTaskCreate, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_admin(authorization)
+    now = int(time.time())
+    with closing(db.connect()) as conn:
+        agent = conn.execute("SELECT * FROM agents WHERE id=?", (agent_id,)).fetchone()
+        if not agent:
+            raise HTTPException(status_code=404, detail="agent not found")
+        if agent["status"] != "ACTIVE":
+            raise HTTPException(status_code=409, detail="agent is not active")
+        capabilities = set(json.loads(agent["capabilities_json"] or "[]"))
+        if payload.capability not in capabilities:
+            raise HTTPException(status_code=403, detail="agent did not advertise the requested capability")
+        capability = ADAPTER_CAPABILITIES.get(payload.capability)
+        if not capability:
+            raise HTTPException(status_code=422, detail="unknown adapter capability")
+
+        changeset = _changeset(conn, payload.changeset_id)
+        _require_current_policy_generation(conn, changeset)
+        target = conn.execute("SELECT * FROM targets WHERE id=?", (changeset["target_id"],)).fetchone()
+        if not target:
+            raise HTTPException(status_code=404, detail="ChangeSet target not found")
+        if target["connection_mode"] != "agent":
+            raise HTTPException(status_code=409, detail="ChangeSet target is not configured for agent execution")
+        if capability["adapter"] != changeset["adapter"]:
+            raise HTTPException(status_code=409, detail="capability adapter does not match ChangeSet adapter")
+        if changeset["approval_required"]:
+            if changeset["state"] != "APPROVED":
+                raise HTTPException(status_code=409, detail="approved ChangeSet required before agent task issuance")
+        elif changeset["state"] != "PREVIEWED":
+            raise HTTPException(status_code=409, detail="previewed ChangeSet required before agent task issuance")
+
+        task_id = f"tsk_{uuid.uuid4().hex[:16]}"
+        expires_at = min(now + payload.ttl_seconds, int(changeset["expires_at"] or now + payload.ttl_seconds))
+        envelope = {
+            "schema_version": 1,
+            "task_id": task_id,
+            "agent_id": agent_id,
+            "changeset_id": changeset["id"],
+            "changeset_hash": changeset["plan_hash"],
+            "capability": payload.capability,
+            "target_id": changeset["target_id"],
+            "policy_generation": int(changeset["policy_generation"]),
+            "issued_at": now,
+            "expires_at": expires_at,
+            "nonce": secrets.token_urlsafe(24),
+            "plan": json.loads(changeset["plan_json"] or "{}"),
+        }
+        signature = _agent_task_signature(envelope)
+        conn.execute(
+            "INSERT INTO agent_tasks (id,agent_id,changeset_id,capability,policy_generation,envelope_json,signature,state,issued_at,expires_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (task_id, agent_id, changeset["id"], payload.capability, int(changeset["policy_generation"]), canonical_json(envelope), signature, "ISSUED", now, expires_at),
+        )
+        db.audit(conn, "agent.task_issued", "admin", "agent_task", task_id, {"agent_id": agent_id, "changeset_id": changeset["id"], "capability": payload.capability, "plan_hash": changeset["plan_hash"]})
+        conn.commit()
+        row = conn.execute("SELECT * FROM agent_tasks WHERE id=?", (task_id,)).fetchone()
+    return _agent_task_dict(row)
+
+
+@app.get("/v1/agents/tasks/next")
+def next_agent_task(authorization: str | None = Header(default=None)) -> dict[str, Any] | None:
+    now = int(time.time())
+    with closing(db.connect()) as conn:
+        agent = _authorized_agent(conn, authorization)
+        conn.execute("UPDATE agent_tasks SET state='EXPIRED' WHERE agent_id=? AND state='ISSUED' AND expires_at<?", (agent["id"], now))
+        row = conn.execute("SELECT * FROM agent_tasks WHERE agent_id=? AND state='ISSUED' ORDER BY issued_at,id LIMIT 1", (agent["id"],)).fetchone()
+        conn.commit()
+    return _agent_task_dict(row) if row else None
+
+
+@app.post("/v1/agents/tasks/{task_id}/claim")
+def claim_agent_task(task_id: str, payload: AgentTaskClaim, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    now = int(time.time())
+    with closing(db.connect()) as conn:
+        agent = _authorized_agent(conn, authorization)
+        row = conn.execute("SELECT * FROM agent_tasks WHERE id=? AND agent_id=?", (task_id, agent["id"])).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="agent task not found")
+        if row["state"] != "ISSUED":
+            raise HTTPException(status_code=409, detail=f"agent task cannot be claimed from state {row['state']}")
+        if int(row["expires_at"]) < now:
+            conn.execute("UPDATE agent_tasks SET state='EXPIRED' WHERE id=?", (task_id,))
+            conn.commit()
+            raise HTTPException(status_code=409, detail="agent task expired")
+        current_generation = db.get_policy_generation(conn)
+        if int(row["policy_generation"]) != current_generation:
+            conn.execute("UPDATE agent_tasks SET state='STALE_POLICY' WHERE id=?", (task_id,))
+            db.audit(conn, "agent.task_stale_policy", agent["name"], "agent_task", task_id, {"task_generation": row["policy_generation"], "current_generation": current_generation})
+            conn.commit()
+            raise HTTPException(status_code=409, detail="agent task policy generation is stale")
+        changeset = conn.execute("SELECT * FROM changesets WHERE id=?", (row["changeset_id"],)).fetchone()
+        if not changeset:
+            raise HTTPException(status_code=409, detail="agent task ChangeSet no longer exists")
+        allowed_state = "APPROVED" if changeset["approval_required"] else "PREVIEWED"
+        if changeset["state"] != allowed_state:
+            conn.execute("UPDATE agent_tasks SET state='INVALIDATED' WHERE id=?", (task_id,))
+            db.audit(conn, "agent.task_invalidated", agent["name"], "agent_task", task_id, {"changeset_state": changeset["state"], "required_state": allowed_state})
+            conn.commit()
+            raise HTTPException(status_code=409, detail="agent task ChangeSet is no longer authorized for execution")
+        envelope = json.loads(row["envelope_json"] or "{}")
+        if envelope.get("changeset_hash") != changeset["plan_hash"]:
+            conn.execute("UPDATE agent_tasks SET state='INVALIDATED' WHERE id=?", (task_id,))
+            conn.commit()
+            raise HTTPException(status_code=409, detail="agent task ChangeSet hash no longer matches")
+        expected = _agent_task_signature(envelope)
+        if not hmac.compare_digest(str(row["signature"]), expected):
+            raise HTTPException(status_code=409, detail="agent task signature verification failed")
+        try:
+            conn.execute("INSERT INTO agent_nonces (agent_id,nonce,seen_at) VALUES (?,?,?)", (agent["id"], payload.nonce, now))
+        except Exception as exc:
+            if "UNIQUE" in str(exc):
+                raise HTTPException(status_code=409, detail="agent task claim nonce replay rejected") from exc
+            raise
+        changed = conn.execute("UPDATE agent_tasks SET state='CLAIMED',claim_nonce_hash=?,claimed_at=? WHERE id=? AND state='ISSUED'", (_hash_token(payload.nonce), now, task_id))
+        if changed.rowcount != 1:
+            raise HTTPException(status_code=409, detail="agent task was already claimed")
+        db.audit(conn, "agent.task_claimed", agent["name"], "agent_task", task_id, {"claim_nonce_sha256": _hash_token(payload.nonce)})
+        conn.commit()
+        updated = conn.execute("SELECT * FROM agent_tasks WHERE id=?", (task_id,)).fetchone()
+    return _agent_task_dict(updated)
+
+
+@app.post("/v1/agents/tasks/{task_id}/result")
+def complete_agent_task(task_id: str, payload: AgentTaskResult, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    now = int(time.time())
+    _validate_credential_metadata(payload.evidence)
+    with closing(db.connect()) as conn:
+        agent = _authorized_agent(conn, authorization)
+        row = conn.execute("SELECT * FROM agent_tasks WHERE id=? AND agent_id=?", (task_id, agent["id"])).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="agent task not found")
+        if row["state"] != "CLAIMED":
+            raise HTTPException(status_code=409, detail=f"agent task cannot complete from state {row['state']}")
+        state = "SUCCEEDED" if payload.status == "SUCCEEDED" else "FAILED"
+        result = {"status": payload.status, "summary": payload.summary, "evidence": payload.evidence, "completed_at": now}
+        conn.execute("UPDATE agent_tasks SET state=?,completed_at=?,result_json=? WHERE id=?", (state, now, json.dumps(result, sort_keys=True), task_id))
+        db.audit(conn, "agent.task_completed", agent["name"], "agent_task", task_id, {"status": payload.status, "summary": payload.summary})
+        conn.commit()
+        updated = conn.execute("SELECT * FROM agent_tasks WHERE id=?", (task_id,)).fetchone()
+    return _agent_task_dict(updated)
 
 
 @app.get("/v1/integrations")
@@ -634,10 +990,90 @@ def delete_target(target_id: str, authorization: str | None = Header(default=Non
             (target_id,),
         ).fetchone():
             raise HTTPException(status_code=409, detail="target has active ChangeSets")
+        if conn.execute("SELECT 1 FROM applications WHERE target_id=? LIMIT 1", (target_id,)).fetchone():
+            raise HTTPException(status_code=409, detail="target has applications")
         cur = conn.execute("DELETE FROM targets WHERE id=?", (target_id,))
         if not cur.rowcount:
             raise HTTPException(status_code=404, detail="target not found")
         db.audit(conn, "target.deleted", "admin", "target", target_id)
+        conn.commit()
+
+
+@app.get("/v1/applications")
+def list_applications() -> list[dict[str, Any]]:
+    with closing(db.connect()) as conn:
+        rows = conn.execute("SELECT * FROM applications ORDER BY name").fetchall()
+    return [_application_dict(row) for row in rows]
+
+
+@app.post("/v1/applications", status_code=201)
+def create_application(payload: ApplicationCreate, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_admin(authorization)
+    now = int(time.time())
+    application_id = f"app_{uuid.uuid4().hex[:16]}"
+    with closing(db.connect()) as conn:
+        _get_environment(conn, payload.environment_id)
+        target = conn.execute("SELECT * FROM targets WHERE id=?", (payload.target_id,)).fetchone()
+        if not target:
+            raise HTTPException(status_code=404, detail="target not found")
+        if target["environment_id"] != payload.environment_id:
+            raise HTTPException(status_code=409, detail="application environment must match target environment")
+        try:
+            conn.execute(
+                """INSERT INTO applications
+                (id,name,environment_id,target_id,source_repository,revision_policy,build_context,image_repository,deployment_type,values_files_json,verification_checks_json,rollback_strategy_json,labels_json,status,created_at,updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (application_id, payload.name, payload.environment_id, payload.target_id, payload.source_repository, payload.revision_policy, payload.build_context, payload.image_repository, payload.deployment_type, json.dumps(payload.values_files, sort_keys=True), json.dumps(payload.verification_checks, sort_keys=True), json.dumps(payload.rollback_strategy, sort_keys=True), json.dumps(payload.labels, sort_keys=True), "configured", now, now),
+            )
+            db.audit(conn, "application.created", "admin", "application", application_id, {"deployment_type": payload.deployment_type, "target_id": payload.target_id, "source_repository": payload.source_repository})
+            conn.commit()
+        except Exception as exc:
+            if "UNIQUE" in str(exc):
+                raise HTTPException(status_code=409, detail="application name already exists") from exc
+            raise
+        row = conn.execute("SELECT * FROM applications WHERE id=?", (application_id,)).fetchone()
+    return _application_dict(row)
+
+
+@app.patch("/v1/applications/{application_id}")
+def update_application(application_id: str, payload: ApplicationUpdate, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_admin(authorization)
+    updates = payload.model_dump(exclude_unset=True)
+    if not updates:
+        raise HTTPException(status_code=400, detail="no fields supplied")
+    with closing(db.connect()) as conn:
+        current = conn.execute("SELECT * FROM applications WHERE id=?", (application_id,)).fetchone()
+        if not current:
+            raise HTTPException(status_code=404, detail="application not found")
+        environment_id = updates.get("environment_id", current["environment_id"])
+        target_id = updates.get("target_id", current["target_id"])
+        _get_environment(conn, environment_id)
+        target = conn.execute("SELECT * FROM targets WHERE id=?", (target_id,)).fetchone()
+        if not target:
+            raise HTTPException(status_code=404, detail="target not found")
+        if target["environment_id"] != environment_id:
+            raise HTTPException(status_code=409, detail="application environment must match target environment")
+        json_fields = {"values_files": "values_files_json", "verification_checks": "verification_checks_json", "rollback_strategy": "rollback_strategy_json", "labels": "labels_json"}
+        for source, dest in json_fields.items():
+            if source in updates:
+                updates[dest] = json.dumps(updates.pop(source), sort_keys=True)
+        updates["updated_at"] = int(time.time())
+        fields = list(updates)
+        conn.execute(f"UPDATE applications SET {', '.join(f'{field}=?' for field in fields)} WHERE id=?", (*[updates[field] for field in fields], application_id))
+        db.audit(conn, "application.updated", "admin", "application", application_id, {"fields": fields})
+        conn.commit()
+        row = conn.execute("SELECT * FROM applications WHERE id=?", (application_id,)).fetchone()
+    return _application_dict(row)
+
+
+@app.delete("/v1/applications/{application_id}", status_code=204)
+def delete_application(application_id: str, authorization: str | None = Header(default=None)) -> None:
+    _require_admin(authorization)
+    with closing(db.connect()) as conn:
+        cur = conn.execute("DELETE FROM applications WHERE id=?", (application_id,))
+        if not cur.rowcount:
+            raise HTTPException(status_code=404, detail="application not found")
+        db.audit(conn, "application.deleted", "admin", "application", application_id)
         conn.commit()
 
 
@@ -873,9 +1309,26 @@ def approve_changeset(changeset_id: str, payload: ApprovalDecision, authorizatio
             raise HTTPException(status_code=409, detail="approver has already approved this exact plan")
         approval_id = f"apr_{uuid.uuid4().hex[:16]}"
         expires_at = min(now + payload.ttl_seconds, int(row["expires_at"] or now + payload.ttl_seconds))
+        approval_record = {
+            "id": approval_id,
+            "changeset_id": changeset_id,
+            "plan_hash": row["plan_hash"],
+            "approver": payload.approver,
+            "issued_at": now,
+            "expires_at": expires_at,
+            "policy_generation": int(row["policy_generation"]),
+            "policy_id": "risk-baseline",
+            "policy_version": 1,
+            "nonce": secrets.token_urlsafe(24),
+        }
+        approval_record["mac"] = _approval_mac(approval_record)
         conn.execute(
-            "INSERT INTO approvals (id,changeset_id,plan_hash,approver,status,issued_at,expires_at,decided_at) VALUES (?,?,?,?,?,?,?,?)",
-            (approval_id, changeset_id, row["plan_hash"], payload.approver, "APPROVED", now, expires_at, now),
+            """INSERT INTO approvals
+            (id,changeset_id,plan_hash,approver,status,issued_at,expires_at,decided_at,policy_generation,policy_id,policy_version,nonce,mac)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (approval_id, changeset_id, row["plan_hash"], payload.approver, "APPROVED", now, expires_at, now,
+             approval_record["policy_generation"], approval_record["policy_id"], approval_record["policy_version"],
+             approval_record["nonce"], approval_record["mac"]),
         )
         required_approvals = 2 if row["risk"] == "CRITICAL" else 1
         approval_count = conn.execute(
@@ -886,7 +1339,7 @@ def approve_changeset(changeset_id: str, payload: ApprovalDecision, authorizatio
         conn.execute("UPDATE changesets SET state=?,updated_at=? WHERE id=?", (next_state, now, changeset_id))
         db.audit(conn, "changeset.approved", payload.approver, "changeset", changeset_id, {"approval_id": approval_id, "plan_hash": row["plan_hash"], "expires_at": expires_at, "approval_count": approval_count, "required_approvals": required_approvals})
         conn.commit()
-    return {"id": approval_id, "changeset_id": changeset_id, "plan_hash": payload.plan_hash, "approver": payload.approver, "status": "APPROVED", "issued_at": now, "expires_at": expires_at, "approval_count": approval_count, "required_approvals": required_approvals, "changeset_state": next_state, "execution_enabled": os.getenv("HERMES_EXECUTION_ENABLED", "false").lower() == "true"}
+    return {"id": approval_id, "changeset_id": changeset_id, "plan_hash": payload.plan_hash, "approver": payload.approver, "status": "APPROVED", "issued_at": now, "expires_at": expires_at, "policy_generation": approval_record["policy_generation"], "policy_id": approval_record["policy_id"], "policy_version": approval_record["policy_version"], "nonce": approval_record["nonce"], "mac": approval_record["mac"], "approval_count": approval_count, "required_approvals": required_approvals, "changeset_state": next_state, "execution_enabled": os.getenv("HERMES_EXECUTION_ENABLED", "false").lower() == "true"}
 
 
 @app.post("/v1/changesets/{changeset_id}/reject")
@@ -944,6 +1397,7 @@ async def preview_changeset_live(changeset_id: str, authorization: str | None = 
     with closing(db.connect()) as conn:
         row = _changeset(conn, changeset_id)
         _require_infra_actor(row, authorization)
+        _require_current_policy_generation(conn, row)
         if row["state"] not in {"PLANNED", "PREVIEWED"}:
             raise HTTPException(status_code=409, detail=f"cannot preview ChangeSet in state {row['state']}")
         if row["adapter"] not in {"kubernetes", "helm"}:
@@ -1010,14 +1464,20 @@ async def execute_changeset(changeset_id: str, payload: ExecuteDecision, authori
         preview = json.loads(row["preview_json"] or "null")
         if not preview or preview.get("source") != "kubernetes-broker":
             raise HTTPException(status_code=409, detail="a live Kubernetes Broker preview is required")
+        approval_ids_to_consume: list[str] = []
         if row["approval_required"]:
             required_approvals = 2 if row["risk"] == "CRITICAL" else 1
-            approval_count = conn.execute(
-                "SELECT COUNT(DISTINCT approver) FROM approvals WHERE changeset_id=? AND plan_hash=? AND status='APPROVED' AND expires_at>=?",
-                (changeset_id, row["plan_hash"], now),
-            ).fetchone()[0]
-            if approval_count < required_approvals:
-                raise HTTPException(status_code=409, detail=f"{required_approvals} valid distinct approval(s) required for this exact plan hash")
+            approval_rows = conn.execute(
+                "SELECT * FROM approvals WHERE changeset_id=? AND plan_hash=? AND status='APPROVED' AND consumed_at IS NULL ORDER BY issued_at ASC, id ASC",
+                (changeset_id, row["plan_hash"]),
+            ).fetchall()
+            valid_by_approver: dict[str, Any] = {}
+            for approval in approval_rows:
+                if approval["approver"] not in valid_by_approver and _approval_is_valid(approval, changeset=row, now=now):
+                    valid_by_approver[approval["approver"]] = approval
+            if len(valid_by_approver) < required_approvals:
+                raise HTTPException(status_code=409, detail=f"{required_approvals} valid distinct integrity-checked approval(s) required for this exact plan hash")
+            approval_ids_to_consume = [str(approval["id"]) for approval in list(valid_by_approver.values())[:required_approvals]]
         preview_details = (preview.get("details") or {}) if isinstance(preview, dict) else {}
         preconditions = {}
         if preview_details.get("live_state_hash"):
@@ -1035,8 +1495,14 @@ async def execute_changeset(changeset_id: str, payload: ExecuteDecision, authori
             )
         except RuntimeError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
+        if approval_ids_to_consume:
+            placeholders = ",".join("?" for _ in approval_ids_to_consume)
+            conn.execute(
+                f"UPDATE approvals SET status='CONSUMED',consumed_at=?,decided_at=? WHERE id IN ({placeholders}) AND status='APPROVED' AND consumed_at IS NULL",
+                (now, now, *approval_ids_to_consume),
+            )
         conn.execute("UPDATE changesets SET state='EXECUTING',updated_at=? WHERE id=?", (now, changeset_id))
-        db.audit(conn, "changeset.execution.started", payload.actor, "changeset", changeset_id, {"plan_hash": row["plan_hash"]})
+        db.audit(conn, "changeset.execution.started", payload.actor, "changeset", changeset_id, {"plan_hash": row["plan_hash"], "consumed_approval_ids": approval_ids_to_consume})
         conn.commit()
     try:
         result = await kubernetes_broker.post("/v1/execute", {"ticket": ticket, "signature": signature})
@@ -1061,7 +1527,8 @@ async def kubernetes_broker_health() -> dict[str, Any]:
 
 
 @app.get("/v1/changesets/{changeset_id}/approvals")
-def list_approvals(changeset_id: str) -> list[dict[str, Any]]:
+def list_approvals(changeset_id: str, authorization: str | None = Header(default=None)) -> list[dict[str, Any]]:
+    _require_admin(authorization)
     with closing(db.connect()) as conn:
         if not conn.execute("SELECT 1 FROM changesets WHERE id=?", (changeset_id,)).fetchone():
             raise HTTPException(status_code=404, detail="changeset not found")

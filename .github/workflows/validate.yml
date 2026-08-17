@@ -35,6 +35,9 @@ jobs:
           /tmp/hermes-kubernetes-broker-tests/bin/pip install -r kubernetes-broker/requirements-dev.txt
           PYTHONPATH=kubernetes-broker/src /tmp/hermes-kubernetes-broker-tests/bin/pytest -q kubernetes-broker/tests
 
+      - name: Test Telegram approval one-time and expiry boundary
+        run: PYTHONPATH=execution-broker/src /tmp/hermes-control-plane-tests/bin/pytest -q execution-broker/tests
+
       - name: Test Smart Router regression suite
         run: |
           python -m venv /tmp/hermes-smart-router-tests
@@ -75,6 +78,9 @@ jobs:
           assert "HERMES_KUBERNETES_BROKER_UID" in compose
           print("bot/credential wiring: ok")
           PY
+
+      - name: Stable source security checks
+        run: python scripts/acceptance/source-security-gate.py
 
       - name: Helm lint
         uses: azure/setup-helm@v5

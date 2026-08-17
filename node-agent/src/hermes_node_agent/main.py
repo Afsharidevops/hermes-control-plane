@@ -6,7 +6,7 @@ from typing import Any
 
 from fastapi import FastAPI
 
-VERSION = "0.5.10"
+VERSION = "0.5.11-dev.1"
 app = FastAPI(title="Hermes Node Agent", version=VERSION)
 
 

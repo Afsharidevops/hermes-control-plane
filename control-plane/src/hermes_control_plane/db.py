@@ -141,6 +141,46 @@ def init_db() -> None:
                 agent_id TEXT NOT NULL, nonce TEXT NOT NULL, seen_at INTEGER NOT NULL,
                 PRIMARY KEY(agent_id,nonce), FOREIGN KEY(agent_id) REFERENCES agents(id)
             );
+
+            CREATE TABLE IF NOT EXISTS applications (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                environment_id TEXT NOT NULL,
+                target_id TEXT NOT NULL,
+                source_repository TEXT NOT NULL,
+                revision_policy TEXT NOT NULL,
+                build_context TEXT NOT NULL,
+                image_repository TEXT,
+                deployment_type TEXT NOT NULL,
+                values_files_json TEXT NOT NULL,
+                verification_checks_json TEXT NOT NULL,
+                rollback_strategy_json TEXT NOT NULL,
+                labels_json TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                FOREIGN KEY(environment_id) REFERENCES environments(id),
+                FOREIGN KEY(target_id) REFERENCES targets(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS agent_tasks (
+                id TEXT PRIMARY KEY,
+                agent_id TEXT NOT NULL,
+                changeset_id TEXT NOT NULL,
+                capability TEXT NOT NULL,
+                policy_generation INTEGER NOT NULL,
+                envelope_json TEXT NOT NULL,
+                signature TEXT NOT NULL,
+                state TEXT NOT NULL,
+                issued_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                claim_nonce_hash TEXT,
+                claimed_at INTEGER,
+                completed_at INTEGER,
+                result_json TEXT,
+                FOREIGN KEY(agent_id) REFERENCES agents(id),
+                FOREIGN KEY(changeset_id) REFERENCES changesets(id)
+            );
             """
         )
 
@@ -271,7 +311,7 @@ def init_db() -> None:
             "INSERT OR IGNORE INTO system_state (key,value,updated_at) VALUES ('policy_generation','1',?)",
             (int(time.time()),),
         )
-        conn.execute("PRAGMA user_version = 4")
+        conn.execute("PRAGMA user_version = 5")
         conn.commit()
 
 

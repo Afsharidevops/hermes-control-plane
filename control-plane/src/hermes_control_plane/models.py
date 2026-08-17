@@ -157,3 +157,49 @@ class RollbackPlanCreate(StrictModel):
     requested_by: str = Field(min_length=1, max_length=160)
     source_channel: Literal["ui", "telegram", "hermes-bot", "api", "cli"] = "api"
     ttl_seconds: int = Field(default=900, ge=60, le=86400)
+
+
+class ApplicationCreate(StrictModel):
+    name: str = Field(min_length=1, max_length=120)
+    environment_id: str = Field(min_length=1, max_length=80)
+    target_id: str = Field(min_length=1, max_length=160)
+    source_repository: str = Field(min_length=1, max_length=500)
+    revision_policy: str = Field(default="main", min_length=1, max_length=256)
+    build_context: str = Field(default=".", min_length=1, max_length=500)
+    image_repository: str | None = Field(default=None, max_length=500)
+    deployment_type: Literal["kubernetes", "helm", "docker", "compose", "swarm", "gitops"]
+    values_files: list[str] = Field(default_factory=list, max_length=64)
+    verification_checks: list[dict[str, Any]] = Field(default_factory=list, max_length=64)
+    rollback_strategy: dict[str, Any] = Field(default_factory=dict)
+    labels: dict[str, str] = Field(default_factory=dict)
+
+
+class ApplicationUpdate(StrictModel):
+    environment_id: str | None = Field(default=None, min_length=1, max_length=80)
+    target_id: str | None = Field(default=None, min_length=1, max_length=160)
+    source_repository: str | None = Field(default=None, min_length=1, max_length=500)
+    revision_policy: str | None = Field(default=None, min_length=1, max_length=256)
+    build_context: str | None = Field(default=None, min_length=1, max_length=500)
+    image_repository: str | None = Field(default=None, max_length=500)
+    deployment_type: Literal["kubernetes", "helm", "docker", "compose", "swarm", "gitops"] | None = None
+    values_files: list[str] | None = Field(default=None, max_length=64)
+    verification_checks: list[dict[str, Any]] | None = Field(default=None, max_length=64)
+    rollback_strategy: dict[str, Any] | None = None
+    labels: dict[str, str] | None = None
+    status: Literal["configured", "disabled"] | None = None
+
+
+class AgentTaskCreate(StrictModel):
+    changeset_id: str = Field(min_length=1, max_length=160)
+    capability: str = Field(min_length=1, max_length=160)
+    ttl_seconds: int = Field(default=300, ge=30, le=3600)
+
+
+class AgentTaskClaim(StrictModel):
+    nonce: str = Field(min_length=16, max_length=256)
+
+
+class AgentTaskResult(StrictModel):
+    status: Literal["SUCCEEDED", "FAILED"]
+    summary: str = Field(min_length=1, max_length=2000)
+    evidence: dict[str, Any] = Field(default_factory=dict)

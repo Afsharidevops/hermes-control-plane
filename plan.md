@@ -2,7 +2,7 @@
 
 **Target:** `0.5.10`
 
-**Current development release:** `0.5.10-rc.1` on branch `dev/0.5.10-rc.1`; `v0.5.10-beta.1` is published.
+**Current release target:** first stable `0.5.10`, advanced from `dev/0.5.10-rc.2`; prior beta/RC tags remain immutable release history.
 
 **Project:** `hermes-control-plane`
 

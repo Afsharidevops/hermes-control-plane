@@ -2,7 +2,7 @@
 
 Hermes Control Plane is a self-hosted, AI-assisted DevOps control plane designed to run on a Docker/VM installation or Kubernetes while keeping privileged credentials and infrastructure execution outside the LLM trust boundary.
 
-> Current development branch: **dev/0.5.10-rc.1**. `v0.5.10-beta.1` is already published; do not tag RC until acceptance tests pass. Kubernetes/Helm mutations are bot-only, exact-hash approved, broker-executed, and disabled by default.
+> **0.5.10 stable candidate:** the checkpoint hardening is implemented locally. Do not create the public `v0.5.10` tag until `docs/STABLE-0.5.10-ACCEPTANCE.md` passes on the exact candidate commit. Kubernetes/Helm mutations remain bot-only, policy-generation-bound, exact-hash approved, broker-executed, and disabled by default.
 
 ## What is included
 
@@ -147,7 +147,7 @@ The Kubernetes Broker re-enforces target scope (`namespace_allowlist`/`namespace
 Manual fallback build/publish remains available:
 
 ```bash
-IMAGE_NAMESPACE=afsharidevops VERSION=0.5.10-rc.1 ./scripts/push-images.sh
+IMAGE_NAMESPACE=afsharidevops VERSION=0.5.10 ./scripts/push-images.sh
 ```
 
 ## Verify
@@ -156,7 +156,7 @@ IMAGE_NAMESPACE=afsharidevops VERSION=0.5.10-rc.1 ./scripts/push-images.sh
 ./scripts/verify.sh
 ```
 
-CI runs the Control Plane safety/beta flow tests, Kubernetes Broker policy/ticket tests, Compose validation, and Helm lint.
+CI runs the Control Plane stable safety suite, Kubernetes Broker policy/ticket tests, full Smart Router regression suite, Compose/static security validation, and Helm lint.
 
 ## Security status
 

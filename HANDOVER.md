@@ -1,11 +1,23 @@
+# Hermes Control Plane — 0.5.11 development handover
+
+**Stable base:** `v0.5.10` at `e73dd7c69767e709fb944a6356e47776a4464d92`
+**Active development branch:** `dev/0.5.11`
+**Current development package:** `0.5.11-dev.1`
+**Draft PR:** `#2`
+**Status:** dev.1 shared substrate is implemented; validate, repair the branch history, keep PR #2 draft, then continue with dev.2 credential-service work.
+
+`v0.5.10` is already published and must not be moved or rewritten. The historical 0.5.10 handover below is retained only as release history.
+
+---
+
 # Hermes Control Plane — Development Handover
 
 **Repository:** `Afsharidevops/hermes-control-plane`
 **Published prerelease:** `v0.5.10-beta.1`
 **Active development branch:** `dev/0.5.10-rc.1`
 **Current development package:** `0.5.10-rc.1`
-**Latest local update:** RC.1 stabilization R4 + final release hardening
-**Status:** R4 live security/execution acceptance is complete and execution is disabled. Only the final pre-tag release-mechanics gate remains: CI, multi-arch candidate images, isolated fresh install, Beta.1 -> RC candidate upgrade, then merge/tag verification.
+**Latest local update:** RC.1 stabilization R2
+**Status:** beta tag is already published; RC is not ready to tag yet. R1 exposed a shell EOF bug before combo creation; R2 fixes it and still requires live validation.
 
 ## Continuation rule
 
@@ -323,36 +335,3 @@ Root cause: R1 wrote tiny combo action files without a trailing newline, then pa
 R2 fixes this by newline-terminating plan files and making the action-file `read` explicitly EOF-tolerant while preserving fail-closed validation for invalid actions. It also removes handover trailing whitespace so `git diff --check` passes.
 
 R2 must now be overlaid on the same branch and tested with execution disabled. Expected first-run behavior is creation of `ai`, `combo-fast`, `combo-standard`, and `combo-strong`; a second startup must refresh `ai` but preserve existing tier combos. Then `router probe`, `bot check`, and the Telegram read-only target query must pass.
-
-## RC.1 final release-mechanics gate — pre-tag
-
-Validated development checkpoint before this gate:
-
-```text
-f55840c add target-aware kubectl selection and execution binding
-```
-
-Completed acceptance on R4:
-
-```text
-Control Plane tests:       16 passed
-Kubernetes Broker tests:   18 passed
-Safe acceptance:           35/35 passed
-Controlled execution:      32/32 passed
-Full down -> up restart:   passed
-Dynamic kubectl selection: passed (sandbox v1.33.3 -> kubectl v1.33.13)
-Ticket replay rejection:   passed
-ConfigMap rollback:        passed
-Helm install/uninstall:    passed
-Execution final state:     disabled
-```
-
-No new product features should be added before `v0.5.10-rc.1`. The remaining pre-tag work is release mechanics only:
-
-1. isolate Control Plane and Kubernetes Broker CI test environments;
-2. publish temporary `0.5.10-rc.1-candidate.<sha>` multi-arch images;
-3. verify `linux/amd64` and `linux/arm64` for all project images and confirm `:latest` does not move;
-4. wait for the final development-branch validation workflow;
-5. test an isolated fresh candidate install;
-6. test published `v0.5.10-beta.1` -> candidate upgrade with DB backup, registry persistence, managed-router-key reuse, router parity, and execution disabled;
-7. only after all of the above pass, merge the exact validated development commit to `main`, re-run release validation, tag `v0.5.10-rc.1`, and verify tag publishing without moving `:latest`.

@@ -1,0 +1,7 @@
+tool availability during local packaging (2026-08-17 UTC)
+docker=NOT_INSTALLED
+helm=NOT_INSTALLED
+kubectl=NOT_INSTALLED
+shellcheck=NOT_INSTALLED
+git=/usr/bin/git
+python3=/opt/pyvenv/bin/python3

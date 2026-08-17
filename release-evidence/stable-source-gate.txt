@@ -1,29 +1,15 @@
 Hermes Control Plane stable source gate
 version=0.5.10
-utc=2026-08-17T12:38:13Z
+utc=2026-08-17T12:27:25Z
+stable-source-security: PASS
 foundation files: ok
 bot/credential wiring: ok
-......................                                                   [100%]
-22 passed in 1.65s
+...........................                                              [100%]
+27 passed in 3.94s
 ..................                                                       [100%]
-18 passed in 0.21s
-docker compose config: ok
-==> Linting /home/afshari/Downloads/hermes-control-plane/charts/hermes-control-plane
-[INFO] Chart.yaml: icon is recommended
-
-1 chart(s) linted, 0 chart(s) failed
+18 passed in 0.19s
+..                                                                       [100%]
+2 passed in 0.06s
 ........................................................................ [ 61%]
 .............................................                            [100%]
-=============================== warnings summary ===============================
-smart-router/src/smart_router/oidc_v52.py:17
-  /home/afshari/Downloads/hermes-control-plane/smart-router/src/smart_router/oidc_v52.py:17: AuthlibDeprecationWarning: authlib.jose module is deprecated, please use joserfc instead.
-  It will be compatible before version 2.0.0.
-    from authlib.jose import jwt  # type: ignore
-
-tests/test_report.py: 1874 warnings
-  /home/afshari/hermes-0.5.10-release-venv/lib/python3.12/site-packages/joblib/numpy_pickle.py:207: DeprecationWarning: Setting the shape on a NumPy array has been deprecated in NumPy 2.5.
-  As an alternative, you can create a new view using np.reshape (with copy=False if needed).
-    array.shape = self.shape
-
--- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
 stable-source-gate: PASS

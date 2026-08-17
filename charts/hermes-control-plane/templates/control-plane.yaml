@@ -27,6 +27,14 @@ spec:
             - {name: HERMES_RUNTIME, value: kubernetes}
             - name: HERMES_CONTROL_ADMIN_TOKEN
               valueFrom: {secretKeyRef: {name: {{ include "hermes.secretName" . }}, key: control-admin-token}}
+            - name: HERMES_BOT_SERVICE_TOKEN
+              valueFrom: {secretKeyRef: {name: {{ include "hermes.secretName" . }}, key: bot-service-token}}
+            - name: HERMES_APPROVAL_BOT_TOKEN
+              valueFrom: {secretKeyRef: {name: {{ include "hermes.secretName" . }}, key: approval-bot-token}}
+            - name: HERMES_APPROVAL_HMAC_KEY
+              valueFrom: {secretKeyRef: {name: {{ include "hermes.secretName" . }}, key: approval-hmac-key}}
+            - name: HERMES_AGENT_TASK_HMAC_KEY
+              valueFrom: {secretKeyRef: {name: {{ include "hermes.secretName" . }}, key: agent-task-hmac-key}}
             - {name: HERMES_KUBERNETES_BROKER_URL, value: http://{{ include "hermes.fullname" . }}-kubernetes-broker:{{ .Values.kubernetesBroker.service.port }} }
             - name: HERMES_KUBERNETES_BROKER_TOKEN
               valueFrom: {secretKeyRef: {name: {{ include "hermes.secretName" . }}, key: kubernetes-broker-token}}

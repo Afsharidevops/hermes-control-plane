@@ -11,6 +11,7 @@ os.environ["HERMES_EXECUTION_HMAC_KEY"] = "ticket-key"
 os.environ["HERMES_KUBERNETES_BROKER_TOKEN"] = "broker-key"
 os.environ["HERMES_BOT_SERVICE_TOKEN"] = "test-bot"
 os.environ["HERMES_APPROVAL_BOT_TOKEN"] = "test-approval"
+os.environ["HERMES_APPROVAL_HMAC_KEY"] = "approval-hmac-key-0123456789abcdef0123456789abcdef"
 
 from hermes_control_plane import db  # noqa: E402
 from hermes_control_plane import main as cp  # noqa: E402
@@ -148,3 +149,44 @@ def test_critical_requires_two_distinct_exact_hash_approvers(client: TestClient,
     executed = client.post(f"/v1/changesets/{chg['id']}/execute", headers=BOT_AUTH, json={"actor": "telegram:executor"})
     assert executed.status_code == 200, executed.text
     assert executed.json()["state"] == "EXECUTED"
+
+
+def test_approval_is_integrity_bound_consumed_before_broker_network_failure(client: TestClient, monkeypatch):
+    target = setup_target(client)
+
+    async def fake_post(path, payload):
+        if path == "/v1/preview":
+            return {"summary": "ok", "kind": "kubernetes-manifest", "live_state_hash": "d" * 64}
+        if path == "/v1/execute":
+            from fastapi import HTTPException
+            raise HTTPException(status_code=503, detail="injected broker network loss")
+        raise AssertionError(path)
+
+    monkeypatch.setattr(cp.kubernetes_broker, "post", fake_post)
+    monkeypatch.setenv("HERMES_EXECUTION_ENABLED", "true")
+    chg = client.post("/v1/changesets", headers=BOT_AUTH, json={
+        "operation": "kubernetes.manifest.apply", "adapter": "kubernetes", "target_id": target["id"],
+        "requested_by": "telegram:requester", "source_channel": "hermes-bot",
+        "parameters": {"manifest": "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: once\n"},
+    }).json()
+    assert client.post(f"/v1/changesets/{chg['id']}/preview-live", headers=BOT_AUTH).status_code == 200
+    assert client.post(f"/v1/changesets/{chg['id']}/request-approval", headers=BOT_AUTH).status_code == 200
+    approval = client.post(
+        f"/v1/changesets/{chg['id']}/approve", headers=APPROVAL_AUTH,
+        json={"approver": "approval-bot:once", "plan_hash": chg["plan_hash"]},
+    )
+    assert approval.status_code == 201, approval.text
+    body = approval.json()
+    assert len(body["nonce"]) >= 24
+    assert len(body["mac"]) == 64
+    assert body["policy_generation"] == chg["policy_generation"]
+
+    failed = client.post(f"/v1/changesets/{chg['id']}/execute", headers=BOT_AUTH, json={"actor": "telegram:executor"})
+    assert failed.status_code == 502
+    approvals = client.get(f"/v1/changesets/{chg['id']}/approvals", headers=AUTH)
+    assert approvals.status_code == 200
+    assert approvals.json()[0]["status"] == "CONSUMED"
+    assert approvals.json()[0]["consumed_at"] is not None
+
+    retry = client.post(f"/v1/changesets/{chg['id']}/execute", headers=BOT_AUTH, json={"actor": "telegram:executor"})
+    assert retry.status_code == 409
