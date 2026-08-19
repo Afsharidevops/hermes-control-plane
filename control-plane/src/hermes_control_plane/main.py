@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
+import ipaddress
+import re
 import json
 import os
 import secrets
@@ -14,11 +17,13 @@ from urllib.parse import urlparse
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Query, Request
-from fastapi.responses import FileResponse, PlainTextResponse
+from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
 
 from . import db
 from .canonical import canonical_json, sha256_hex
 from . import kubernetes as kubernetes_broker
+from . import preflight as host_preflight
+from .providers import PROVIDERS, provider_descriptor
 from .tickets import issue_ticket
 from .models import (
     AgentEnroll,
@@ -33,6 +38,7 @@ from .models import (
     ApprovalDecision,
     ChangeSetCreate,
     CredentialRefCreate,
+    CredentialRefSync,
     CredentialRefUpdate,
     EnvironmentCreate,
     EnvironmentUpdate,
@@ -45,16 +51,22 @@ from .models import (
     RollbackPlanCreate,
     TargetCreate,
     TargetUpdate,
+    ServerCreate,
+    ServerUpdate,
+    ServerPreflightResult,
+    BootstrapPlanCreate,
+    ProviderJobTransition,
+    ProviderJobRetry,
 )
 from .risk import approval_required, classify
 
-VERSION = "0.5.11-dev.1"
+VERSION = "0.5.11-dev.2"
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 TERMINAL_CHANGESET_STATES = {
     "REJECTED", "CANCELLED", "EXPIRED", "EXECUTED", "FAILED",
     "POLICY_DENIED", "PREVIEW_FAILED", "STALE_POLICY",
 }
-INFRA_MUTATION_ADAPTERS = {"kubernetes", "helm"}
+INFRA_MUTATION_ADAPTERS = {"kubernetes", "helm", "ssh", "bootstrap", "radar", "hubble", "provider"}
 BOT_SOURCE_CHANNELS = {"telegram", "hermes-bot", "api"}
 
 ADAPTER_CAPABILITIES: dict[str, dict[str, Any]] = {
@@ -67,6 +79,11 @@ ADAPTER_CAPABILITIES: dict[str, dict[str, Any]] = {
     "compose.apply": {"adapter": "compose", "mode": "write", "default_risk": "HIGH", "reversible": True, "credential_class": "docker-socket-local", "connection_modes": ["agent"], "approval": "policy", "target_restrictions": ["validated compose project"]},
     "swarm.deploy": {"adapter": "swarm", "mode": "write", "default_risk": "HIGH", "reversible": True, "credential_class": "docker-socket-local", "connection_modes": ["agent"], "approval": "policy", "target_restrictions": ["stack/service allowlist"]},
     "ssh.profile.verify": {"adapter": "ssh", "mode": "read", "default_risk": "READ", "reversible": False, "credential_class": "ssh", "connection_modes": ["direct", "agent"], "approval": "none", "target_restrictions": ["host fingerprint required"]},
+    "ssh.preflight": {"adapter": "ssh", "mode": "read", "default_risk": "READ", "reversible": False, "credential_class": "ssh", "connection_modes": ["direct", "agent"], "approval": "none", "target_restrictions": ["host fingerprint required", "fixed read-only checks only"]},
+    "bootstrap.apply": {"adapter": "bootstrap", "mode": "write", "default_risk": "HIGH", "reversible": True, "credential_class": "ssh", "connection_modes": ["agent"], "approval": "policy", "target_restrictions": ["typed provider plan only", "approved ChangeSet required", "no generated shell"]},
+    "radar.discover": {"adapter": "radar", "mode": "read", "default_risk": "READ", "reversible": False, "credential_class": "kubeconfig", "connection_modes": ["direct", "agent"], "approval": "none", "target_restrictions": ["read intelligence only"]},
+    "radar.apply": {"adapter": "radar", "mode": "write", "default_risk": "HIGH", "reversible": True, "credential_class": "kubeconfig", "connection_modes": ["direct", "agent"], "approval": "policy", "target_restrictions": ["must execute through Hermes ChangeSet"]},
+    "hubble.flows": {"adapter": "hubble", "mode": "read", "default_risk": "READ", "reversible": False, "credential_class": "kubeconfig", "connection_modes": ["direct", "agent"], "approval": "none", "target_restrictions": ["authorization, redaction, aggregation before AI/UI"]},
     "ssh.runbook.execute": {"adapter": "ssh", "mode": "write", "default_risk": "HIGH", "reversible": False, "credential_class": "ssh", "connection_modes": ["agent"], "approval": "policy", "target_restrictions": ["structured runbook only", "no unrestricted shell endpoint"]},
     "github.gitops": {"adapter": "github", "mode": "write", "default_risk": "HIGH", "reversible": True, "credential_class": "token", "connection_modes": ["direct"], "approval": "policy", "target_restrictions": ["controlled files", "protected branch policy"]},
     "gitlab.gitops": {"adapter": "gitlab", "mode": "write", "default_risk": "HIGH", "reversible": True, "credential_class": "token", "connection_modes": ["direct"], "approval": "policy", "target_restrictions": ["controlled files", "protected branch policy"]},
@@ -87,7 +104,7 @@ async def lifespan(_: FastAPI):
 app = FastAPI(
     title="Hermes Control Plane API",
     version=VERSION,
-    description="Hermes Control Plane 0.5.11-dev.1 development API",
+    description="Hermes Control Plane 0.5.11-dev.2 development API",
     lifespan=lifespan,
 )
 
@@ -112,6 +129,10 @@ def _bot_token() -> str:
 
 def _approval_bot_token() -> str:
     return os.getenv("HERMES_APPROVAL_BOT_TOKEN", "")
+
+
+def _credential_service_token() -> str:
+    return os.getenv("HERMES_CREDENTIAL_SERVICE_TOKEN", "")
 
 
 def _approval_hmac_key() -> bytes:
@@ -195,6 +216,12 @@ def _require_approval_bot(authorization: str | None) -> None:
     _require_token(authorization, _approval_bot_token(), "HERMES_APPROVAL_BOT_TOKEN")
 
 
+def _require_credential_service(authorization: str | None) -> None:
+    if authorization in {f"Bearer {_admin_token()}", f"Bearer {_bot_token()}", f"Bearer {_approval_bot_token()}"}:
+        raise HTTPException(status_code=403, detail="credential metadata sync is restricted to the separate Credential Service identity")
+    _require_token(authorization, _credential_service_token(), "HERMES_CREDENTIAL_SERVICE_TOKEN")
+
+
 def _require_bot_origin(source_channel: str) -> None:
     if source_channel not in BOT_SOURCE_CHANNELS:
         raise HTTPException(
@@ -244,6 +271,85 @@ def _integration_dict(row: Any) -> dict[str, Any]:
 
 def _target_dict(row: Any) -> dict[str, Any]:
     return _row_json(row, {"scope_json": "scope", "labels_json": "labels"})
+
+
+def _server_dict(row: Any) -> dict[str, Any]:
+    item = _row_json(row, {"labels_json": "labels", "inventory_json": "inventory"})
+    raw = item.pop("preflight_json", None)
+    item["preflight"] = json.loads(raw or "null")
+    return item
+
+
+def _validated_ip(value: str | None, field: str) -> str | None:
+    if value is None:
+        return None
+    try:
+        return str(ipaddress.ip_address(value))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=f"{field} must be a valid IPv4 or IPv6 address") from exc
+
+
+def _validate_host_fingerprint(value: str) -> str:
+    if not re.fullmatch(r"SHA256:[A-Za-z0-9+/]{20,}={0,2}", value):
+        raise HTTPException(status_code=422, detail="host_fingerprint must be an OpenSSH SHA256 fingerprint")
+    return value
+
+
+def _get_server(conn, server_id: str):
+    row = conn.execute("SELECT * FROM servers WHERE id=?", (server_id,)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="server not found")
+    return row
+
+
+def _assert_server_ips_unique(conn, management_ip: str, provisioning_ip: str | None, bmc_ip: str | None, *, exclude_id: str | None = None) -> None:
+    values = [value for value in (management_ip, provisioning_ip, bmc_ip) if value]
+    if len(values) != len(set(values)):
+        raise HTTPException(status_code=409, detail="server management/provisioning/BMC IPs must be distinct")
+    for value in values:
+        row = conn.execute(
+            "SELECT id FROM servers WHERE (management_ip=? OR provisioning_ip=? OR bmc_ip=?) AND (? IS NULL OR id<>?) LIMIT 1",
+            (value, value, value, exclude_id, exclude_id),
+        ).fetchone()
+        if row:
+            raise HTTPException(status_code=409, detail=f"server IP {value} is already registered")
+
+
+def _validate_server_credentials(conn, credential_ref: str, bmc_credential_ref: str | None) -> None:
+    ssh = _get_credential_ref(conn, credential_ref)
+    if ssh["kind"] not in {"ssh-key", "ssh-password"}:
+        raise HTTPException(status_code=422, detail="server credential_ref must reference an SSH credential")
+    if ssh["status"] != "configured":
+        raise HTTPException(status_code=409, detail="server SSH credential is not active/configured")
+    if bmc_credential_ref:
+        bmc = _get_credential_ref(conn, bmc_credential_ref)
+        if bmc["kind"] not in {"ssh-password", "token", "generic"}:
+            raise HTTPException(status_code=422, detail="bmc_credential_ref has an unsupported credential kind")
+        if bmc["status"] != "configured":
+            raise HTTPException(status_code=409, detail="server BMC credential is not active/configured")
+
+
+def _server_snapshot(conn, server_id: str) -> dict[str, Any]:
+    row = _get_server(conn, server_id)
+    server = _server_dict(row)
+    snapshot = {
+        "entity_type": "server",
+        "id": server["id"],
+        "hostname": server["hostname"],
+        "environment_id": server["environment_id"],
+        "management_ip": server["management_ip"],
+        "provisioning_ip": server["provisioning_ip"],
+        "ssh_port": server["ssh_port"],
+        "ssh_user": server["ssh_user"],
+        "host_fingerprint": server["host_fingerprint"],
+        "connection_mode": server["connection_mode"],
+        "credential_ref": server["credential_ref"],
+        "status": server["status"],
+        "credential_snapshot": _credential_snapshot(conn, server["credential_ref"]),
+        "preflight_status": server["preflight_status"],
+    }
+    snapshot["snapshot_hash"] = sha256_hex(snapshot)
+    return snapshot
 
 
 def _application_dict(row: Any) -> dict[str, Any]:
@@ -302,6 +408,8 @@ def _validate_credential_metadata(metadata: dict[str, Any]) -> None:
 def _target_snapshot(conn, target_id: str) -> dict[str, Any]:
     row = conn.execute("SELECT * FROM targets WHERE id=?", (target_id,)).fetchone()
     if not row:
+        if target_id.startswith("srv_"):
+            return _server_snapshot(conn, target_id)
         raise HTTPException(status_code=404, detail="target not found")
     target = _target_dict(row)
     snapshot = {
@@ -319,6 +427,32 @@ def _target_snapshot(conn, target_id: str) -> dict[str, Any]:
     }
     snapshot["snapshot_hash"] = sha256_hex(snapshot)
     return snapshot
+
+
+def _provider_job_dict(row: Any) -> dict[str, Any]:
+    item = dict(row)
+    item["request"] = json.loads(item.pop("request_json") or "{}")
+    item["result"] = json.loads(item.pop("result_json") or "null")
+    return item
+
+
+def _provider_job_authorization(conn, job: Any) -> Any:
+    changeset = _changeset(conn, job["changeset_id"])
+    _require_current_policy_generation(conn, changeset)
+    required_state = "APPROVED" if changeset["approval_required"] else "PREVIEWED"
+    if changeset["state"] != required_state:
+        raise HTTPException(status_code=409, detail=f"provider job requires ChangeSet state {required_state}")
+    if changeset["plan_hash"] != job["plan_hash"]:
+        raise HTTPException(status_code=409, detail="provider job plan hash no longer matches ChangeSet")
+    return changeset
+
+
+def _provider_job_event(conn, job_id: str, stage: str, status: str, message: str, evidence: dict[str, Any] | None = None) -> None:
+    _validate_credential_metadata(evidence or {})
+    conn.execute(
+        "INSERT INTO provider_job_events (job_id,stage,status,message,evidence_json,created_at) VALUES (?,?,?,?,?,?)",
+        (job_id, stage, status, message, json.dumps(evidence or {}, sort_keys=True), int(time.time())),
+    )
 
 
 def _changeset_dict(row: Any) -> dict[str, Any]:
@@ -380,6 +514,8 @@ def system() -> dict[str, Any]:
             "integrations": conn.execute("SELECT COUNT(*) FROM integrations").fetchone()[0],
             "targets": conn.execute("SELECT COUNT(*) FROM targets").fetchone()[0],
             "credential_refs": conn.execute("SELECT COUNT(*) FROM credential_refs").fetchone()[0],
+            "servers": conn.execute("SELECT COUNT(*) FROM servers").fetchone()[0],
+            "provider_jobs": conn.execute("SELECT COUNT(*) FROM provider_jobs").fetchone()[0],
             "changesets": conn.execute("SELECT COUNT(*) FROM changesets").fetchone()[0],
             "applications": conn.execute("SELECT COUNT(*) FROM applications").fetchone()[0],
             "agents": conn.execute("SELECT COUNT(*) FROM agents").fetchone()[0],
@@ -391,10 +527,12 @@ def system() -> dict[str, Any]:
         "version": VERSION,
         "stage": "development",
         "runtime": os.getenv("HERMES_RUNTIME", "docker"),
-        "capabilities": ["integration-registry", "target-registry", "application-registry", "adapter-capability-contract", "credential-references", "changeset-planning", "risk-engine", "approval-binding", "audit", "agent-enrollment", "agent-signed-task-envelope", "kubernetes-discovery", "kubernetes-server-dry-run", "kubernetes-guarded-delete", "kubernetes-rollback", "kubernetes-rollout-verification", "helm-server-dry-run", "helm-rollback", "signed-execution-tickets"],
+        "capabilities": ["integration-registry", "target-registry", "application-registry", "adapter-capability-contract", "credential-references", "server-registry", "ssh-preflight", "provider-lifecycle-contract", "bootstrap-jobs", "radar-provider-foundation", "hubble-provider-foundation", "changeset-planning", "risk-engine", "approval-binding", "audit", "agent-enrollment", "agent-signed-task-envelope", "kubernetes-discovery", "kubernetes-server-dry-run", "kubernetes-guarded-delete", "kubernetes-rollback", "kubernetes-rollout-verification", "helm-server-dry-run", "helm-rollback", "signed-execution-tickets"],
         "execution_enabled": os.getenv("HERMES_EXECUTION_ENABLED", "false").lower() == "true",
         "policy_generation": policy_generation,
         "mutation_control": {
+            "infrastructure_mutations": "bot-only-changeset",
+            "radar_hubble_mutations": "changeset-policy-approval-only",
             "kubernetes_helm": "bot-only",
             "approval": "approval-bot-only",
             "ui": "configuration-and-observability",
@@ -479,6 +617,49 @@ def delete_environment(environment_id: str, authorization: str | None = Header(d
         conn.commit()
 
 
+@app.post("/v1/internal/credential-refs/sync")
+def sync_credential_ref(payload: CredentialRefSync, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_credential_service(authorization)
+    _validate_credential_metadata(payload.metadata)
+    now = int(time.time())
+    with closing(db.connect()) as conn:
+        existing = conn.execute("SELECT * FROM credential_refs WHERE id=?", (payload.id,)).fetchone()
+        name_owner = conn.execute("SELECT id FROM credential_refs WHERE name=?", (payload.name,)).fetchone()
+        if name_owner and name_owner["id"] != payload.id:
+            raise HTTPException(status_code=409, detail="credential reference name already exists")
+        if existing:
+            conn.execute(
+                "UPDATE credential_refs SET name=?,kind=?,provider=?,status=?,metadata_json=?,updated_at=? WHERE id=?",
+                (payload.name, payload.kind, payload.provider, payload.status, json.dumps(payload.metadata, sort_keys=True), now, payload.id),
+            )
+            event = "credential_ref.synced"
+        else:
+            conn.execute(
+                "INSERT INTO credential_refs (id,name,kind,provider,status,metadata_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)",
+                (payload.id, payload.name, payload.kind, payload.provider, payload.status, json.dumps(payload.metadata, sort_keys=True), now, now),
+            )
+            event = "credential_ref.synced_created"
+        db.audit(conn, event, "credential-service", "credential_ref", payload.id, {"kind": payload.kind, "provider": payload.provider, "metadata_only": True})
+        conn.commit()
+        row = conn.execute("SELECT * FROM credential_refs WHERE id=?", (payload.id,)).fetchone()
+    return _row_json(row, {"metadata_json": "metadata"})
+
+
+@app.delete("/v1/internal/credential-refs/{credential_id}", status_code=204)
+def delete_synced_credential_ref(credential_id: str, authorization: str | None = Header(default=None)) -> None:
+    _require_credential_service(authorization)
+    with closing(db.connect()) as conn:
+        if (conn.execute("SELECT 1 FROM integrations WHERE credential_ref=? LIMIT 1", (credential_id,)).fetchone()
+                or conn.execute("SELECT 1 FROM targets WHERE credential_ref=? LIMIT 1", (credential_id,)).fetchone()
+                or conn.execute("SELECT 1 FROM servers WHERE credential_ref=? OR bmc_credential_ref=? LIMIT 1", (credential_id, credential_id)).fetchone()):
+            raise HTTPException(status_code=409, detail="credential reference is in use")
+        cur = conn.execute("DELETE FROM credential_refs WHERE id=?", (credential_id,))
+        if not cur.rowcount:
+            raise HTTPException(status_code=404, detail="credential reference not found")
+        db.audit(conn, "credential_ref.synced_deleted", "credential-service", "credential_ref", credential_id, {"metadata_only": True})
+        conn.commit()
+
+
 @app.get("/v1/credential-refs")
 def list_credential_refs() -> list[dict[str, Any]]:
     with closing(db.connect()) as conn:
@@ -556,7 +737,9 @@ def rotate_credential_ref(credential_id: str, payload: CredentialRefUpdate, auth
 def delete_credential_ref(credential_id: str, authorization: str | None = Header(default=None)) -> None:
     _require_admin(authorization)
     with closing(db.connect()) as conn:
-        if conn.execute("SELECT 1 FROM integrations WHERE credential_ref=? LIMIT 1", (credential_id,)).fetchone() or conn.execute("SELECT 1 FROM targets WHERE credential_ref=? LIMIT 1", (credential_id,)).fetchone():
+        if (conn.execute("SELECT 1 FROM integrations WHERE credential_ref=? LIMIT 1", (credential_id,)).fetchone()
+                or conn.execute("SELECT 1 FROM targets WHERE credential_ref=? LIMIT 1", (credential_id,)).fetchone()
+                or conn.execute("SELECT 1 FROM servers WHERE credential_ref=? OR bmc_credential_ref=? LIMIT 1", (credential_id, credential_id)).fetchone()):
             raise HTTPException(status_code=409, detail="credential reference is in use")
         cur = conn.execute("DELETE FROM credential_refs WHERE id=?", (credential_id,))
         if not cur.rowcount:
@@ -685,10 +868,8 @@ def issue_agent_task(agent_id: str, payload: AgentTaskCreate, authorization: str
 
         changeset = _changeset(conn, payload.changeset_id)
         _require_current_policy_generation(conn, changeset)
-        target = conn.execute("SELECT * FROM targets WHERE id=?", (changeset["target_id"],)).fetchone()
-        if not target:
-            raise HTTPException(status_code=404, detail="ChangeSet target not found")
-        if target["connection_mode"] != "agent":
+        target_snapshot = _target_snapshot(conn, changeset["target_id"])
+        if target_snapshot.get("connection_mode") != "agent":
             raise HTTPException(status_code=409, detail="ChangeSet target is not configured for agent execution")
         if capability["adapter"] != changeset["adapter"]:
             raise HTTPException(status_code=409, detail="capability adapter does not match ChangeSet adapter")
@@ -915,6 +1096,373 @@ async def test_integration_health(integration_id: str, authorization: str | None
         db.audit(conn, "integration.health", "admin", "integration", integration_id, {"status": status, "detail": detail, "http_status": code})
         conn.commit()
     return {"integration_id": integration_id, "status": status, "detail": detail, "http_status": code, "tested_at": now, "credential_used": False}
+
+
+@app.get("/v1/providers")
+def list_providers() -> list[dict[str, Any]]:
+    return [{"id": provider_id, **spec} for provider_id, spec in sorted(PROVIDERS.items())]
+
+
+@app.get("/v1/providers/{provider_id}")
+def get_provider(provider_id: str) -> dict[str, Any]:
+    item = provider_descriptor(provider_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="provider not found")
+    return item
+
+
+@app.get("/v1/preflight/ssh/spec")
+def ssh_preflight_spec() -> dict[str, Any]:
+    return host_preflight.spec()
+
+
+@app.get("/v1/servers")
+def list_servers() -> list[dict[str, Any]]:
+    with closing(db.connect()) as conn:
+        rows = conn.execute("SELECT * FROM servers ORDER BY hostname").fetchall()
+    return [_server_dict(row) for row in rows]
+
+
+@app.get("/v1/servers/{server_id}")
+def get_server(server_id: str) -> dict[str, Any]:
+    with closing(db.connect()) as conn:
+        row = _get_server(conn, server_id)
+    return _server_dict(row)
+
+
+@app.post("/v1/servers", status_code=201)
+def create_server(payload: ServerCreate, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_admin(authorization)
+    management_ip = _validated_ip(payload.management_ip, "management_ip")
+    provisioning_ip = _validated_ip(payload.provisioning_ip, "provisioning_ip")
+    bmc_ip = _validated_ip(payload.bmc_ip, "bmc_ip")
+    host_fingerprint = _validate_host_fingerprint(payload.host_fingerprint)
+    server_id = f"srv_{uuid.uuid4().hex[:16]}"
+    now = int(time.time())
+    with closing(db.connect()) as conn:
+        _get_environment(conn, payload.environment_id)
+        _validate_server_credentials(conn, payload.credential_ref, payload.bmc_credential_ref)
+        _assert_server_ips_unique(conn, management_ip, provisioning_ip, bmc_ip)
+        try:
+            conn.execute(
+                """INSERT INTO servers
+                (id,hostname,environment_id,management_ip,provisioning_ip,bmc_ip,ssh_port,ssh_user,host_fingerprint,connection_mode,credential_ref,bmc_credential_ref,architecture,site,rack,zone,labels_json,status,created_at,updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (server_id, payload.hostname, payload.environment_id, management_ip, provisioning_ip, bmc_ip,
+                 payload.ssh_port, payload.ssh_user, host_fingerprint, payload.connection_mode, payload.credential_ref,
+                 payload.bmc_credential_ref, payload.architecture, payload.site, payload.rack, payload.zone,
+                 json.dumps(payload.labels, sort_keys=True), "configured", now, now),
+            )
+            db.audit(conn, "server.created", "admin", "server", server_id, {
+                "hostname": payload.hostname, "management_ip": management_ip, "credential_ref": payload.credential_ref,
+            })
+            conn.commit()
+        except Exception as exc:
+            if "UNIQUE" in str(exc):
+                raise HTTPException(status_code=409, detail="server hostname or IP is already registered") from exc
+            raise
+        row = _get_server(conn, server_id)
+    return _server_dict(row)
+
+
+@app.patch("/v1/servers/{server_id}")
+def update_server(server_id: str, payload: ServerUpdate, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_admin(authorization)
+    updates = payload.model_dump(exclude_unset=True)
+    if not updates:
+        raise HTTPException(status_code=400, detail="no fields supplied")
+    with closing(db.connect()) as conn:
+        current = _get_server(conn, server_id)
+        if "environment_id" in updates:
+            _get_environment(conn, updates["environment_id"])
+        credential_ref = updates.get("credential_ref", current["credential_ref"])
+        bmc_credential_ref = updates.get("bmc_credential_ref", current["bmc_credential_ref"])
+        _validate_server_credentials(conn, credential_ref, bmc_credential_ref)
+        for field in ("management_ip", "provisioning_ip", "bmc_ip"):
+            if field in updates:
+                updates[field] = _validated_ip(updates[field], field)
+        if "host_fingerprint" in updates:
+            updates["host_fingerprint"] = _validate_host_fingerprint(updates["host_fingerprint"])
+        management_ip = updates.get("management_ip", current["management_ip"])
+        provisioning_ip = updates.get("provisioning_ip", current["provisioning_ip"])
+        bmc_ip = updates.get("bmc_ip", current["bmc_ip"])
+        _assert_server_ips_unique(conn, management_ip, provisioning_ip, bmc_ip, exclude_id=server_id)
+        if "labels" in updates:
+            updates["labels_json"] = json.dumps(updates.pop("labels"), sort_keys=True)
+        updates["updated_at"] = int(time.time())
+        fields = list(updates)
+        try:
+            conn.execute(f"UPDATE servers SET {', '.join(f'{f}=?' for f in fields)} WHERE id=?", (*[updates[f] for f in fields], server_id))
+        except Exception as exc:
+            if "UNIQUE" in str(exc):
+                raise HTTPException(status_code=409, detail="server hostname or IP is already registered") from exc
+            raise
+        db.audit(conn, "server.updated", "admin", "server", server_id, {"fields": fields})
+        conn.commit()
+        row = _get_server(conn, server_id)
+    return _server_dict(row)
+
+
+@app.delete("/v1/servers/{server_id}", status_code=204)
+def delete_server(server_id: str, authorization: str | None = Header(default=None)) -> None:
+    _require_admin(authorization)
+    with closing(db.connect()) as conn:
+        _get_server(conn, server_id)
+        if conn.execute("SELECT 1 FROM changesets WHERE target_id=? AND state NOT IN ('REJECTED','CANCELLED','EXPIRED','EXECUTED','FAILED','POLICY_DENIED','PREVIEW_FAILED','STALE_POLICY') LIMIT 1", (server_id,)).fetchone():
+            raise HTTPException(status_code=409, detail="server has active ChangeSets")
+        if conn.execute("SELECT 1 FROM provider_jobs WHERE server_id=? AND state NOT IN ('SUCCEEDED','FAILED','CANCELLED') LIMIT 1", (server_id,)).fetchone():
+            raise HTTPException(status_code=409, detail="server has active provider jobs")
+        conn.execute("DELETE FROM provider_job_events WHERE job_id IN (SELECT id FROM provider_jobs WHERE server_id=?)", (server_id,))
+        conn.execute("DELETE FROM provider_jobs WHERE server_id=?", (server_id,))
+        conn.execute("DELETE FROM servers WHERE id=?", (server_id,))
+        db.audit(conn, "server.deleted", "admin", "server", server_id)
+        conn.commit()
+
+
+@app.post("/v1/servers/{server_id}/preflight-plan", status_code=201)
+def create_server_preflight_plan(server_id: str, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_admin(authorization)
+    with closing(db.connect()) as conn:
+        server = _get_server(conn, server_id)
+        if server["status"] != "configured":
+            raise HTTPException(status_code=409, detail="server is disabled")
+        _validate_server_credentials(conn, server["credential_ref"], server["bmc_credential_ref"])
+        row = _insert_changeset(
+            conn, operation="discover.ssh.preflight", adapter="ssh", target_id=server_id,
+            requested_by="admin:preflight", source_channel="api", source_revision=None,
+            parameters={"preflight_spec": host_preflight.spec(), "credential_ref": server["credential_ref"], "host_fingerprint": server["host_fingerprint"]},
+            policy_generation=db.get_policy_generation(conn), ttl_seconds=900,
+        )
+        preview = {"summary": f"Read-only SSH preflight for {server['hostname']}", "details": {"checks": [x["id"] for x in host_preflight.CHECKS]}, "generated_at": int(time.time()), "source": "deterministic-preflight-planner"}
+        conn.execute("UPDATE changesets SET preview_json=?,state='PREVIEWED',updated_at=? WHERE id=?", (json.dumps(preview, sort_keys=True), int(time.time()), row["id"]))
+        job_id = f"job_{uuid.uuid4().hex[:16]}"
+        conn.execute("INSERT INTO provider_jobs (id,provider_id,server_id,changeset_id,operation,state,stage,attempt,max_attempts,plan_hash,request_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                     (job_id, "ssh", server_id, row["id"], "discover.ssh.preflight", "READY", "discover", 1, 3, row["plan_hash"], json.dumps({"spec": host_preflight.spec()}, sort_keys=True), int(time.time()), int(time.time())))
+        _provider_job_event(conn, job_id, "discover", "READY", "Deterministic SSH preflight plan is ready for constrained execution")
+        db.audit(conn, "server.preflight_planned", "admin", "server", server_id, {"changeset_id": row["id"], "job_id": job_id, "plan_hash": row["plan_hash"]})
+        conn.commit()
+        updated = conn.execute("SELECT * FROM changesets WHERE id=?", (row["id"],)).fetchone()
+    return {"changeset": _changeset_dict(updated), "provider_job_id": job_id, "capability": "ssh.preflight", "execution": "agent-task" if server["connection_mode"] == "agent" else "ssh-provider-worker"}
+
+
+@app.post("/v1/servers/{server_id}/preflight-result")
+def record_server_preflight_result(server_id: str, payload: ServerPreflightResult, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    # Results are metadata/facts only; raw credential-shaped evidence is rejected.
+    _require_admin(authorization)
+    _validate_credential_metadata(payload.facts)
+    for check in payload.checks:
+        _validate_credential_metadata(check)
+    now = int(time.time())
+    body = payload.model_dump()
+    with closing(db.connect()) as conn:
+        _get_server(conn, server_id)
+        job = conn.execute("SELECT * FROM provider_jobs WHERE id=?", (payload.provider_job_id,)).fetchone()
+        if not job or job["server_id"] != server_id or job["operation"] != "discover.ssh.preflight":
+            raise HTTPException(status_code=409, detail="preflight result must reference this server's SSH preflight provider job")
+        _provider_job_authorization(conn, job)
+        if job["state"] not in {"READY", "RUNNING"}:
+            raise HTTPException(status_code=409, detail=f"preflight provider job cannot complete from state {job['state']}")
+        job_state = "FAILED" if payload.status == "FAIL" else "SUCCEEDED"
+        conn.execute("UPDATE provider_jobs SET state=?,stage='verify',result_json=?,updated_at=? WHERE id=?",
+                     (job_state, json.dumps(body, sort_keys=True), now, payload.provider_job_id))
+        _provider_job_event(conn, payload.provider_job_id, "verify", payload.status, payload.summary, {"checks": payload.checks, "facts": payload.facts})
+        conn.execute("UPDATE servers SET preflight_status=?,preflight_json=?,inventory_json=?,discovery_status=?,last_preflight_at=?,updated_at=? WHERE id=?",
+                     (payload.status, json.dumps(body, sort_keys=True), json.dumps(payload.facts, sort_keys=True), "DISCOVERED" if payload.status != "FAIL" else "FAILED", now, now, server_id))
+        db.audit(conn, "server.preflight_recorded", "admin", "server", server_id, {"status": payload.status, "summary": payload.summary, "provider_job_id": payload.provider_job_id})
+        conn.commit()
+        row = _get_server(conn, server_id)
+    return _server_dict(row)
+
+
+@app.post("/v1/servers/{server_id}/bootstrap-plan", status_code=201)
+def create_bootstrap_plan(server_id: str, payload: BootstrapPlanCreate, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_bot(authorization)
+    _require_bot_origin(payload.source_channel)
+    provider = provider_descriptor(payload.provider)
+    if not provider or provider.get("kind") != "cluster-bootstrap":
+        raise HTTPException(status_code=422, detail="unsupported bootstrap provider")
+    with closing(db.connect()) as conn:
+        server = _get_server(conn, server_id)
+        if server["status"] != "configured":
+            raise HTTPException(status_code=409, detail="server is disabled")
+        _validate_server_credentials(conn, server["credential_ref"], server["bmc_credential_ref"])
+        if server["preflight_status"] != "PASS":
+            raise HTTPException(status_code=409, detail="server must have PASS preflight status before bootstrap planning")
+        params = {
+            "provider": payload.provider,
+            "cluster_name": payload.cluster_name,
+            "kubernetes_version": payload.kubernetes_version,
+            "node_role": payload.node_role,
+            "network_plugin": payload.network_plugin,
+            "hubble_enabled": payload.hubble_enabled,
+            "radar_enabled": payload.radar_enabled,
+            "server_id": server_id,
+            "credential_ref": server["credential_ref"],
+            "provider_parameters": payload.parameters,
+            "lifecycle": provider["lifecycle"],
+        }
+        row = _insert_changeset(
+            conn, operation="bootstrap.apply", adapter="bootstrap", target_id=server_id,
+            requested_by=payload.requested_by, source_channel=payload.source_channel, source_revision=None,
+            parameters=params, policy_generation=db.get_policy_generation(conn), ttl_seconds=payload.ttl_seconds,
+        )
+        preview = {
+            "summary": f"Bootstrap {payload.cluster_name} on {server['hostname']} with {payload.provider}",
+            "details": {"provider": payload.provider, "stages": provider["lifecycle"], "radar": payload.radar_enabled, "hubble": payload.hubble_enabled, "mutation_gate": "ChangeSet approval required"},
+            "generated_at": int(time.time()), "source": "deterministic-bootstrap-planner",
+        }
+        conn.execute("UPDATE changesets SET preview_json=?,state='PREVIEWED',updated_at=? WHERE id=?", (json.dumps(preview, sort_keys=True), int(time.time()), row["id"]))
+        job_id = f"job_{uuid.uuid4().hex[:16]}"
+        now = int(time.time())
+        conn.execute("INSERT INTO provider_jobs (id,provider_id,server_id,changeset_id,operation,state,stage,attempt,max_attempts,plan_hash,request_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                     (job_id, payload.provider, server_id, row["id"], "bootstrap.apply", "WAITING_APPROVAL", "plan", 1, 3, row["plan_hash"], json.dumps(params, sort_keys=True), now, now))
+        _provider_job_event(conn, job_id, "plan", "WAITING_APPROVAL", "Bootstrap job is blocked on the bound ChangeSet approval")
+        db.audit(conn, "bootstrap.planned", payload.requested_by, "provider_job", job_id, {"changeset_id": row["id"], "provider": payload.provider, "plan_hash": row["plan_hash"]})
+        conn.commit()
+        updated = conn.execute("SELECT * FROM changesets WHERE id=?", (row["id"],)).fetchone()
+    return {"changeset": _changeset_dict(updated), "provider_job_id": job_id, "provider": provider, "execution": "blocked-until-approved-agent-task"}
+
+
+@app.get("/v1/provider-jobs")
+def list_provider_jobs(authorization: str | None = Header(default=None)) -> list[dict[str, Any]]:
+    _require_admin(authorization)
+    with closing(db.connect()) as conn:
+        rows = conn.execute("SELECT * FROM provider_jobs ORDER BY created_at DESC,id DESC").fetchall()
+    return [_provider_job_dict(row) for row in rows]
+
+
+@app.post("/v1/provider-jobs/{job_id}/authorize")
+def authorize_provider_job(job_id: str, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_bot(authorization)
+    now = int(time.time())
+    with closing(db.connect()) as conn:
+        job = conn.execute("SELECT * FROM provider_jobs WHERE id=?", (job_id,)).fetchone()
+        if not job:
+            raise HTTPException(status_code=404, detail="provider job not found")
+        if job["state"] != "WAITING_APPROVAL":
+            raise HTTPException(status_code=409, detail="provider job is not waiting for approval")
+        changeset = _provider_job_authorization(conn, job)
+        conn.execute("UPDATE provider_jobs SET state='READY',stage='apply',updated_at=? WHERE id=?", (now, job_id))
+        _provider_job_event(conn, job_id, "apply", "AUTHORIZED", "Exact approved ChangeSet hash authorized provider job")
+        db.audit(conn, "provider_job.authorized", "hermes-bot", "provider_job", job_id, {"changeset_id": changeset["id"], "plan_hash": job["plan_hash"]})
+        conn.commit()
+        job = conn.execute("SELECT * FROM provider_jobs WHERE id=?", (job_id,)).fetchone()
+    return _provider_job_dict(job)
+
+
+@app.get("/v1/provider-jobs/{job_id}")
+def get_provider_job(job_id: str, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_admin(authorization)
+    with closing(db.connect()) as conn:
+        row = conn.execute("SELECT * FROM provider_jobs WHERE id=?", (job_id,)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="provider job not found")
+    return _provider_job_dict(row)
+
+
+@app.get("/v1/provider-jobs/{job_id}/events")
+def list_provider_job_events(job_id: str, after_id: int = Query(default=0, ge=0), authorization: str | None = Header(default=None)) -> list[dict[str, Any]]:
+    _require_admin(authorization)
+    with closing(db.connect()) as conn:
+        if not conn.execute("SELECT 1 FROM provider_jobs WHERE id=?", (job_id,)).fetchone():
+            raise HTTPException(status_code=404, detail="provider job not found")
+        rows = conn.execute("SELECT * FROM provider_job_events WHERE job_id=? AND id>? ORDER BY id", (job_id, after_id)).fetchall()
+    return [{**dict(row), "evidence": json.loads(row["evidence_json"] or "{}"), "evidence_json": None} for row in rows]
+
+
+@app.post("/v1/provider-jobs/{job_id}/transition")
+def transition_provider_job(job_id: str, payload: ProviderJobTransition, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_bot(authorization)
+    _validate_credential_metadata(payload.evidence)
+    allowed = {
+        "READY": {"RUNNING", "FAILED"},
+        "RUNNING": {"RUNNING", "PAUSED", "SUCCEEDED", "FAILED"},
+        "PAUSED": set(),
+        "WAITING_APPROVAL": set(),
+        "FAILED": set(),
+        "SUCCEEDED": set(),
+        "CANCELLED": set(),
+    }
+    with closing(db.connect()) as conn:
+        job = conn.execute("SELECT * FROM provider_jobs WHERE id=?", (job_id,)).fetchone()
+        if not job:
+            raise HTTPException(status_code=404, detail="provider job not found")
+        _provider_job_authorization(conn, job)
+        if payload.state not in allowed.get(job["state"], set()):
+            raise HTTPException(status_code=409, detail=f"provider job cannot transition from {job['state']} to {payload.state}")
+        now = int(time.time())
+        result_json = job["result_json"]
+        if payload.state in {"SUCCEEDED", "FAILED"}:
+            result_json = json.dumps({"state": payload.state, "stage": payload.stage, "message": payload.message, "evidence": payload.evidence, "completed_at": now}, sort_keys=True)
+        conn.execute("UPDATE provider_jobs SET state=?,stage=?,result_json=?,updated_at=? WHERE id=?", (payload.state, payload.stage, result_json, now, job_id))
+        _provider_job_event(conn, job_id, payload.stage, payload.state, payload.message, payload.evidence)
+        db.audit(conn, "provider_job.transitioned", "hermes-bot", "provider_job", job_id, {"from": job["state"], "to": payload.state, "stage": payload.stage, "attempt": int(job["attempt"])})
+        conn.commit()
+        updated = conn.execute("SELECT * FROM provider_jobs WHERE id=?", (job_id,)).fetchone()
+    return _provider_job_dict(updated)
+
+
+def _retry_or_resume_provider_job(job_id: str, payload: ProviderJobRetry, authorization: str | None, *, resume: bool) -> dict[str, Any]:
+    _require_bot(authorization)
+    with closing(db.connect()) as conn:
+        job = conn.execute("SELECT * FROM provider_jobs WHERE id=?", (job_id,)).fetchone()
+        if not job:
+            raise HTTPException(status_code=404, detail="provider job not found")
+        expected = "PAUSED" if resume else "FAILED"
+        if job["state"] != expected:
+            raise HTTPException(status_code=409, detail=f"provider job must be {expected} to {'resume' if resume else 'retry'}")
+        _provider_job_authorization(conn, job)
+        attempt = int(job["attempt"]) if resume else int(job["attempt"]) + 1
+        if attempt > int(job["max_attempts"]):
+            raise HTTPException(status_code=409, detail="provider job retry limit reached")
+        now = int(time.time())
+        conn.execute("UPDATE provider_jobs SET state='READY',attempt=?,result_json=NULL,updated_at=? WHERE id=?", (attempt, now, job_id))
+        status = "RESUMED" if resume else "RETRY"
+        _provider_job_event(conn, job_id, job["stage"], status, payload.reason, {"attempt": attempt})
+        db.audit(conn, f"provider_job.{status.lower()}", "hermes-bot", "provider_job", job_id, {"attempt": attempt, "reason": payload.reason})
+        conn.commit()
+        updated = conn.execute("SELECT * FROM provider_jobs WHERE id=?", (job_id,)).fetchone()
+    return _provider_job_dict(updated)
+
+
+@app.post("/v1/provider-jobs/{job_id}/retry")
+def retry_provider_job(job_id: str, payload: ProviderJobRetry, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    return _retry_or_resume_provider_job(job_id, payload, authorization, resume=False)
+
+
+@app.post("/v1/provider-jobs/{job_id}/resume")
+def resume_provider_job(job_id: str, payload: ProviderJobRetry, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    return _retry_or_resume_provider_job(job_id, payload, authorization, resume=True)
+
+
+@app.get("/v1/provider-jobs/{job_id}/stream")
+async def stream_provider_job(job_id: str, request: Request, after_id: int = Query(default=0, ge=0), authorization: str | None = Header(default=None)):
+    _require_admin(authorization)
+    with closing(db.connect()) as conn:
+        if not conn.execute("SELECT 1 FROM provider_jobs WHERE id=?", (job_id,)).fetchone():
+            raise HTTPException(status_code=404, detail="provider job not found")
+
+    async def event_stream():
+        cursor = after_id
+        while True:
+            if await request.is_disconnected():
+                return
+            with closing(db.connect()) as conn:
+                rows = conn.execute("SELECT * FROM provider_job_events WHERE job_id=? AND id>? ORDER BY id", (job_id, cursor)).fetchall()
+                job = conn.execute("SELECT state,stage,attempt,updated_at FROM provider_jobs WHERE id=?", (job_id,)).fetchone()
+            for row in rows:
+                cursor = int(row["id"])
+                event = {**dict(row), "evidence": json.loads(row["evidence_json"] or "{}")}
+                event.pop("evidence_json", None)
+                yield f"id: {cursor}\nevent: provider-job\ndata: {json.dumps(event, sort_keys=True)}\n\n"
+            if job and job["state"] in {"SUCCEEDED", "FAILED", "CANCELLED"}:
+                yield f"event: end\ndata: {json.dumps(dict(job), sort_keys=True)}\n\n"
+                return
+            if not rows:
+                yield ": heartbeat\n\n"
+            await asyncio.sleep(1.0)
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream", headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
 
 
 @app.get("/v1/targets")

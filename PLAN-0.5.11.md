@@ -1,216 +1,100 @@
-# Hermes Control Plane — v0.5.11 Completion Plan
+# Hermes Control Plane — v0.5.11 Compressed Completion Plan
 
-**Target:** `0.5.11`
+**Target:** `0.5.11`  
+**Development branch:** `dev/0.5.11`  
+**Stable release already complete:** `v0.5.10` — do not redo  
+**Clean dev.1 baseline:** `1764cad667717ec78156af8f9f3fcc30eb84c1f5` — do not redo  
+**Draft PR:** `#2` — keep Draft until explicitly requested otherwise
 
-**Development line:** `dev/0.5.11`
+## Security invariant
 
-**Base:** published stable `v0.5.10` at `e73dd7c69767e709fb944a6356e47776a4464d92`
+Every infrastructure mutation remains:
 
-## Goal
+`intent -> typed plan -> ChangeSet -> deterministic preview -> risk -> policy -> approval -> exact-hash binding -> constrained broker/agent/provider -> verification -> audit`
 
-Finish the remaining planned product surface without weakening the v0.5.10 trust model. v0.5.11 is a completion and hardening release, not an unrestricted-shell expansion.
+Raw infrastructure credentials never enter Smart Router, Hermes/LLM prompts, or normal Control Plane responses. Radar/Hubble are first-class intelligence providers but never governance bypasses. `kubectl-aban-plugin` is not a runtime dependency; only useful ideas/checks may be reimplemented natively.
 
-All mutating operations continue to follow:
+## 0.5.11-dev.1 — shared substrate
 
-`request -> resolve references -> typed ChangeSet -> validate -> preview -> risk -> policy -> approval -> exact-hash binding -> broker/agent execution -> verify -> rollback -> audit`
+**Status: COMPLETE / DO NOT REDO**
 
-## Release rules
+Baseline commit: `1764cad667717ec78156af8f9f3fcc30eb84c1f5`.
 
-1. Preserve all v0.5.10 security invariants and stable API behavior unless a migration is documented.
-2. Prefer shared primitives over provider-specific implementations.
-3. Every new mutation capability must declare its risk, credential class, connection mode, reversibility, approval behavior, and target restrictions.
-4. No new adapter may bypass ChangeSet/policy/approval/audit.
-5. No raw secrets may be returned to LLM-facing or normal management APIs.
-6. `v0.5.10` is immutable. Any defect is fixed forward in `0.5.11`.
+Includes shared application/adapter substrate, signed agent-task envelopes, replay protection, policy-generation binding, and existing v0.5.10 trust controls.
 
-## Workstream 1 — shared product substrate
+## 0.5.11-dev.2 — trust + bootstrap foundation
 
-**Milestone:** `0.5.11-dev.1`
+**Status: implementation complete in this handoff; validate/apply/push on `dev/0.5.11`.**
 
-- Application registry and CRUD.
-- Shared adapter capability contract and discovery endpoint.
-- Agent capability enforcement.
-- Signed agent task envelope foundation.
-- One-time task claim/replay protection.
-- Policy-generation binding for agent tasks.
-- Audit events for application and agent-task lifecycle.
-- 0.5.11 plan/checkpoint/release-gate scaffolding.
+### Credential boundary
 
-Exit gate:
-- existing v0.5.10 tests stay green;
-- new substrate tests pass;
-- no raw secret or unrestricted execution path is introduced.
+- dedicated Credential Service process/trust boundary;
+- Fernet encrypted-at-rest local backend;
+- external references for Kubernetes/External Secrets/Vault/AWS/Azure/GCP secret managers;
+- Kubernetes, SSH, token, registry and generic credential classes;
+- create, rotate, revoke, delete, safe test and metadata-sync lifecycle;
+- redacted management responses and raw-secret-shaped metadata rejection;
+- metadata-only Control Plane synchronization;
+- reference-delete safety and audited lifecycle;
+- fail-closed create/rotate/revoke/delete synchronization behavior.
 
-## Workstream 2 — credential service completion
+### Server Registry
 
-**Milestone:** `0.5.11-dev.2`
+- environment/site/rack/zone/labels;
+- management/provisioning/BMC addresses with duplicate-IP protection;
+- SSH user/port and pinned OpenSSH SHA256 host fingerprint;
+- SSH and optional BMC credential references;
+- credential kind/status validation;
+- discovered inventory and preflight status/facts.
 
-- Dedicated credential-service boundary.
-- Encrypted local/volume backend for self-hosted installations.
-- Kubernetes Secret / External Secrets reference backend.
-- Vault-compatible reference backend.
-- Cloud secret-manager provider interface.
-- Create/rotate/delete/test operations through constrained adapters.
-- SSH and Kubernetes credential lifecycle through the credential boundary.
-- Provider credential redaction tests.
-- Rotation/revocation audit evidence.
+### SSH / host preflight
 
-Exit gate:
-- raw secret retrieval is impossible through normal Control Plane APIs;
-- credential operations require admin boundary and are fully audited;
-- Smart Router/LLM-facing services never receive storage-master credentials.
+- deterministic, product-coded read-only preflight contract;
+- SSH/session connectivity, sudo/root, OS, CPU/RAM, disks, NIC/routes, DNS/NTP, kernel/modules, ports, runtime/Kubernetes detection, filesystem and hostname checks;
+- pinned-host-fingerprint requirement;
+- READ ChangeSet and exact target snapshot binding;
+- agent execution path plus direct-SSH provider-worker foundation;
+- preflight result metadata bound to its provider job; secret-shaped evidence rejected.
 
-## Workstream 3 — infrastructure adapters
+### Provider/bootstrap foundation
 
-**Milestone:** `0.5.11-dev.3`
+- generic `discover/validate/plan/apply/verify/upgrade/rollback/destroy` provider lifecycle;
+- Kubespray, K3s and RKE2 bootstrap provider descriptors;
+- deterministic HIGH-risk bootstrap ChangeSets;
+- PASS-preflight prerequisite;
+- provider jobs blocked on required ChangeSet approval;
+- exact plan-hash/policy-generation authorization checks;
+- ordered stage/log events, SSE stream, pause/resume and bounded retry foundation;
+- Radar and Hubble first-class provider contracts with no governance bypass;
+- Hubble authorization/redaction/aggregation required before AI/UI exposure.
 
-### Kubernetes + Helm completion
-- richer namespace/resource allow/deny policy;
-- rollout restart/scale/delete/undo;
-- rollback metadata and verification;
-- agent-mode Kubernetes execution;
-- Helm repository/OCI metadata, discovery, values preview, template, install, upgrade, rollback, uninstall.
+### Image publication
 
-### Docker + Compose
-- list/inspect/logs;
-- restart and image pull;
-- structured container deployment;
-- guarded delete;
-- Compose validate/preview/pull/up/restart/down;
-- Docker socket remains broker/agent-only.
+Canonical production image path remains:
 
-### Swarm
-- cluster/service/stack discovery;
-- stack deploy;
-- service scale/update;
-- rollback;
-- guarded stack remove.
+`git push/tag -> GitHub Actions -> multi-arch Buildx -> user's Docker Hub`
 
-### SSH
-- profile CRUD in Operations Center/API;
-- host fingerprint verification;
-- credential rotation/reference lifecycle;
-- enable/disable/delete;
-- structured runbook execution only; no arbitrary unrestricted shell endpoint.
+GitHub Actions uses `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` GitHub Secrets and builds every Hermes image including Credential Service. Local `push.sh` pushes source/commits/tags only and never publishes production images.
 
-Exit gate:
-- all mutations are ChangeSet-driven;
-- HIGH/CRITICAL behavior follows policy/approval defaults;
-- rollback/verification evidence is captured where supported.
+## 0.5.11-dev.3 — cluster factory + core infrastructure
 
-## Workstream 4 — GitHub, GitLab, Applications and GitOps
+Next milestone only after dev.2 is applied and CI-validated:
 
-**Milestone:** `0.5.11-dev.4`
+- ClusterBlueprint/ClusterProfile/Cluster lifecycle;
+- production Kubespray, lab/edge K3s, hardened RKE2;
+- Cilium + Hubble;
+- Radar Kubernetes intelligence;
+- storage, ingress, TLS, GitOps, observability, cost, backup and core day-2;
+- useful diagnostics inspired by Aban implemented natively where valuable.
 
-- GitHub repository/branch/commit discovery.
-- GitHub branch creation, controlled file changes, PR creation, check inspection, policy-gated merge.
-- GitLab project/branch/commit discovery.
-- GitLab branch creation, controlled file changes, MR creation, pipeline inspection/trigger.
-- Application registry wired to source/target/deployment metadata.
-- GitOps mode converts production mutations into controlled Git changes + PR/MR.
-- deployment verification and rollback metadata.
-- prefer GitHub App and minimum-scope GitLab credentials.
+## 0.5.11-dev.4 — operations center + next-deploy infrastructure
 
-Exit gate:
-- production GitOps flow can produce an auditable PR/MR without exposing repository credentials to the LLM;
-- merge remains policy-gated.
+- Web UI, Telegram and AI Operations;
+- multi-cluster and advanced day-2;
+- empty-disk bare metal, PXE/iPXE, Redfish/BMC, IPMI, BIOS and switch configuration;
+- VMware, OpenStack, AWS, Azure, GCP;
+- full air-gap artifact mirroring and advanced recovery/decommission.
 
-## Workstream 5 — agent protocol + ChatOps completion
+## Release path
 
-**Milestone:** `0.5.11-dev.5`
-
-### Node Agent
-- enrollment token and device identity lifecycle;
-- device certificate interface;
-- heartbeat and capability advertisement;
-- signed task envelopes;
-- replay protection;
-- policy-generation checks;
-- execution-event stream model;
-- revocation;
-- target/capability enforcement.
-
-### Telegram
-- Hermes Bot: discovery, planning, status, read operations, ChangeSet creation.
-- Approval Bot: exact plan display, approve-once, deny, expiry-bound decision.
-- ChangeSet-driven execution and verification.
-- secrets rejected from normal Telegram setup paths.
-
-Exit gate:
-- Approval Bot identity remains isolated from execution identity;
-- task/approval replay is rejected;
-- stale policy/hash changes fail closed.
-
-## Workstream 6 — routing, UI and CLI completion
-
-**Milestone:** `0.5.11-dev.6`
-
-### Routing
-- generic OpenAI-compatible provider adapter;
-- LiteLLM-compatible endpoint adapter;
-- custom provider plugin contract;
-- equivalent provider metadata/readiness contract;
-- provider switching without Git branches or credential exposure.
-
-### Operations Center
-- Applications, Changes, Deployments, Infrastructure, Integrations, Agents, Approvals, Audit, AI Routing, Settings navigation.
-- landing-page priority for pending changes, failed deployments, unhealthy targets, recent approvals and integration health.
-
-### hermesctl
-- `integration list`;
-- `agent enroll`;
-- application/acceptance helper commands where useful;
-- preserve init/up/down/status/router/backup/restore/doctor behavior.
-
-Exit gate:
-- Docker and Kubernetes deployment modes expose equivalent product APIs for these surfaces.
-
-## Workstream 7 — acceptance and release
-
-**Milestone:** `0.5.11-rc.1` -> `0.5.11`
-
-Automate and save evidence for:
-
-- clean Docker Compose install;
-- clean Helm/Kubernetes install;
-- 9router, OmniRoute and generic OpenAI-compatible provider selection;
-- provider credential isolation;
-- Integration + Application CRUD audit;
-- Kubernetes and SSH credential lifecycle;
-- Kubernetes, Helm, Docker, Compose and Swarm ChangeSet enforcement;
-- production HIGH approval;
-- CRITICAL two-person approval;
-- exact-hash/policy-generation stale invalidation;
-- one-time Telegram approval;
-- agent task replay/stale-policy rejection;
-- Docker socket isolation;
-- raw kubeconfig/private key/token retrieval denial;
-- Docker -> Kubernetes API-equivalence/migration;
-- v0.5.10 -> v0.5.11 upgrade, backup, rollback, restore, re-upgrade;
-- broker/agent/network-loss failure injection;
-- single-active SQLite failover posture;
-- audit export/retention;
-- amd64 + arm64 candidate and stable images.
-
-Stable release only after all mandatory gates are PASS.
-
-## Explicitly deferred beyond 0.5.11
-
-The original broad non-goals remain deferred so this release can actually finish:
-
-- Terraform;
-- Ansible;
-- broad AWS/Azure/GCP resource management;
-- Proxmox/VMware full management;
-- database administration;
-- network-device configuration.
-
-They should later use the same capability/ChangeSet/policy/approval framework.
-
-## Fast path
-
-The compressed route is:
-
-`dev.1 shared substrate -> dev.2 credentials -> dev.3 infra adapters -> dev.4 GitOps -> dev.5 agent/ChatOps -> dev.6 routing/UI/CLI -> rc.1 full acceptance -> stable 0.5.11`
-
-Do not create separate RCs per feature. Create another RC only if `rc.1` acceptance uncovers release-blocking defects.
+`dev.1 complete -> dev.2 trust/bootstrap -> dev.3 cluster factory/core infra -> dev.4 operations/next-deploy infra -> 0.5.11-rc.1 hardening -> 0.5.11`

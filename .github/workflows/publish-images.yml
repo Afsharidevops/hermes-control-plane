@@ -2,7 +2,7 @@ name: Build and Publish Docker Images
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'dev/**']
     tags: ["v*"]
   pull_request:
     branches: [main]
@@ -31,6 +31,8 @@ jobs:
         include:
           - image: hermes-control-plane-api
             context: ./control-plane
+          - image: hermes-control-plane-credential-service
+            context: ./credential-service
           - image: hermes-control-plane-router-gateway
             context: ./router-gateway
           - image: hermes-control-plane-smart-router
@@ -56,7 +58,7 @@ jobs:
         if: github.event_name != 'pull_request'
         uses: docker/login-action@v4
         with:
-          username: ${{ vars.DOCKERHUB_USERNAME }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Validate manual candidate tag
@@ -75,7 +77,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v6
         with:
-          images: ${{ vars.DOCKERHUB_USERNAME }}/${{ matrix.image }}
+          images: ${{ secrets.DOCKERHUB_USERNAME }}/${{ matrix.image }}
           flavor: |
             latest=false
           tags: |

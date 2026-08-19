@@ -19,7 +19,7 @@ jobs:
           python-version: '3.12'
 
       - name: Compile Python services
-        run: python -m compileall -q control-plane/src router-gateway/src node-agent/src kubernetes-broker/src
+        run: python -m compileall -q control-plane/src credential-service/src router-gateway/src node-agent/src kubernetes-broker/src execution-broker/src smart-router/src scripts/acceptance
 
       - name: Test Control Plane safety core
         run: |
@@ -27,6 +27,13 @@ jobs:
           /tmp/hermes-control-plane-tests/bin/python -m pip install --upgrade pip
           /tmp/hermes-control-plane-tests/bin/pip install -r control-plane/requirements-dev.txt
           PYTHONPATH=control-plane/src /tmp/hermes-control-plane-tests/bin/pytest -q control-plane/tests
+
+      - name: Test Credential Service trust boundary
+        run: |
+          python -m venv /tmp/hermes-credential-service-tests
+          /tmp/hermes-credential-service-tests/bin/python -m pip install --upgrade pip
+          /tmp/hermes-credential-service-tests/bin/pip install -r credential-service/requirements-dev.txt
+          PYTHONPATH=credential-service/src /tmp/hermes-credential-service-tests/bin/pytest -q credential-service/tests
 
       - name: Test Kubernetes Broker policy and execution boundaries
         run: |
@@ -90,6 +97,10 @@ jobs:
               ;;
             0.5.11-dev.1)
               "$SECURITY_PY" scripts/acceptance/dev1-source-security-gate.py
+              ;;
+            0.5.11-dev.2)
+              "$SECURITY_PY" scripts/acceptance/dev2-source-security-gate.py
+              "$SECURITY_PY" scripts/acceptance/dev2-config-static-gate.py
               ;;
             *)
               echo "No source security gate configured for VERSION=$(cat VERSION)" >&2

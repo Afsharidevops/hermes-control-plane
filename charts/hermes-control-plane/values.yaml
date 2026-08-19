@@ -1,5 +1,5 @@
 imageNamespace: afsharidevops
-imageTag: 0.5.11-dev.1
+imageTag: 0.5.11-dev.2
 imagePullPolicy: IfNotPresent
 
 router:
@@ -19,6 +19,17 @@ controlPlane:
   service:
     type: ClusterIP
     port: 8800
+
+
+credentialService:
+  enabled: true
+  service:
+    type: ClusterIP
+    port: 8082
+  persistence:
+    enabled: true
+    size: 1Gi
+    storageClass: ""
 
 kubernetesBroker:
   enabled: true
@@ -57,6 +68,10 @@ secrets:
   approvalBotToken: ""
   approvalHmacKey: ""
   agentTaskHmacKey: ""
+  credentialAdminToken: ""
+  credentialServiceToken: ""
+  credentialMasterKey: ""
+  credentialMasterKeyVersion: "v1"
   kubernetesBrokerToken: ""
   executionHmacKey: ""
   routerGatewayAdminToken: ""

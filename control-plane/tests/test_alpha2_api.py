@@ -141,4 +141,4 @@ def test_audit_events_are_written(client: TestClient):
 def test_ui_is_served(client: TestClient):
     r = client.get("/ui")
     assert r.status_code == 200
-    assert "Kubernetes + Helm vertical slice" in r.text
+    assert "0.5.11-dev.2 · Trust + bootstrap foundation" in r.text

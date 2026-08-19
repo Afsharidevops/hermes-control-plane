@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.5.11-dev.2
+
+- complete the isolated Credential Service with encrypted local storage, external references, safe metadata/name update, rotation, revocation, safe testing, metadata-only synchronization, audit and failure-closed behavior
+- add Server Registry with environment/site/rack/zone labels, pinned SSH host fingerprints, duplicate-IP controls, SSH/BMC credential bindings and discovered inventory
+- add deterministic fixed read-only SSH/host preflight ChangeSets and provider-job result binding
+- add generic provider lifecycle descriptors for SSH, Kubespray, K3s, RKE2, Radar and Hubble
+- add HIGH-risk bootstrap ChangeSet planning gated by PASS preflight, policy, approval and exact plan hash
+- add provider-job stage events, SSE log/status streaming, pause/resume and bounded retry foundation
+- make Radar/Hubble first-class while explicitly prohibiting governance bypass and requiring Hubble authorization/redaction/aggregation before AI/UI
+- add the Credential Service to the GitHub Actions multi-arch Docker image matrix and use Docker Hub username/token from GitHub Secrets
+- add dev.2 source/security and static configuration gates plus separate apply/validate/push handoff scripts
+- keep local push logic source/tag-only; production image publishing remains GitHub Actions -> Docker Hub
+
 ## 0.5.11-dev.1
 
 - add the compressed v0.5.11 completion roadmap

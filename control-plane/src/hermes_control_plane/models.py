@@ -38,6 +38,17 @@ class CredentialRefUpdate(StrictModel):
     metadata: dict[str, Any] | None = None
 
 
+
+
+class CredentialRefSync(StrictModel):
+    id: str = Field(pattern=r"^cred_[a-zA-Z0-9_-]{8,80}$")
+    name: str = Field(min_length=1, max_length=120)
+    kind: Literal["kubeconfig", "ssh-key", "ssh-password", "token", "registry", "generic"]
+    provider: str = Field(min_length=1, max_length=80)
+    status: Literal["configured", "disabled", "rotating", "revoked"] = "configured"
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
 class CredentialRefRotate(StrictModel):
     actor: str = Field(min_length=1, max_length=160)
     metadata: dict[str, Any]
@@ -203,3 +214,74 @@ class AgentTaskResult(StrictModel):
     status: Literal["SUCCEEDED", "FAILED"]
     summary: str = Field(min_length=1, max_length=2000)
     evidence: dict[str, Any] = Field(default_factory=dict)
+
+class ServerCreate(StrictModel):
+    hostname: str = Field(min_length=1, max_length=253)
+    environment_id: str = Field(min_length=1, max_length=80)
+    management_ip: str = Field(min_length=2, max_length=64)
+    provisioning_ip: str | None = Field(default=None, min_length=2, max_length=64)
+    bmc_ip: str | None = Field(default=None, min_length=2, max_length=64)
+    ssh_port: int = Field(default=22, ge=1, le=65535)
+    ssh_user: str = Field(default="root", min_length=1, max_length=64)
+    host_fingerprint: str = Field(min_length=20, max_length=256)
+    connection_mode: ConnectionMode = "agent"
+    credential_ref: str = Field(min_length=1, max_length=120)
+    bmc_credential_ref: str | None = Field(default=None, max_length=120)
+    architecture: str | None = Field(default=None, max_length=64)
+    site: str | None = Field(default=None, max_length=120)
+    rack: str | None = Field(default=None, max_length=120)
+    zone: str | None = Field(default=None, max_length=120)
+    labels: dict[str, str] = Field(default_factory=dict)
+
+
+class ServerUpdate(StrictModel):
+    hostname: str | None = Field(default=None, min_length=1, max_length=253)
+    environment_id: str | None = Field(default=None, min_length=1, max_length=80)
+    management_ip: str | None = Field(default=None, min_length=2, max_length=64)
+    provisioning_ip: str | None = Field(default=None, min_length=2, max_length=64)
+    bmc_ip: str | None = Field(default=None, min_length=2, max_length=64)
+    ssh_port: int | None = Field(default=None, ge=1, le=65535)
+    ssh_user: str | None = Field(default=None, min_length=1, max_length=64)
+    host_fingerprint: str | None = Field(default=None, min_length=20, max_length=256)
+    connection_mode: ConnectionMode | None = None
+    credential_ref: str | None = Field(default=None, min_length=1, max_length=120)
+    bmc_credential_ref: str | None = Field(default=None, max_length=120)
+    architecture: str | None = Field(default=None, max_length=64)
+    site: str | None = Field(default=None, max_length=120)
+    rack: str | None = Field(default=None, max_length=120)
+    zone: str | None = Field(default=None, max_length=120)
+    labels: dict[str, str] | None = None
+    status: Literal["configured", "disabled"] | None = None
+
+
+class ServerPreflightResult(StrictModel):
+    provider_job_id: str = Field(min_length=1, max_length=120)
+    status: Literal["PASS", "WARN", "FAIL"]
+    summary: str = Field(min_length=1, max_length=2000)
+    checks: list[dict[str, Any]] = Field(default_factory=list, max_length=64)
+    facts: dict[str, Any] = Field(default_factory=dict)
+
+
+class BootstrapPlanCreate(StrictModel):
+    provider: Literal["kubespray", "k3s", "rke2"]
+    requested_by: str = Field(min_length=1, max_length=160)
+    source_channel: Literal["telegram", "hermes-bot", "api"] = "api"
+    cluster_name: str = Field(min_length=1, max_length=120)
+    kubernetes_version: str = Field(min_length=1, max_length=80)
+    node_role: Literal["control-plane", "worker", "control-plane-worker"] = "control-plane-worker"
+    network_plugin: Literal["cilium"] = "cilium"
+    hubble_enabled: bool = True
+    radar_enabled: bool = True
+    parameters: dict[str, Any] = Field(default_factory=dict)
+    ttl_seconds: int = Field(default=1800, ge=60, le=86400)
+
+
+class ProviderJobTransition(StrictModel):
+    state: Literal["RUNNING", "PAUSED", "SUCCEEDED", "FAILED"]
+    stage: str = Field(min_length=1, max_length=80)
+    message: str = Field(min_length=1, max_length=2000)
+    evidence: dict[str, Any] = Field(default_factory=dict)
+
+
+class ProviderJobRetry(StrictModel):
+    reason: str = Field(min_length=1, max_length=1000)

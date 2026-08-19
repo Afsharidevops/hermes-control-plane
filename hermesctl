@@ -57,6 +57,8 @@ init_env() {
     [HERMES_APPROVAL_BOT_TOKEN]=32
     [HERMES_APPROVAL_HMAC_KEY]=32
     [HERMES_AGENT_TASK_HMAC_KEY]=32
+    [HERMES_CREDENTIAL_ADMIN_TOKEN]=32
+    [HERMES_CREDENTIAL_SERVICE_TOKEN]=32
     [HERMES_KUBERNETES_BROKER_TOKEN]=32
     [HERMES_EXECUTION_HMAC_KEY]=32
     [ROUTER_GATEWAY_ADMIN_TOKEN]=32
@@ -83,6 +85,15 @@ init_env() {
       set_env "$key" "$(randhex "${sizes[$key]}")"
     fi
   done
+
+  # Fernet requires exactly 32 random bytes encoded with URL-safe base64.
+  if [[ -z "${HERMES_CREDENTIAL_MASTER_KEY:-}" || "${HERMES_CREDENTIAL_MASTER_KEY:-}" == "CHANGE_ME" ]]; then
+    set_env HERMES_CREDENTIAL_MASTER_KEY "$(python3 - <<'PYKEY'
+import base64, os
+print(base64.urlsafe_b64encode(os.urandom(32)).decode('ascii'))
+PYKEY
+)"
+  fi
 
   # Keep imported kubeconfigs mode 0600. For local Docker/Compose, the broker
   # must use the host operator's numeric UID/GID to read the bind-mounted files.
@@ -1369,6 +1380,9 @@ cmd_bot() {
     status)
       [[ -n "${HERMES_BOT_SERVICE_TOKEN:-}" && "${HERMES_BOT_SERVICE_TOKEN:-}" != "CHANGE_ME" ]] && echo "Hermes Bot service identity: configured" || echo "Hermes Bot service identity: missing"
       [[ -n "${HERMES_APPROVAL_BOT_TOKEN:-}" && "${HERMES_APPROVAL_BOT_TOKEN:-}" != "CHANGE_ME" ]] && echo "Approval Bot service identity: configured" || echo "Approval Bot service identity: missing"
+      [[ -n "${HERMES_CREDENTIAL_ADMIN_TOKEN:-}" && "${HERMES_CREDENTIAL_ADMIN_TOKEN:-}" != "CHANGE_ME" ]] && echo "Credential Service admin identity: configured" || echo "Credential Service admin identity: missing"
+      [[ -n "${HERMES_CREDENTIAL_SERVICE_TOKEN:-}" && "${HERMES_CREDENTIAL_SERVICE_TOKEN:-}" != "CHANGE_ME" ]] && echo "Credential Service sync identity: configured" || echo "Credential Service sync identity: missing"
+      [[ -n "${HERMES_CREDENTIAL_MASTER_KEY:-}" && "${HERMES_CREDENTIAL_MASTER_KEY:-}" != "CHANGE_ME" ]] && echo "Credential Service master key: configured" || echo "Credential Service master key: missing"
       [[ -n "${TELEGRAM_BOT_TOKEN:-}" ]] && echo "Hermes Telegram gateway token: configured" || echo "Hermes Telegram gateway token: missing"
       echo "Telegram gateway users: ${TELEGRAM_ALLOWED_USERS:-<none>}"
       echo "Telegram mutation users: ${HERMES_CONTROL_PLANE_BOT_USERS:-<none>}"

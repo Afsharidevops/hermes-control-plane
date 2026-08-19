@@ -94,6 +94,70 @@ def init_db() -> None:
                 FOREIGN KEY(environment_id) REFERENCES environments(id)
             );
 
+            CREATE TABLE IF NOT EXISTS servers (
+                id TEXT PRIMARY KEY,
+                hostname TEXT NOT NULL UNIQUE,
+                environment_id TEXT NOT NULL,
+                management_ip TEXT NOT NULL,
+                provisioning_ip TEXT,
+                bmc_ip TEXT,
+                ssh_port INTEGER NOT NULL,
+                ssh_user TEXT NOT NULL,
+                host_fingerprint TEXT NOT NULL,
+                connection_mode TEXT NOT NULL,
+                credential_ref TEXT NOT NULL,
+                bmc_credential_ref TEXT,
+                architecture TEXT,
+                site TEXT,
+                rack TEXT,
+                zone TEXT,
+                labels_json TEXT NOT NULL,
+                inventory_json TEXT NOT NULL DEFAULT '{}',
+                discovery_status TEXT NOT NULL DEFAULT 'UNKNOWN',
+                preflight_status TEXT NOT NULL DEFAULT 'UNKNOWN',
+                preflight_json TEXT,
+                last_preflight_at INTEGER,
+                status TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                FOREIGN KEY(environment_id) REFERENCES environments(id),
+                FOREIGN KEY(credential_ref) REFERENCES credential_refs(id),
+                FOREIGN KEY(bmc_credential_ref) REFERENCES credential_refs(id)
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_servers_management_ip ON servers(management_ip);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_servers_provisioning_ip ON servers(provisioning_ip) WHERE provisioning_ip IS NOT NULL;
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_servers_bmc_ip ON servers(bmc_ip) WHERE bmc_ip IS NOT NULL;
+
+            CREATE TABLE IF NOT EXISTS provider_jobs (
+                id TEXT PRIMARY KEY,
+                provider_id TEXT NOT NULL,
+                server_id TEXT NOT NULL,
+                changeset_id TEXT NOT NULL,
+                operation TEXT NOT NULL,
+                state TEXT NOT NULL,
+                stage TEXT NOT NULL,
+                attempt INTEGER NOT NULL DEFAULT 1,
+                max_attempts INTEGER NOT NULL DEFAULT 3,
+                plan_hash TEXT NOT NULL,
+                request_json TEXT NOT NULL,
+                result_json TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                FOREIGN KEY(server_id) REFERENCES servers(id),
+                FOREIGN KEY(changeset_id) REFERENCES changesets(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS provider_job_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id TEXT NOT NULL,
+                stage TEXT NOT NULL,
+                status TEXT NOT NULL,
+                message TEXT NOT NULL,
+                evidence_json TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                FOREIGN KEY(job_id) REFERENCES provider_jobs(id)
+            );
+
             CREATE TABLE IF NOT EXISTS approvals (
                 id TEXT PRIMARY KEY,
                 changeset_id TEXT NOT NULL,
@@ -311,7 +375,7 @@ def init_db() -> None:
             "INSERT OR IGNORE INTO system_state (key,value,updated_at) VALUES ('policy_generation','1',?)",
             (int(time.time()),),
         )
-        conn.execute("PRAGMA user_version = 5")
+        conn.execute("PRAGMA user_version = 6")
         conn.commit()
 
 

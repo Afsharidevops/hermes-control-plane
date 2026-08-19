@@ -2,7 +2,7 @@
 
 Hermes Control Plane is a self-hosted, AI-assisted DevOps control plane designed to run on a Docker/VM installation or Kubernetes while keeping privileged credentials and infrastructure execution outside the LLM trust boundary.
 
-> **0.5.10 stable candidate:** the checkpoint hardening is implemented locally. Do not create the public `v0.5.10` tag until `docs/STABLE-0.5.10-ACCEPTANCE.md` passes on the exact candidate commit. Kubernetes/Helm mutations remain bot-only, policy-generation-bound, exact-hash approved, broker-executed, and disabled by default.
+> **0.5.11-dev.2 trust + bootstrap foundation:** Credential Service, Server Registry, deterministic SSH/host preflight, provider jobs/bootstrap planning, and first-class Radar/Hubble provider contracts are included. Infrastructure mutations remain ChangeSet/policy/approval-bound. Production images are built by GitHub Actions and published to Docker Hub; local handoff scripts do not publish images.
 
 ## What is included
 
@@ -47,7 +47,17 @@ Beta.1 work currently includes:
 - readiness-aware `hermesctl execution` and `wait` helpers
 - `hermesctl kubeconfig`, `version`, and `upgrade` commands
 
-See `docs/BETA1.md`, `docs/ALPHA2.md`, `plan.md`, `SECURITY.md`, and `HANDOVER.md`.
+
+Dev.2 trust/bootstrap foundation adds:
+
+- isolated encrypted Credential Service with metadata-only Control Plane synchronization
+- Server Registry with SSH/BMC bindings and pinned host fingerprints
+- deterministic read-only SSH/host preflight plans and inventory facts
+- provider lifecycle/job foundation with streamed events and bounded retry/resume
+- Kubespray/K3s/RKE2 bootstrap planning behind HIGH-risk ChangeSets
+- Radar/Hubble first-class provider contracts with Hermes governance preserved
+
+See `docs/DEV2-TRUST-BOOTSTRAP.md`, `PLAN-0.5.11.md`, `SECURITY.md`, and `HANDOVER.md`.
 
 ## Architecture
 

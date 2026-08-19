@@ -2,11 +2,12 @@
 
 **Stable base:** `v0.5.10` at `e73dd7c69767e709fb944a6356e47776a4464d92`
 **Active development branch:** `dev/0.5.11`
-**Current development package:** `0.5.11-dev.1`
-**Draft PR:** `#2`
-**Status:** dev.1 shared substrate is implemented; validate, repair the branch history, keep PR #2 draft, then continue with dev.2 credential-service work.
+**Do-not-redo baseline:** `0.5.11-dev.1` at `1764cad667717ec78156af8f9f3fcc30eb84c1f5`
+**Current development package:** `0.5.11-dev.2`
+**Draft PR:** `#2` — keep Draft
+**Status:** dev.2 trust + bootstrap foundation is completed in this handoff and locally regression-tested; apply it to the existing branch, run `validate.sh`, then use `push.sh`. GitHub Actions remains the production image builder/publisher to Docker Hub.
 
-`v0.5.10` is already published and must not be moved or rewritten. The historical 0.5.10 handover below is retained only as release history.
+`v0.5.10` and dev.1 are historical baselines and must not be recreated. See `RELEASE-STATUS-0.5.11-dev.2.md` and `docs/DEV2-TRUST-BOOTSTRAP.md` for the new slice. The historical handover below is retained only as release history.
 
 ---
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-python3 -m compileall -q "$ROOT/control-plane/src" "$ROOT/router-gateway/src" "$ROOT/node-agent/src" "$ROOT/kubernetes-broker/src"
+python3 -m compileall -q "$ROOT/control-plane/src" "$ROOT/credential-service/src" "$ROOT/router-gateway/src" "$ROOT/node-agent/src" "$ROOT/kubernetes-broker/src"
 ROOT="$ROOT" python3 - <<'PY'
 from pathlib import Path
 import os
@@ -79,6 +79,7 @@ import fastapi, httpx, pytest
 PY
 then
   PYTHONPATH="$ROOT/control-plane/src" python3 -m pytest -q "$ROOT/control-plane/tests"
+  PYTHONPATH="$ROOT/credential-service/src" python3 -m pytest -q "$ROOT/credential-service/tests"
   if PYTHONPATH="$ROOT/kubernetes-broker/src" python3 - <<'PY2' >/dev/null 2>&1
 import yaml
 PY2
