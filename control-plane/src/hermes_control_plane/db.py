@@ -379,6 +379,99 @@ def init_db() -> None:
             """
         )
 
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS infrastructure_providers (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                kind TEXT NOT NULL,
+                endpoint TEXT NOT NULL,
+                credential_ref TEXT NOT NULL,
+                api_version TEXT NOT NULL,
+                implementation_version TEXT NOT NULL,
+                site TEXT,
+                zone TEXT,
+                capabilities_json TEXT NOT NULL,
+                labels_json TEXT NOT NULL,
+                status TEXT NOT NULL,
+                health_status TEXT NOT NULL DEFAULT 'UNKNOWN',
+                health_detail TEXT,
+                last_health_at INTEGER,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                FOREIGN KEY(credential_ref) REFERENCES credential_refs(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS fleet_target_snapshots (
+                id TEXT PRIMARY KEY,
+                selector_json TEXT NOT NULL,
+                targets_json TEXT NOT NULL,
+                snapshot_hash TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS operation_plans (
+                id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                subject_type TEXT NOT NULL,
+                subject_id TEXT NOT NULL,
+                state TEXT NOT NULL,
+                changeset_id TEXT,
+                plan_json TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                FOREIGN KEY(changeset_id) REFERENCES changesets(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS operation_jobs (
+                id TEXT PRIMARY KEY,
+                operation_plan_id TEXT NOT NULL,
+                changeset_id TEXT NOT NULL,
+                executor TEXT NOT NULL,
+                state TEXT NOT NULL,
+                stage TEXT NOT NULL,
+                plan_hash TEXT NOT NULL,
+                request_json TEXT NOT NULL,
+                result_json TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                FOREIGN KEY(operation_plan_id) REFERENCES operation_plans(id),
+                FOREIGN KEY(changeset_id) REFERENCES changesets(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS artifact_mirror_items (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                kind TEXT NOT NULL,
+                source TEXT NOT NULL,
+                destination TEXT NOT NULL,
+                version TEXT NOT NULL,
+                digest TEXT NOT NULL,
+                labels_json TEXT NOT NULL,
+                status TEXT NOT NULL,
+                verification_json TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS verification_results (
+                id TEXT PRIMARY KEY,
+                operation_plan_id TEXT,
+                changeset_id TEXT,
+                subject_type TEXT NOT NULL,
+                subject_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                checks_json TEXT NOT NULL,
+                evidence_json TEXT NOT NULL,
+                observed_at INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                FOREIGN KEY(operation_plan_id) REFERENCES operation_plans(id),
+                FOREIGN KEY(changeset_id) REFERENCES changesets(id)
+            );
+            """
+        )
+
         # Alpha.1 compatibility: preserve the old integrations table and extend it in place.
         if not _columns(conn, "integrations"):
             conn.execute(
@@ -512,7 +605,7 @@ def init_db() -> None:
         if "addon_versions_json" not in blueprint_cols:
             conn.execute("ALTER TABLE cluster_blueprints ADD COLUMN addon_versions_json TEXT NOT NULL DEFAULT '{}'")
 
-        conn.execute("PRAGMA user_version = 7")
+        conn.execute("PRAGMA user_version = 8")
         conn.commit()
 
 

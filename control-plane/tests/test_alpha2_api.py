@@ -141,4 +141,4 @@ def test_audit_events_are_written(client: TestClient):
 def test_ui_is_served(client: TestClient):
     r = client.get("/ui")
     assert r.status_code == 200
-    assert "0.5.11-dev.3 · Cluster Factory + core infrastructure/day-2" in r.text
+    assert "0.5.11-dev.4 · Full Operations Center + next-deploy infrastructure" in r.text

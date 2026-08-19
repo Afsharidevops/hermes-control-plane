@@ -1,14 +1,17 @@
 # Hermes Control Plane — 0.5.11 development handover
 
-**Stable base:** `v0.5.10` at `e73dd7c69767e709fb944a6356e47776a4464d92`
+**Stable base:** `v0.5.10` — frozen / do not recreate
 **Active development branch:** `dev/0.5.11`
-**Do-not-redo baseline:** `0.5.11-dev.1` at `1764cad667717ec78156af8f9f3fcc30eb84c1f5`
-**Frozen dev.2 boundary:** `a71b03a54ed2f619d3605c0c08d46de35ad5911c`
-**Current development package:** `0.5.11-dev.3`
+**Frozen dev.1 boundary:** `1764cad667717ec78156af8f9f3fcc30eb84c1f5`
+**Frozen dev.2 boundary:** `a71b03a54ed2f619d3605c0c08d46de35ad5911c`, tag `v0.5.11-dev.2`
+**Frozen dev.3 boundary:** `8547c44de4f6e8116d70f2690b50a50c895eba34`, tag `v0.5.11-dev.3`
+**Current development package:** `0.5.11-dev.4`
 **Draft PR:** `#2` — keep Draft
-**Status:** dev.3 Cluster Factory + core infrastructure/day-2 is implemented and locally regression-tested in this checkpoint workspace on top of frozen dev.2 source. Because the checkpoint contains no `.git`, apply it to the real `dev/0.5.11` checkout, commit as new dev.3 history, run `validate.sh`, then use `push.sh`. GitHub Actions remains the production image builder/publisher to Docker Hub.
+**Status:** dev.4 Full Operations Center + Next-Deploy Infrastructure source is implemented in this checkpoint workspace and must be applied as new commits on top of frozen dev.3 in the real Git checkout. Do not amend or move dev.3. Run full validation, push the intended branch SHA, require branch CI green on that exact SHA, and only then create `v0.5.11-dev.4`. Production image publication remains GitHub Actions -> Docker Hub.
 
-`v0.5.10` and dev.1 are historical baselines and must not be recreated. See `RELEASE-STATUS-0.5.11-dev.3.md` and `docs/DEV3-CLUSTER-FACTORY.md` for the new slice; dev.2 remains frozen and is documented separately. The historical handover below is retained only as release history.
+Dev.4 adds the shared Web/Telegram/AI typed intent backend, fleet exact-target snapshots, advanced day-2 plans, VMware/OpenStack/AWS/Azure/GCP foundations, Redfish/IPMI/PXE and typed switch/network contracts, digest-pinned air-gap artifact mirroring, constrained generic operation jobs with signed exact-plan execution tickets and unified verification. It does **not** claim live provider/cloud/bare-metal/switch execution without separate disposable-target evidence.
+
+See `RELEASE-STATUS-0.5.11-dev.4.md` and `docs/DEV4-OPERATIONS-CENTER.md`. The historical handover below is retained only as release history.
 
 ---
 

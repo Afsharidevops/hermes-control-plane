@@ -78,7 +78,9 @@ GitHub Actions uses `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` GitHub Secrets an
 
 ## 0.5.11-dev.3 — cluster factory + core infrastructure
 
-**Status: implemented and locally validated in the dev.3 checkpoint workspace; requires application/commit on the real Git checkout because this archive contains no `.git`.**
+**Status: COMPLETE / FROZEN / PUBLISHED at `8547c44de4f6e8116d70f2690b50a50c895eba34`, tag `v0.5.11-dev.3`; do not redo or rewrite.**
+
+Implementation commit: `e51d7f99faa180974cb7a925e12b587d8432fd5b`. The frozen/published boundary above supersedes historical pre-publication status text retained in the exact dev.3 source snapshot.
 
 - persisted ClusterBlueprint/ClusterProfile/Cluster/NodeRole lifecycle resources;
 - persisted ProvisioningRun/AddonPlan/UpgradePlan/BackupPlan resources;
@@ -92,11 +94,21 @@ GitHub Actions uses `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` GitHub Secrets an
 
 ## 0.5.11-dev.4 — operations center + next-deploy infrastructure
 
-- Web UI, Telegram and AI Operations;
-- multi-cluster and advanced day-2;
-- empty-disk bare metal, PXE/iPXE, Redfish/BMC, IPMI, BIOS and switch configuration;
-- VMware, OpenStack, AWS, Azure, GCP;
-- full air-gap artifact mirroring and advanced recovery/decommission.
+**Status: source implementation prepared in this checkpoint workspace; NOT TAGGED OR PUBLISHED. Apply as new commits on top of frozen dev.3, run the full local validation suite, require green branch CI on the intended exact SHA, then use the guarded tag path.**
+
+Implemented source foundations include:
+
+- shared Web UI, Telegram, Hermes/AI and API intent planning through one governed operations backend;
+- persisted multi-cluster/fleet views, selectors and exact fleet/target snapshot binding;
+- typed advanced day-2 planning for worker/node, workload, add-on, Helm/GitOps, Kubernetes/Cilium upgrade, backup/restore, certificate, maintenance, decommission, clone and DR operations;
+- typed provider foundations for VMware, OpenStack, AWS, Azure and GCP with explicit provider/API pins and constrained operation contracts;
+- typed empty-disk bare-metal planning for Redfish/BMC, IPMI and PXE/iPXE plus network/switch contracts, without arbitrary generated shell execution;
+- digest-pinned OCI/Helm/package/Git-release air-gap mirror items and governed mirror plans;
+- persisted operation plans/jobs, short-lived HMAC-signed exact-plan execution tickets, one-time approval consumption at execution start, and unified typed verification results;
+- exact ChangeSet plan-hash, current-policy-generation and current target/fleet snapshot authorization checks before operation-job authorization;
+- negative security tests for raw-secret-shaped parameters, embedded URL credentials and target/fleet drift.
+
+Live VMware/cloud/BMC/switch/provider execution is not claimed by this source checkpoint unless backed by separate disposable-target evidence. Production images remain CI-owned.
 
 ## Release path
 

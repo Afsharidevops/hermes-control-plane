@@ -34,3 +34,23 @@ def issue_ticket(
     }
     signature = hmac.new(key.encode(), canonical_json(ticket).encode(), hashlib.sha256).hexdigest()
     return ticket, signature
+
+
+def verify_ticket(
+    ticket: dict[str, Any],
+    signature: str,
+    *,
+    now: int | None = None,
+    require_fresh: bool = True,
+) -> None:
+    key = execution_key()
+    if not key:
+        raise RuntimeError("HERMES_EXECUTION_HMAC_KEY is not configured")
+    expected = hmac.new(key.encode(), canonical_json(ticket).encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, signature):
+        raise ValueError("invalid execution ticket signature")
+    observed = int(time.time()) if now is None else int(now)
+    if require_fresh and int(ticket.get("expires_at") or 0) < observed:
+        raise ValueError("execution ticket expired")
+    if int(ticket.get("issued_at") or 0) > observed + 30:
+        raise ValueError("execution ticket issued_at is in the future")

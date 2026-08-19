@@ -2,7 +2,7 @@
 
 Hermes Control Plane is a self-hosted, AI-assisted DevOps control plane designed to run on a Docker/VM installation or Kubernetes while keeping privileged credentials and infrastructure execution outside the LLM trust boundary.
 
-> **0.5.11-dev.3 Cluster Factory + core infrastructure/day-2:** dev.2 trust/bootstrap remains intact and now backs typed ClusterBlueprint/Profile/Cluster/NodeRole/ProvisioningRun/AddonPlan/UpgradePlan/BackupPlan resources, deterministic Kubespray/K3s/RKE2 plans, Cilium/Hubble/Radar contracts, pinned add-on planning, backup/upgrade foundations, and native diagnostics. Infrastructure mutations remain ChangeSet/policy/approval/exact-hash-bound. Production images remain GitHub Actions -> Docker Hub.
+> **0.5.11-dev.4 Full Operations Center + next-deploy infrastructure:** the frozen dev.3 Cluster Factory now feeds a shared Web/Telegram/AI intent backend, exact-snapshot fleet planning, advanced typed day-2 operations, VMware/OpenStack/AWS/Azure/GCP provider foundations, Redfish/IPMI/PXE bare-metal plans, typed switch/network contracts, digest-pinned air-gap mirroring and unified verification. Every mutation remains ChangeSet/policy/approval/exact-hash/target-drift governed, and raw infrastructure credentials remain behind the Credential Service. Production images remain GitHub Actions -> Docker Hub.
 
 ## What is included
 
@@ -47,6 +47,20 @@ Beta.1 work currently includes:
 - readiness-aware `hermesctl execution` and `wait` helpers
 - `hermesctl kubeconfig`, `version`, and `upgrade` commands
 
+
+Dev.4 Operations Center / next-deploy foundation adds:
+
+- shared typed intent planning for Web/UI, Telegram, Hermes Bot/AI and API channels
+- centralized fleet registry with environment/labels/sites/zones/health metadata and exact target snapshots
+- governed advanced day-2 plans for node, worker, workload, add-on, Helm/GitOps, upgrade, backup/restore, maintenance, decommission, clone and DR operations
+- first-class typed provider foundations for VMware, OpenStack, AWS, Azure and GCP
+- Redfish/IPMI/PXE bare-metal and typed switch/network desired-state contracts
+- digest-pinned OCI/Helm/package/Git-release artifact mirroring plans
+- generic constrained operation jobs with integrity-checked approvals, exact typed-plan/hash binding, signed execution tickets, one-time approval consumption at start, and target-drift authorization
+- typed post-operation verification with secret-shaped evidence rejection
+- Hermes-native Operations Center observability pages with no mutation/approval bypass controls
+
+See `docs/DEV4-OPERATIONS-CENTER.md`, `PLAN-0.5.11.md`, `SECURITY.md`, and `HANDOVER.md`.
 
 Dev.2 trust/bootstrap foundation adds:
 

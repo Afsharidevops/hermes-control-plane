@@ -24,8 +24,9 @@ from .canonical import canonical_json, sha256_hex
 from . import kubernetes as kubernetes_broker
 from . import preflight as host_preflight
 from . import cluster_factory
+from . import operations
 from .providers import PROVIDERS, provider_descriptor
-from .tickets import issue_ticket
+from .tickets import issue_ticket, verify_ticket
 from .models import (
     AgentEnroll,
     AgentEnrollmentTokenCreate,
@@ -69,17 +70,23 @@ from .models import (
     BackupPlanCreate,
     RadarSnapshotCreate,
     HubbleFlowSummaryCreate,
+    InfrastructureProviderCreate,
+    InfrastructureProviderHealth,
+    OperationsIntentPlanCreate,
+    ArtifactMirrorItemCreate,
+    VerificationResultCreate,
+    OperationJobTransition,
 )
 from .risk import approval_required, classify
 
-VERSION = "0.5.11-dev.3"
+VERSION = "0.5.11-dev.4"
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 TERMINAL_CHANGESET_STATES = {
     "REJECTED", "CANCELLED", "EXPIRED", "EXECUTED", "FAILED",
     "POLICY_DENIED", "PREVIEW_FAILED", "STALE_POLICY",
 }
-INFRA_MUTATION_ADAPTERS = {"kubernetes", "helm", "ssh", "bootstrap", "radar", "hubble", "provider"}
-BOT_SOURCE_CHANNELS = {"telegram", "hermes-bot", "api"}
+INFRA_MUTATION_ADAPTERS = {"kubernetes", "helm", "ssh", "bootstrap", "radar", "hubble", "provider", "fleet", "cloud", "bare-metal", "network", "artifact"}
+BOT_SOURCE_CHANNELS = {"ui", "telegram", "hermes-bot", "api"}
 
 ADAPTER_CAPABILITIES: dict[str, dict[str, Any]] = {
     "kubernetes.discover": {"adapter": "kubernetes", "mode": "read", "default_risk": "READ", "reversible": False, "credential_class": "kubeconfig", "connection_modes": ["direct", "agent"], "approval": "none", "target_restrictions": ["namespace allowlist", "no Secret value reads"]},
@@ -103,6 +110,11 @@ ADAPTER_CAPABILITIES: dict[str, dict[str, Any]] = {
     "ssh.runbook.execute": {"adapter": "ssh", "mode": "write", "default_risk": "HIGH", "reversible": False, "credential_class": "ssh", "connection_modes": ["agent"], "approval": "policy", "target_restrictions": ["structured runbook only", "no unrestricted shell endpoint"]},
     "github.gitops": {"adapter": "github", "mode": "write", "default_risk": "HIGH", "reversible": True, "credential_class": "token", "connection_modes": ["direct"], "approval": "policy", "target_restrictions": ["controlled files", "protected branch policy"]},
     "gitlab.gitops": {"adapter": "gitlab", "mode": "write", "default_risk": "HIGH", "reversible": True, "credential_class": "token", "connection_modes": ["direct"], "approval": "policy", "target_restrictions": ["controlled files", "protected branch policy"]},
+    "fleet.apply": {"adapter": "fleet", "mode": "write", "default_risk": "HIGH", "reversible": False, "credential_class": "indirect", "connection_modes": ["agent", "provider"], "approval": "policy", "target_restrictions": ["exact fleet target snapshot", "reject target drift", "per-cluster audit"]},
+    "cloud.apply": {"adapter": "cloud", "mode": "write", "default_risk": "HIGH", "reversible": True, "credential_class": "cloud", "connection_modes": ["provider"], "approval": "policy", "target_restrictions": ["typed provider contract", "credential-service delivery only", "exact ChangeSet hash"]},
+    "bare-metal.apply": {"adapter": "bare-metal", "mode": "write", "default_risk": "HIGH", "reversible": False, "credential_class": "bmc", "connection_modes": ["provider"], "approval": "policy", "target_restrictions": ["typed Redfish/IPMI/PXE contract", "no generated shell", "exact ChangeSet hash"]},
+    "network.apply": {"adapter": "network", "mode": "write", "default_risk": "HIGH", "reversible": True, "credential_class": "switch", "connection_modes": ["provider"], "approval": "policy", "target_restrictions": ["typed switch intent", "no arbitrary CLI", "exact ChangeSet hash"]},
+    "artifact.mirror.apply": {"adapter": "artifact", "mode": "write", "default_risk": "HIGH", "reversible": True, "credential_class": "registry-or-repository", "connection_modes": ["provider"], "approval": "policy", "target_restrictions": ["version and sha256 digest pinned", "source/destination digest verification"]},
 }
 
 
@@ -120,7 +132,7 @@ async def lifespan(_: FastAPI):
 app = FastAPI(
     title="Hermes Control Plane API",
     version=VERSION,
-    description="Hermes Control Plane 0.5.11-dev.3 development API",
+    description="Hermes Control Plane 0.5.11-dev.4 development API",
     lifespan=lifespan,
 )
 
@@ -407,6 +419,93 @@ def _provisioning_run_dict(row: Any) -> dict[str, Any]:
     return item
 
 
+def _infrastructure_provider_dict(row: Any) -> dict[str, Any]:
+    item = dict(row)
+    item["capabilities"] = json.loads(item.pop("capabilities_json") or "{}")
+    item["labels"] = json.loads(item.pop("labels_json") or "{}")
+    return item
+
+
+def _artifact_mirror_item_dict(row: Any) -> dict[str, Any]:
+    item = dict(row)
+    item["labels"] = json.loads(item.pop("labels_json") or "{}")
+    item["verification"] = json.loads(item.pop("verification_json") or "null")
+    return item
+
+
+def _operation_plan_dict(row: Any) -> dict[str, Any]:
+    item = dict(row)
+    item["plan"] = json.loads(item.pop("plan_json") or "{}")
+    return item
+
+
+def _operation_job_dict(row: Any) -> dict[str, Any]:
+    item = dict(row)
+    item["request"] = json.loads(item.pop("request_json") or "{}")
+    item["result"] = json.loads(item.pop("result_json") or "null")
+    return item
+
+
+def _verification_result_dict(row: Any) -> dict[str, Any]:
+    item = dict(row)
+    item["checks"] = json.loads(item.pop("checks_json") or "[]")
+    item["evidence"] = json.loads(item.pop("evidence_json") or "{}")
+    return item
+
+
+def _get_infrastructure_provider(conn, provider_id: str):
+    row = conn.execute("SELECT * FROM infrastructure_providers WHERE id=?", (provider_id,)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="infrastructure provider not found")
+    return row
+
+
+def _get_artifact_mirror_item(conn, artifact_id: str):
+    row = conn.execute("SELECT * FROM artifact_mirror_items WHERE id=?", (artifact_id,)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="artifact mirror item not found")
+    return row
+
+
+def _infrastructure_provider_snapshot(conn, provider_id: str) -> dict[str, Any]:
+    provider = _infrastructure_provider_dict(_get_infrastructure_provider(conn, provider_id))
+    snapshot = {
+        "id": provider["id"],
+        "name": provider["name"],
+        "kind": provider["kind"],
+        "endpoint": provider["endpoint"],
+        "credential_ref": provider["credential_ref"],
+        "credential_snapshot": _credential_snapshot(conn, provider["credential_ref"]),
+        "api_version": provider["api_version"],
+        "implementation_version": provider["implementation_version"],
+        "site": provider["site"],
+        "zone": provider["zone"],
+        "capabilities": provider["capabilities"],
+        "labels": provider["labels"],
+        "health_status": provider["health_status"],
+        "status": provider["status"],
+    }
+    snapshot["snapshot_hash"] = sha256_hex(snapshot)
+    return snapshot
+
+
+def _artifact_mirror_snapshot(conn, artifact_id: str) -> dict[str, Any]:
+    artifact = _artifact_mirror_item_dict(_get_artifact_mirror_item(conn, artifact_id))
+    snapshot = {
+        "id": artifact["id"],
+        "name": artifact["name"],
+        "kind": artifact["kind"],
+        "source": artifact["source"],
+        "destination": artifact["destination"],
+        "version": artifact["version"],
+        "digest": artifact["digest"],
+        "labels": artifact["labels"],
+        "status": artifact["status"],
+    }
+    snapshot["snapshot_hash"] = sha256_hex(snapshot)
+    return snapshot
+
+
 def _get_blueprint(conn, blueprint_id: str):
     row = conn.execute("SELECT * FROM cluster_blueprints WHERE id=?", (blueprint_id,)).fetchone()
     if not row:
@@ -490,6 +589,7 @@ def _credential_snapshot(conn, credential_ref: str | None) -> dict[str, Any] | N
 _SECRET_METADATA_KEYS = {
     "secret", "password", "passphrase", "token", "access_token", "refresh_token",
     "private_key", "privatekey", "kubeconfig", "credential", "credentials", "raw", "content", "value",
+    "api_key", "secret_key", "client_secret", "user_data", "cloud_init", "authorization", "bearer",
 }
 
 
@@ -507,6 +607,12 @@ def _validate_credential_metadata(metadata: dict[str, Any]) -> None:
     walk(metadata)
 
 
+def _reject_embedded_url_credentials(value: str, field: str) -> None:
+    parsed = urlparse(value)
+    if parsed.username is not None or parsed.password is not None:
+        raise HTTPException(status_code=422, detail=f"raw credentials are forbidden in {field}; use a Credential Service reference")
+
+
 def _target_snapshot(conn, target_id: str) -> dict[str, Any]:
     row = conn.execute("SELECT * FROM targets WHERE id=?", (target_id,)).fetchone()
     if not row:
@@ -514,6 +620,22 @@ def _target_snapshot(conn, target_id: str) -> dict[str, Any]:
             return _server_snapshot(conn, target_id)
         if target_id.startswith("clu_"):
             return _cluster_snapshot(conn, target_id)
+        if target_id.startswith("ipr_"):
+            return _infrastructure_provider_snapshot(conn, target_id)
+        if target_id.startswith("art_"):
+            return _artifact_mirror_snapshot(conn, target_id)
+        if target_id.startswith("flt_"):
+            fleet = conn.execute("SELECT * FROM fleet_target_snapshots WHERE id=?", (target_id,)).fetchone()
+            if not fleet:
+                raise HTTPException(status_code=404, detail="fleet target snapshot not found")
+            return {
+                "id": fleet["id"],
+                "kind": "fleet-target-snapshot",
+                "selector": json.loads(fleet["selector_json"] or "{}"),
+                "targets": json.loads(fleet["targets_json"] or "[]"),
+                "snapshot_hash": fleet["snapshot_hash"],
+                "status": fleet["status"],
+            }
         raise HTTPException(status_code=404, detail="target not found")
     target = _target_dict(row)
     snapshot = {
@@ -628,6 +750,11 @@ def system() -> dict[str, Any]:
             "applications": conn.execute("SELECT COUNT(*) FROM applications").fetchone()[0],
             "agents": conn.execute("SELECT COUNT(*) FROM agents").fetchone()[0],
             "agent_tasks": conn.execute("SELECT COUNT(*) FROM agent_tasks").fetchone()[0],
+            "infrastructure_providers": conn.execute("SELECT COUNT(*) FROM infrastructure_providers").fetchone()[0],
+            "operation_plans": conn.execute("SELECT COUNT(*) FROM operation_plans").fetchone()[0],
+            "operation_jobs": conn.execute("SELECT COUNT(*) FROM operation_jobs").fetchone()[0],
+            "artifact_mirror_items": conn.execute("SELECT COUNT(*) FROM artifact_mirror_items").fetchone()[0],
+            "verification_results": conn.execute("SELECT COUNT(*) FROM verification_results").fetchone()[0],
         }
         policy_generation = db.get_policy_generation(conn)
     return {
@@ -635,7 +762,7 @@ def system() -> dict[str, Any]:
         "version": VERSION,
         "stage": "development",
         "runtime": os.getenv("HERMES_RUNTIME", "docker"),
-        "capabilities": ["integration-registry", "target-registry", "application-registry", "adapter-capability-contract", "credential-references", "server-registry", "ssh-preflight", "provider-lifecycle-contract", "bootstrap-jobs", "cluster-factory", "cluster-blueprints", "cluster-profiles", "node-roles", "provisioning-runs", "addon-plans", "upgrade-plans", "backup-plans", "kubespray-production-path", "k3s-edge-path", "rke2-hardened-path", "cilium-hubble", "radar-kubernetes-intelligence", "native-diagnostics", "changeset-planning", "risk-engine", "approval-binding", "audit", "agent-enrollment", "agent-signed-task-envelope", "kubernetes-discovery", "kubernetes-server-dry-run", "kubernetes-guarded-delete", "kubernetes-rollback", "kubernetes-rollout-verification", "helm-server-dry-run", "helm-rollback", "signed-execution-tickets"],
+        "capabilities": ["integration-registry", "target-registry", "application-registry", "adapter-capability-contract", "credential-references", "server-registry", "ssh-preflight", "provider-lifecycle-contract", "bootstrap-jobs", "cluster-factory", "cluster-blueprints", "cluster-profiles", "node-roles", "provisioning-runs", "addon-plans", "upgrade-plans", "backup-plans", "kubespray-production-path", "k3s-edge-path", "rke2-hardened-path", "cilium-hubble", "radar-kubernetes-intelligence", "native-diagnostics", "operations-center", "shared-intent-backend", "fleet-registry", "fleet-exact-target-snapshots", "advanced-day2-plans", "bare-metal-provider-contracts", "switch-network-provider-contracts", "vmware-provider-foundation", "openstack-provider-foundation", "aws-provider-foundation", "azure-provider-foundation", "gcp-provider-foundation", "airgap-artifact-mirror", "unified-verification", "generic-operation-jobs", "target-drift-rejection", "changeset-planning", "risk-engine", "approval-binding", "audit", "agent-enrollment", "agent-signed-task-envelope", "kubernetes-discovery", "kubernetes-server-dry-run", "kubernetes-guarded-delete", "kubernetes-rollback", "kubernetes-rollout-verification", "helm-server-dry-run", "helm-rollback", "signed-execution-tickets"],
         "execution_enabled": os.getenv("HERMES_EXECUTION_ENABLED", "false").lower() == "true",
         "policy_generation": policy_generation,
         "mutation_control": {
@@ -643,7 +770,8 @@ def system() -> dict[str, Any]:
             "radar_hubble_mutations": "changeset-policy-approval-only",
             "kubernetes_helm": "bot-only",
             "approval": "approval-bot-only",
-            "ui": "configuration-and-observability",
+            "ui": "configuration-and-observability; mutations enter the same bot-authenticated intent backend",
+            "fleet_cloud_baremetal_network_artifact": "typed-plan-changeset-exact-hash-operation-job-verification",
         },
         "counts": counts,
     }
@@ -2680,3 +2808,609 @@ def get_cluster_intelligence(cluster_id: str, authorization: str | None = Header
             row = conn.execute("SELECT * FROM kubernetes_intelligence_snapshots WHERE cluster_id=? AND provider=? ORDER BY observed_at DESC,id DESC LIMIT 1", (cluster_id, provider)).fetchone()
             latest[provider] = None if not row else {"id": row["id"], "observed_at": row["observed_at"], "summary": json.loads(row["summary_json"] or "{}")}
     return {"cluster_id": cluster_id, "radar_contract": cluster_factory.RADAR_CONTRACT, "hubble_contract": cluster_factory.HUBBLE_CONTRACT, "latest": latest, "diagnostics": cluster_factory.NATIVE_DIAGNOSTICS}
+
+
+# --- 0.5.11-dev.4 Full Operations Center + next-deploy infrastructure ---
+
+def _fleet_entry(conn, cluster_row: Any) -> dict[str, Any]:
+    cluster = _cluster_dict(cluster_row)
+    profile = _profile_dict(_get_profile(conn, cluster["profile_id"]))
+    servers = [_server_dict(_get_server(conn, server_id)) for server_id in profile["server_ids"]]
+    sites = sorted({item["site"] for item in servers if item.get("site")})
+    zones = sorted({item["zone"] for item in servers if item.get("zone")})
+    latest_radar = conn.execute(
+        "SELECT summary_json,observed_at FROM kubernetes_intelligence_snapshots WHERE cluster_id=? AND provider='radar' ORDER BY observed_at DESC,id DESC LIMIT 1",
+        (cluster["id"],),
+    ).fetchone()
+    health = "UNKNOWN"
+    radar_score = None
+    if cluster["state"] == "READY":
+        health = "HEALTHY"
+    elif cluster["state"] in {"ERROR", "FAILED"}:
+        health = "DEGRADED"
+    if latest_radar:
+        radar = json.loads(latest_radar["summary_json"] or "{}")
+        radar_score = radar.get("health_score")
+        if isinstance(radar_score, int):
+            health = "HEALTHY" if radar_score >= 80 else "DEGRADED"
+    return {
+        **cluster,
+        "sites": sites,
+        "zones": zones,
+        "health": health,
+        "radar_health_score": radar_score,
+        "agent_connectivity": "configured" if servers and all(item["connection_mode"] == "agent" for item in servers) else "mixed-or-direct",
+        "provider_health": "contract-available" if cluster["provider"] in cluster_factory.CLUSTER_PROVIDERS else "UNKNOWN",
+    }
+
+
+def _select_fleet_targets(conn, selector: dict[str, Any]) -> list[dict[str, Any]]:
+    rows = conn.execute("SELECT * FROM clusters WHERE status='configured' ORDER BY id").fetchall()
+    selected: list[dict[str, Any]] = []
+    for row in rows:
+        entry = _fleet_entry(conn, row)
+        if selector.get("cluster_ids") and entry["id"] not in selector["cluster_ids"]:
+            continue
+        if selector.get("environment_ids") and entry["environment_id"] not in selector["environment_ids"]:
+            continue
+        if selector.get("providers") and entry["provider"] not in selector["providers"]:
+            continue
+        if selector.get("states") and entry["state"] not in selector["states"]:
+            continue
+        if selector.get("sites") and not set(selector["sites"]).intersection(entry["sites"]):
+            continue
+        if selector.get("zones") and not set(selector["zones"]).intersection(entry["zones"]):
+            continue
+        labels = entry.get("labels") or {}
+        if any(labels.get(key) != value for key, value in (selector.get("labels") or {}).items()):
+            continue
+        selected.append(_cluster_snapshot(conn, entry["id"]))
+    return selected
+
+
+def _store_fleet_target_snapshot(conn, selector: dict[str, Any], targets: list[dict[str, Any]]) -> str:
+    fleet_id = f"flt_{uuid.uuid4().hex[:16]}"
+    target_refs = [{"id": item["id"], "snapshot_hash": item["snapshot_hash"]} for item in targets]
+    snapshot_hash = sha256_hex({"selector": selector, "targets": target_refs})
+    conn.execute(
+        "INSERT INTO fleet_target_snapshots (id,selector_json,targets_json,snapshot_hash,status,created_at) VALUES (?,?,?,?,?,?)",
+        (fleet_id, json.dumps(selector, sort_keys=True), json.dumps(target_refs, sort_keys=True), snapshot_hash, "configured", int(time.time())),
+    )
+    return fleet_id
+
+
+def _store_operation_plan(
+    conn,
+    *,
+    typed_plan: dict[str, Any],
+    subject_type: str,
+    subject_id: str,
+    changeset: Any,
+    requested_by: str,
+    executor: str,
+) -> tuple[Any, Any]:
+    now = int(time.time())
+    plan_id = f"opn_{uuid.uuid4().hex[:16]}"
+    job_id = f"opj_{uuid.uuid4().hex[:16]}"
+    conn.execute(
+        "INSERT INTO operation_plans (id,kind,subject_type,subject_id,state,changeset_id,plan_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
+        (plan_id, typed_plan["kind"], subject_type, subject_id, "WAITING_APPROVAL" if changeset["approval_required"] else "PLANNED", changeset["id"], json.dumps(typed_plan, sort_keys=True), now, now),
+    )
+    conn.execute(
+        "INSERT INTO operation_jobs (id,operation_plan_id,changeset_id,executor,state,stage,plan_hash,request_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (job_id, plan_id, changeset["id"], executor, "WAITING_APPROVAL", "plan", changeset["plan_hash"], json.dumps({"typed_plan_hash": typed_plan["plan_hash"], "subject_id": subject_id}, sort_keys=True), now, now),
+    )
+    db.audit(conn, "operation_plan.created", requested_by, "operation_plan", plan_id, {"changeset_id": changeset["id"], "operation_job_id": job_id, "typed_plan_hash": typed_plan["plan_hash"], "executor": executor})
+    return conn.execute("SELECT * FROM operation_plans WHERE id=?", (plan_id,)).fetchone(), conn.execute("SELECT * FROM operation_jobs WHERE id=?", (job_id,)).fetchone()
+
+
+def _plan_mutation(
+    conn,
+    *,
+    typed_plan: dict[str, Any],
+    target_id: str,
+    subject_type: str,
+    subject_id: str,
+    requested_by: str,
+    source_channel: str,
+    adapter: str,
+    ttl_seconds: int,
+    executor: str,
+) -> dict[str, Any]:
+    operation = typed_plan["operation"]
+    changeset = _insert_changeset(
+        conn,
+        operation=operation if ".apply" in operation or ".upgrade" in operation or ".remove" in operation or ".delete" in operation or ".restart" in operation or ".scale" in operation else f"{operation}.apply",
+        adapter=adapter,
+        target_id=target_id,
+        requested_by=requested_by,
+        source_channel=source_channel,
+        source_revision=None,
+        parameters={"resource_type": typed_plan["kind"], "typed_plan": typed_plan},
+        policy_generation=db.get_policy_generation(conn),
+        ttl_seconds=ttl_seconds,
+    )
+    preview = {
+        "summary": f"Governed {typed_plan['operation']} plan for {subject_type} {subject_id}",
+        "details": typed_plan,
+        "source": "operations-center-deterministic-planner",
+    }
+    conn.execute("UPDATE changesets SET preview_json=?,state='PREVIEWED',updated_at=? WHERE id=?", (json.dumps(preview, sort_keys=True), int(time.time()), changeset["id"]))
+    changeset = conn.execute("SELECT * FROM changesets WHERE id=?", (changeset["id"],)).fetchone()
+    plan_row, job_row = _store_operation_plan(
+        conn,
+        typed_plan=typed_plan,
+        subject_type=subject_type,
+        subject_id=subject_id,
+        changeset=changeset,
+        requested_by=requested_by,
+        executor=executor,
+    )
+    return {"operation_plan": _operation_plan_dict(plan_row), "changeset": _changeset_dict(changeset), "operation_job": _operation_job_dict(job_row)}
+
+
+def _operation_job_bound_plan(conn, job: Any, *, require_current_policy: bool) -> tuple[Any, dict[str, Any], dict[str, Any], dict[str, Any]]:
+    changeset = _changeset(conn, job["changeset_id"])
+    if require_current_policy:
+        _require_current_policy_generation(conn, changeset)
+    changeset_plan = json.loads(changeset["plan_json"] or "{}")
+    if sha256_hex(changeset_plan) != changeset["plan_hash"]:
+        raise HTTPException(status_code=409, detail="stored ChangeSet hash verification failed")
+    if changeset["plan_hash"] != job["plan_hash"]:
+        raise HTTPException(status_code=409, detail="operation job exact plan hash no longer matches ChangeSet")
+    plan_row = conn.execute("SELECT * FROM operation_plans WHERE id=?", (job["operation_plan_id"],)).fetchone()
+    if not plan_row:
+        raise HTTPException(status_code=409, detail="operation job references missing operation plan")
+    if plan_row["changeset_id"] != changeset["id"]:
+        raise HTTPException(status_code=409, detail="operation plan ChangeSet binding mismatch")
+    typed_plan = json.loads(plan_row["plan_json"] or "{}")
+    typed_hash = typed_plan.get("plan_hash")
+    unhashed_typed_plan = dict(typed_plan)
+    unhashed_typed_plan.pop("plan_hash", None)
+    if not typed_hash or sha256_hex(unhashed_typed_plan) != typed_hash:
+        raise HTTPException(status_code=409, detail="operation typed plan hash verification failed")
+    bound_typed_plan = ((changeset_plan.get("parameters") or {}).get("typed_plan") or {})
+    if bound_typed_plan != typed_plan:
+        raise HTTPException(status_code=409, detail="operation plan is not exactly bound to the ChangeSet plan")
+    request = json.loads(job["request_json"] or "{}")
+    if request.get("typed_plan_hash") != typed_hash:
+        raise HTTPException(status_code=409, detail="operation job typed plan hash binding mismatch")
+    return changeset, changeset_plan, typed_plan, request
+
+
+def _valid_operation_approval_ids(conn, changeset: Any, *, now: int) -> list[str]:
+    if not changeset["approval_required"]:
+        return []
+    required_approvals = 2 if changeset["risk"] == "CRITICAL" else 1
+    approval_rows = conn.execute(
+        "SELECT * FROM approvals WHERE changeset_id=? AND plan_hash=? AND status='APPROVED' AND consumed_at IS NULL ORDER BY issued_at ASC,id ASC",
+        (changeset["id"], changeset["plan_hash"]),
+    ).fetchall()
+    valid_by_approver: dict[str, Any] = {}
+    for approval in approval_rows:
+        if approval["approver"] not in valid_by_approver and _approval_is_valid(approval, changeset=changeset, now=now):
+            valid_by_approver[approval["approver"]] = approval
+    if len(valid_by_approver) < required_approvals:
+        raise HTTPException(status_code=409, detail=f"{required_approvals} valid distinct integrity-checked approval(s) required for this exact operation plan hash")
+    return [str(item["id"]) for item in list(valid_by_approver.values())[:required_approvals]]
+
+
+def _verify_operation_job_authorization(conn, job: Any) -> tuple[Any, dict[str, Any], dict[str, Any], list[str]]:
+    now = int(time.time())
+    changeset, changeset_plan, typed_plan, _ = _operation_job_bound_plan(conn, job, require_current_policy=True)
+    required_state = "APPROVED" if changeset["approval_required"] else "PREVIEWED"
+    if changeset["state"] != required_state:
+        raise HTTPException(status_code=409, detail=f"operation job requires ChangeSet state {required_state}")
+    current_changeset_target = _target_snapshot(conn, changeset["target_id"])
+    if current_changeset_target != changeset_plan.get("target_snapshot"):
+        raise HTTPException(status_code=409, detail=f"target drift detected for {changeset['target_id']}; re-plan and re-approve")
+    for target in typed_plan.get("targets", []):
+        target_id = target.get("id")
+        expected = target.get("snapshot_hash")
+        if not target_id or not expected:
+            continue
+        current = _target_snapshot(conn, target_id)
+        if current.get("snapshot_hash") != expected:
+            raise HTTPException(status_code=409, detail=f"target drift detected for {target_id}; re-plan and re-approve")
+    approval_ids = _valid_operation_approval_ids(conn, changeset, now=now)
+    return changeset, changeset_plan, typed_plan, approval_ids
+
+
+def _issue_operation_job_ticket(conn, job: Any, changeset: Any, changeset_plan: dict[str, Any], typed_plan: dict[str, Any], approval_ids: list[str]) -> tuple[dict[str, Any], str]:
+    now = int(time.time())
+    expiry_candidates = [int(changeset["expires_at"] or now + 120)]
+    if approval_ids:
+        placeholders = ",".join("?" for _ in approval_ids)
+        rows = conn.execute(f"SELECT expires_at FROM approvals WHERE id IN ({placeholders})", approval_ids).fetchall()
+        expiry_candidates.extend(int(row["expires_at"]) for row in rows)
+    ttl_seconds = max(1, min(120, min(expiry_candidates) - now))
+    preconditions = {
+        "operation_job_id": job["id"],
+        "operation_plan_id": job["operation_plan_id"],
+        "executor": job["executor"],
+        "typed_plan_hash": typed_plan["plan_hash"],
+        "policy_generation": int(changeset["policy_generation"]),
+    }
+    try:
+        ticket, signature = issue_ticket(
+            changeset["id"],
+            changeset["plan_hash"],
+            changeset_plan,
+            ttl_seconds=ttl_seconds,
+            preconditions=preconditions,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    request = json.loads(job["request_json"] or "{}")
+    request["authorization"] = {
+        "ticket_hash": sha256_hex(ticket),
+        "issued_at": ticket["issued_at"],
+        "expires_at": ticket["expires_at"],
+        "approval_ids": approval_ids,
+        "policy_generation": int(changeset["policy_generation"]),
+        "plan_hash": changeset["plan_hash"],
+    }
+    conn.execute("UPDATE operation_jobs SET request_json=?,updated_at=? WHERE id=?", (json.dumps(request, sort_keys=True), now, job["id"]))
+    return ticket, signature
+
+
+def _verify_operation_job_ticket(conn, job: Any, ticket: dict[str, Any], signature: str, *, require_fresh: bool) -> dict[str, Any]:
+    changeset, changeset_plan, typed_plan, request = _operation_job_bound_plan(conn, job, require_current_policy=False)
+    authorization = request.get("authorization") or {}
+    if not authorization.get("ticket_hash"):
+        raise HTTPException(status_code=409, detail="operation job has no issued execution ticket")
+    try:
+        verify_ticket(ticket, signature, require_fresh=require_fresh)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if sha256_hex(ticket) != authorization["ticket_hash"]:
+        raise HTTPException(status_code=409, detail="execution ticket does not match the authorized operation job")
+    if ticket.get("changeset_id") != changeset["id"] or ticket.get("plan_hash") != changeset["plan_hash"] or ticket.get("plan") != changeset_plan:
+        raise HTTPException(status_code=409, detail="execution ticket ChangeSet binding mismatch")
+    preconditions = ticket.get("preconditions") or {}
+    expected = {
+        "operation_job_id": job["id"],
+        "operation_plan_id": job["operation_plan_id"],
+        "executor": job["executor"],
+        "typed_plan_hash": typed_plan["plan_hash"],
+        "policy_generation": int(changeset["policy_generation"]),
+    }
+    if preconditions != expected:
+        raise HTTPException(status_code=409, detail="execution ticket operation preconditions mismatch")
+    return authorization
+
+
+@app.get("/v1/operations-center/contracts")
+def operations_center_contracts() -> dict[str, Any]:
+    return operations.contracts()
+
+
+@app.get("/v1/operations-center/overview")
+def operations_center_overview(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_admin(authorization)
+    with closing(db.connect()) as conn:
+        fleet = [_fleet_entry(conn, row) for row in conn.execute("SELECT * FROM clusters WHERE status='configured' ORDER BY name").fetchall()]
+        providers = [_infrastructure_provider_dict(row) for row in conn.execute("SELECT * FROM infrastructure_providers WHERE status='configured' ORDER BY name").fetchall()]
+        artifacts = [_artifact_mirror_item_dict(row) for row in conn.execute("SELECT * FROM artifact_mirror_items WHERE status='configured' ORDER BY name").fetchall()]
+        pending = conn.execute("SELECT COUNT(*) FROM operation_jobs WHERE state IN ('WAITING_APPROVAL','READY','RUNNING','PAUSED')").fetchone()[0]
+        verification_failures = conn.execute("SELECT COUNT(*) FROM verification_results WHERE status='FAIL'").fetchone()[0]
+    return {
+        "fleet": fleet,
+        "providers": providers,
+        "artifacts": artifacts,
+        "pending_operation_jobs": pending,
+        "verification_failures": verification_failures,
+        "credential_material_exposed": False,
+        "mutation_backend": "shared-governed-intent-planner",
+    }
+
+
+@app.get("/v1/fleet/clusters")
+def fleet_clusters(authorization: str | None = Header(default=None)) -> list[dict[str, Any]]:
+    _require_admin(authorization)
+    with closing(db.connect()) as conn:
+        return [_fleet_entry(conn, row) for row in conn.execute("SELECT * FROM clusters WHERE status='configured' ORDER BY name").fetchall()]
+
+
+@app.get("/v1/infrastructure-providers")
+def list_infrastructure_providers(authorization: str | None = Header(default=None)) -> list[dict[str, Any]]:
+    _require_admin(authorization)
+    with closing(db.connect()) as conn:
+        rows = conn.execute("SELECT * FROM infrastructure_providers ORDER BY name").fetchall()
+    return [_infrastructure_provider_dict(row) for row in rows]
+
+
+@app.post("/v1/infrastructure-providers", status_code=201)
+def create_infrastructure_provider(payload: InfrastructureProviderCreate, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_admin(authorization)
+    _validate_credential_metadata(payload.capabilities)
+    _reject_embedded_url_credentials(payload.endpoint, "provider endpoint")
+    provider_id = f"ipr_{uuid.uuid4().hex[:16]}"
+    now = int(time.time())
+    with closing(db.connect()) as conn:
+        cred = _get_credential_ref(conn, payload.credential_ref)
+        if cred["status"] != "configured":
+            raise HTTPException(status_code=409, detail="provider credential reference is not configured")
+        try:
+            conn.execute(
+                "INSERT INTO infrastructure_providers (id,name,kind,endpoint,credential_ref,api_version,implementation_version,site,zone,capabilities_json,labels_json,status,health_status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (provider_id, payload.name, payload.kind, payload.endpoint, payload.credential_ref, payload.api_version, payload.implementation_version, payload.site, payload.zone, json.dumps(payload.capabilities, sort_keys=True), json.dumps(payload.labels, sort_keys=True), "configured", "UNKNOWN", now, now),
+            )
+        except Exception as exc:
+            if "UNIQUE constraint failed" in str(exc):
+                raise HTTPException(status_code=409, detail="infrastructure provider name already exists") from exc
+            raise
+        db.audit(conn, "infrastructure_provider.created", "admin", "infrastructure_provider", provider_id, {"kind": payload.kind, "api_version": payload.api_version, "implementation_version": payload.implementation_version, "credential_ref": payload.credential_ref})
+        conn.commit()
+        row = _get_infrastructure_provider(conn, provider_id)
+    return _infrastructure_provider_dict(row)
+
+
+@app.post("/v1/infrastructure-providers/{provider_id}/health")
+def record_infrastructure_provider_health(provider_id: str, payload: InfrastructureProviderHealth, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_admin(authorization)
+    _validate_credential_metadata(payload.evidence)
+    with closing(db.connect()) as conn:
+        _get_infrastructure_provider(conn, provider_id)
+        conn.execute("UPDATE infrastructure_providers SET health_status=?,health_detail=?,last_health_at=?,updated_at=? WHERE id=?", (payload.status, payload.detail, payload.observed_at, int(time.time()), provider_id))
+        db.audit(conn, "infrastructure_provider.health_recorded", "admin", "infrastructure_provider", provider_id, {"status": payload.status, "observed_at": payload.observed_at, "evidence": payload.evidence})
+        conn.commit()
+        row = _get_infrastructure_provider(conn, provider_id)
+    return _infrastructure_provider_dict(row)
+
+
+@app.get("/v1/artifact-mirror/items")
+def list_artifact_mirror_items(authorization: str | None = Header(default=None)) -> list[dict[str, Any]]:
+    _require_admin(authorization)
+    with closing(db.connect()) as conn:
+        rows = conn.execute("SELECT * FROM artifact_mirror_items ORDER BY name").fetchall()
+    return [_artifact_mirror_item_dict(row) for row in rows]
+
+
+@app.post("/v1/artifact-mirror/items", status_code=201)
+def create_artifact_mirror_item(payload: ArtifactMirrorItemCreate, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_admin(authorization)
+    _reject_embedded_url_credentials(payload.source, "artifact source")
+    _reject_embedded_url_credentials(payload.destination, "artifact destination")
+    artifact_id = f"art_{uuid.uuid4().hex[:16]}"
+    now = int(time.time())
+    with closing(db.connect()) as conn:
+        try:
+            conn.execute(
+                "INSERT INTO artifact_mirror_items (id,name,kind,source,destination,version,digest,labels_json,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (artifact_id, payload.name, payload.kind, payload.source, payload.destination, payload.version, payload.digest, json.dumps(payload.labels, sort_keys=True), "configured", now, now),
+            )
+        except Exception as exc:
+            if "UNIQUE constraint failed" in str(exc):
+                raise HTTPException(status_code=409, detail="artifact mirror item name already exists") from exc
+            raise
+        db.audit(conn, "artifact_mirror_item.created", "admin", "artifact", artifact_id, {"kind": payload.kind, "version": payload.version, "digest": payload.digest})
+        conn.commit()
+        row = _get_artifact_mirror_item(conn, artifact_id)
+    return _artifact_mirror_item_dict(row)
+
+
+@app.get("/v1/operation-plans")
+def list_operation_plans(authorization: str | None = Header(default=None)) -> list[dict[str, Any]]:
+    _require_admin(authorization)
+    with closing(db.connect()) as conn:
+        rows = conn.execute("SELECT * FROM operation_plans ORDER BY created_at DESC,id DESC").fetchall()
+    return [_operation_plan_dict(row) for row in rows]
+
+
+@app.get("/v1/operation-jobs")
+def list_operation_jobs(authorization: str | None = Header(default=None)) -> list[dict[str, Any]]:
+    _require_admin(authorization)
+    with closing(db.connect()) as conn:
+        rows = conn.execute("SELECT * FROM operation_jobs ORDER BY created_at DESC,id DESC").fetchall()
+    return [_operation_job_dict(row) for row in rows]
+
+
+@app.post("/v1/operations-center/intents/plan", status_code=201)
+def plan_operations_intent(payload: OperationsIntentPlanCreate, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    selector = payload.selector.model_dump()
+    _validate_credential_metadata(payload.parameters)
+    _validate_credential_metadata(payload.desired_state)
+    if payload.domain == "read":
+        _require_admin(authorization)
+        try:
+            query_plan = operations.read_query_plan(operation=payload.operation, selector=selector, parameters=payload.parameters)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {"mode": "read", "query_plan": query_plan, "changeset": None, "operation_job": None}
+
+    _require_bot(authorization)
+    _require_bot_origin(payload.source_channel)
+    with closing(db.connect()) as conn:
+        if payload.domain == "day2":
+            if not payload.target_id or not payload.target_id.startswith("clu_"):
+                raise HTTPException(status_code=422, detail="day2 intent requires target_id for a cluster")
+            cluster = _cluster_dict(_get_cluster(conn, payload.target_id))
+            if cluster["state"] != "READY" and payload.operation not in {"cluster.template.clone", "cluster.disaster-recovery"}:
+                raise HTTPException(status_code=409, detail="day-2 target cluster must be READY")
+            target = _cluster_snapshot(conn, payload.target_id)
+            try:
+                typed_plan = operations.day2_plan(operation=payload.operation, targets=[target], parameters=payload.parameters)
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            result = _plan_mutation(conn, typed_plan=typed_plan, target_id=payload.target_id, subject_type="cluster", subject_id=payload.target_id, requested_by=payload.requested_by, source_channel=payload.source_channel, adapter="provider", ttl_seconds=payload.ttl_seconds, executor="cluster-provider-worker")
+        elif payload.domain == "fleet":
+            targets = _select_fleet_targets(conn, selector)
+            try:
+                typed_plan = operations.fleet_plan(operation=payload.operation, selector=selector, targets=targets, parameters=payload.parameters)
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            fleet_id = _store_fleet_target_snapshot(conn, selector, targets)
+            result = _plan_mutation(conn, typed_plan=typed_plan, target_id=fleet_id, subject_type="fleet", subject_id=fleet_id, requested_by=payload.requested_by, source_channel=payload.source_channel, adapter="fleet", ttl_seconds=payload.ttl_seconds, executor="fleet-provider-worker")
+        elif payload.domain in {"cloud", "bare-metal", "network"}:
+            if not payload.provider_id:
+                raise HTTPException(status_code=422, detail="infrastructure intent requires provider_id")
+            provider = _infrastructure_provider_dict(_get_infrastructure_provider(conn, payload.provider_id))
+            allowed_kinds = {
+                "cloud": set(operations.CLOUD_PROVIDER_CONTRACTS),
+                "bare-metal": set(operations.BARE_METAL_PROVIDER_CONTRACTS),
+                "network": set(operations.NETWORK_PROVIDER_CONTRACTS),
+            }[payload.domain]
+            if provider["kind"] not in allowed_kinds:
+                raise HTTPException(status_code=422, detail=f"provider kind {provider['kind']} does not match {payload.domain} domain")
+            provider_snapshot = _infrastructure_provider_snapshot(conn, payload.provider_id)
+            subject_targets: list[dict[str, Any]] = []
+            if payload.target_id:
+                subject_targets.append(_target_snapshot(conn, payload.target_id))
+            try:
+                typed_plan = operations.infrastructure_plan(provider=provider, provider_snapshot=provider_snapshot, operation=payload.operation, subject_targets=subject_targets, desired_state=payload.desired_state)
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            adapter = {"cloud": "cloud", "bare-metal": "bare-metal", "network": "network"}[payload.domain]
+            result = _plan_mutation(conn, typed_plan=typed_plan, target_id=payload.provider_id, subject_type="provider", subject_id=payload.provider_id, requested_by=payload.requested_by, source_channel=payload.source_channel, adapter=adapter, ttl_seconds=payload.ttl_seconds, executor=f"{provider['kind']}-provider-worker")
+        elif payload.domain == "artifact":
+            if not payload.target_id or not payload.target_id.startswith("art_"):
+                raise HTTPException(status_code=422, detail="artifact intent requires target_id for an artifact mirror item")
+            artifact_snapshot = _artifact_mirror_snapshot(conn, payload.target_id)
+            typed_plan = operations.artifact_mirror_plan(artifact_snapshot=artifact_snapshot, parameters=payload.parameters)
+            result = _plan_mutation(conn, typed_plan=typed_plan, target_id=payload.target_id, subject_type="artifact", subject_id=payload.target_id, requested_by=payload.requested_by, source_channel=payload.source_channel, adapter="artifact", ttl_seconds=payload.ttl_seconds, executor="artifact-mirror-worker")
+        else:
+            raise HTTPException(status_code=422, detail="unsupported operations intent domain")
+        conn.commit()
+    return {"mode": "mutation", **result}
+
+
+@app.post("/v1/operation-jobs/{job_id}/authorize")
+def authorize_operation_job(job_id: str, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_bot(authorization)
+    with closing(db.connect()) as conn:
+        job = conn.execute("SELECT * FROM operation_jobs WHERE id=?", (job_id,)).fetchone()
+        if not job:
+            raise HTTPException(status_code=404, detail="operation job not found")
+        if job["state"] not in {"WAITING_APPROVAL", "READY"}:
+            raise HTTPException(status_code=409, detail="operation job cannot be authorized from its current state")
+        changeset, changeset_plan, typed_plan, approval_ids = _verify_operation_job_authorization(conn, job)
+        ticket, signature = _issue_operation_job_ticket(conn, job, changeset, changeset_plan, typed_plan, approval_ids)
+        now = int(time.time())
+        conn.execute("UPDATE operation_jobs SET state='READY',stage='authorized',updated_at=? WHERE id=?", (now, job_id))
+        conn.execute("UPDATE operation_plans SET state='READY',updated_at=? WHERE id=?", (now, job["operation_plan_id"]))
+        db.audit(conn, "operation_job.authorized", "hermes-bot", "operation_job", job_id, {
+            "changeset_id": changeset["id"],
+            "plan_hash": job["plan_hash"],
+            "target_drift_check": "passed",
+            "approval_ids": approval_ids,
+            "execution_ticket_hash": sha256_hex(ticket),
+            "execution_ticket_expires_at": ticket["expires_at"],
+        })
+        conn.commit()
+        updated = conn.execute("SELECT * FROM operation_jobs WHERE id=?", (job_id,)).fetchone()
+    result = _operation_job_dict(updated)
+    result["execution_ticket"] = ticket
+    result["signature"] = signature
+    return result
+
+
+@app.post("/v1/operation-jobs/{job_id}/transition")
+def transition_operation_job(job_id: str, payload: OperationJobTransition, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_bot(authorization)
+    _validate_credential_metadata(payload.evidence)
+    allowed = {
+        "READY": {"RUNNING", "FAILED"},
+        "RUNNING": {"RUNNING", "PAUSED", "SUCCEEDED", "FAILED"},
+        "PAUSED": {"RUNNING", "FAILED"},
+        "WAITING_APPROVAL": set(),
+        "FAILED": set(),
+        "SUCCEEDED": set(),
+    }
+    with closing(db.connect()) as conn:
+        job = conn.execute("SELECT * FROM operation_jobs WHERE id=?", (job_id,)).fetchone()
+        if not job:
+            raise HTTPException(status_code=404, detail="operation job not found")
+        if payload.state not in allowed.get(job["state"], set()):
+            raise HTTPException(status_code=409, detail=f"operation job cannot transition from {job['state']} to {payload.state}")
+
+        starting_execution = job["state"] == "READY" and payload.state == "RUNNING"
+        if job["state"] == "READY":
+            changeset, _, _, current_approval_ids = _verify_operation_job_authorization(conn, job)
+            ticket_auth = _verify_operation_job_ticket(conn, job, payload.execution_ticket, payload.signature, require_fresh=True)
+            authorized_approval_ids = list(ticket_auth.get("approval_ids") or [])
+            if set(authorized_approval_ids) != set(current_approval_ids):
+                raise HTTPException(status_code=409, detail="execution ticket approvals no longer match the current exact-plan authorization")
+        else:
+            changeset, _, _, _ = _operation_job_bound_plan(conn, job, require_current_policy=False)
+            ticket_auth = _verify_operation_job_ticket(conn, job, payload.execution_ticket, payload.signature, require_fresh=False)
+            authorized_approval_ids = list(ticket_auth.get("approval_ids") or [])
+            if changeset["state"] != "EXECUTING":
+                raise HTTPException(status_code=409, detail="operation job ChangeSet is not in EXECUTING state")
+
+        now = int(time.time())
+        if starting_execution:
+            if authorized_approval_ids:
+                placeholders = ",".join("?" for _ in authorized_approval_ids)
+                changed = conn.execute(
+                    f"UPDATE approvals SET status='CONSUMED',consumed_at=?,decided_at=? WHERE id IN ({placeholders}) AND status='APPROVED' AND consumed_at IS NULL",
+                    (now, now, *authorized_approval_ids),
+                )
+                if changed.rowcount != len(authorized_approval_ids):
+                    raise HTTPException(status_code=409, detail="operation approval consumption race detected")
+            conn.execute("UPDATE changesets SET state='EXECUTING',updated_at=? WHERE id=?", (now, changeset["id"]))
+        elif job["state"] == "READY" and payload.state == "FAILED":
+            conn.execute("UPDATE changesets SET state='FAILED',updated_at=? WHERE id=?", (now, changeset["id"]))
+
+        result_json = job["result_json"]
+        if payload.state in {"SUCCEEDED", "FAILED"}:
+            result_json = json.dumps({"state": payload.state, "stage": payload.stage, "message": payload.message, "evidence": payload.evidence, "completed_at": now}, sort_keys=True)
+        conn.execute("UPDATE operation_jobs SET state=?,stage=?,result_json=?,updated_at=? WHERE id=?", (payload.state, payload.stage, result_json, now, job_id))
+        plan_state = "SUCCEEDED" if payload.state == "SUCCEEDED" else "FAILED" if payload.state == "FAILED" else payload.state
+        conn.execute("UPDATE operation_plans SET state=?,updated_at=? WHERE id=?", (plan_state, now, job["operation_plan_id"]))
+        if job["state"] in {"RUNNING", "PAUSED"} and payload.state == "SUCCEEDED":
+            conn.execute("UPDATE changesets SET state='EXECUTED',executed_at=?,updated_at=? WHERE id=?", (now, now, changeset["id"]))
+        elif job["state"] in {"RUNNING", "PAUSED"} and payload.state == "FAILED":
+            conn.execute("UPDATE changesets SET state='FAILED',executed_at=?,updated_at=? WHERE id=?", (now, now, changeset["id"]))
+        db.audit(conn, "operation_job.transitioned", "hermes-bot", "operation_job", job_id, {
+            "from": job["state"],
+            "to": payload.state,
+            "stage": payload.stage,
+            "evidence": payload.evidence,
+            "execution_ticket_hash": ticket_auth["ticket_hash"],
+            "changeset_id": changeset["id"],
+        })
+        conn.commit()
+        updated = conn.execute("SELECT * FROM operation_jobs WHERE id=?", (job_id,)).fetchone()
+    return _operation_job_dict(updated)
+
+
+@app.get("/v1/verifications")
+def list_verifications(subject_id: str | None = None, authorization: str | None = Header(default=None)) -> list[dict[str, Any]]:
+    _require_admin(authorization)
+    with closing(db.connect()) as conn:
+        if subject_id:
+            rows = conn.execute("SELECT * FROM verification_results WHERE subject_id=? ORDER BY observed_at DESC,created_at DESC", (subject_id,)).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM verification_results ORDER BY observed_at DESC,created_at DESC LIMIT 500").fetchall()
+    return [_verification_result_dict(row) for row in rows]
+
+
+@app.post("/v1/verifications", status_code=201)
+def record_verification(payload: VerificationResultCreate, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_bot(authorization)
+    checks = [check.model_dump() for check in payload.checks]
+    for check in checks:
+        _validate_credential_metadata(check.get("evidence") or {})
+    _validate_credential_metadata(payload.evidence)
+    statuses = {check["status"] for check in checks}
+    overall = "FAIL" if "FAIL" in statuses else "WARN" if "WARN" in statuses else "PASS"
+    result_id = f"ver_{uuid.uuid4().hex[:16]}"
+    now = int(time.time())
+    with closing(db.connect()) as conn:
+        if payload.operation_plan_id and not conn.execute("SELECT 1 FROM operation_plans WHERE id=?", (payload.operation_plan_id,)).fetchone():
+            raise HTTPException(status_code=404, detail="operation plan not found")
+        if payload.changeset_id:
+            _changeset(conn, payload.changeset_id)
+        conn.execute(
+            "INSERT INTO verification_results (id,operation_plan_id,changeset_id,subject_type,subject_id,status,checks_json,evidence_json,observed_at,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (result_id, payload.operation_plan_id, payload.changeset_id, payload.subject_type, payload.subject_id, overall, json.dumps(checks, sort_keys=True), json.dumps(payload.evidence, sort_keys=True), payload.observed_at, now),
+        )
+        if payload.operation_plan_id:
+            conn.execute("UPDATE operation_plans SET state=?,updated_at=? WHERE id=?", ("VERIFIED" if overall == "PASS" else "VERIFICATION_FAILED", now, payload.operation_plan_id))
+        db.audit(conn, "verification.recorded", payload.actor, "verification", result_id, {"subject_type": payload.subject_type, "subject_id": payload.subject_id, "status": overall, "operation_plan_id": payload.operation_plan_id, "changeset_id": payload.changeset_id})
+        conn.commit()
+        row = conn.execute("SELECT * FROM verification_results WHERE id=?", (result_id,)).fetchone()
+    return _verification_result_dict(row)

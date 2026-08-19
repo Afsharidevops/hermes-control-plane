@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.5.11-dev.4
+
+- add a shared typed Operations Center intent backend for Web/UI, Telegram, Hermes Bot/AI and API channels while keeping mutations bot-authenticated and ChangeSet-governed
+- add centralized fleet views/selectors with exact cluster target snapshots and fail-closed target-drift authorization
+- add advanced deterministic day-2 plan contracts for worker/node/workload/add-on/Helm/GitOps/upgrades/etcd/restore/certificates/maintenance/decommission/scaling/cloning/DR
+- add first-class typed provider foundations for VMware, OpenStack, AWS, Azure and GCP with explicit API/provider-worker version pins and Credential Service references only
+- add typed Redfish, IPMI and PXE bare-metal contracts plus switch/network desired-state contracts without arbitrary generated shell/CLI
+- add digest-pinned OCI image, Helm chart, package and Git/release artifact mirroring plans with source/destination SHA-256 verification stages
+- add generic constrained operation jobs with integrity-checked approvals, exact typed-plan/hash binding, short-lived HMAC-signed execution tickets, one-time approval consumption at execution start, and provider/cluster/artifact/fleet target-drift rejection
+- add persisted unified typed verification results with secret-shaped evidence rejection
+- add Hermes-native Operations Center fleet/provider/artifact/job/verification observability pages without mutation/approval bypass controls
+- add dev.4 source-security/config-static gates and guarded apply/validate/push scripts bound to frozen dev.3; dev.4 tagging additionally requires the exact branch-CI-green SHA
+
 ## 0.5.11-dev.3
 
 - add persisted typed ClusterBlueprint, ClusterProfile, Cluster, NodeRole, ProvisioningRun, AddonPlan, UpgradePlan and BackupPlan resources
