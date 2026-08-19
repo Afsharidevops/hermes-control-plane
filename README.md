@@ -2,7 +2,7 @@
 
 Hermes Control Plane is a self-hosted, AI-assisted DevOps control plane designed to run on a Docker/VM installation or Kubernetes while keeping privileged credentials and infrastructure execution outside the LLM trust boundary.
 
-> **0.5.11-dev.2 trust + bootstrap foundation:** Credential Service, Server Registry, deterministic SSH/host preflight, provider jobs/bootstrap planning, and first-class Radar/Hubble provider contracts are included. Infrastructure mutations remain ChangeSet/policy/approval-bound. Production images are built by GitHub Actions and published to Docker Hub; local handoff scripts do not publish images.
+> **0.5.11-dev.3 Cluster Factory + core infrastructure/day-2:** dev.2 trust/bootstrap remains intact and now backs typed ClusterBlueprint/Profile/Cluster/NodeRole/ProvisioningRun/AddonPlan/UpgradePlan/BackupPlan resources, deterministic Kubespray/K3s/RKE2 plans, Cilium/Hubble/Radar contracts, pinned add-on planning, backup/upgrade foundations, and native diagnostics. Infrastructure mutations remain ChangeSet/policy/approval/exact-hash-bound. Production images remain GitHub Actions -> Docker Hub.
 
 ## What is included
 

@@ -4,11 +4,11 @@ set -euo pipefail
 ROOT="${HERMES_REPO:-${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}}"
 cd "$ROOT"
 
-[[ "$(cat VERSION)" == "0.5.11-dev.2" ]] || { echo "VERSION is not 0.5.11-dev.2" >&2; exit 2; }
+[[ "$(cat VERSION)" == "0.5.11-dev.3" ]] || { echo "VERSION is not 0.5.11-dev.3" >&2; exit 2; }
 
 python3 -m compileall -q control-plane/src credential-service/src kubernetes-broker/src router-gateway/src node-agent/src execution-broker/src smart-router/src scripts/acceptance
-python3 scripts/acceptance/dev2-source-security-gate.py
-python3 scripts/acceptance/dev2-config-static-gate.py
+python3 scripts/acceptance/dev3-source-security-gate.py
+python3 scripts/acceptance/dev3-config-static-gate.py
 
 echo "control-plane tests:"
 PYTHONPATH=control-plane/src python3 -m pytest -q control-plane/tests
@@ -40,12 +40,12 @@ else
   echo "helm lint: SKIP (helm unavailable)"
 fi
 
-# Optional non-publishing local image compilation. Production publication is CI-owned.
+# Optional non-publishing local image compilation. Production publication remains CI-owned.
 if [[ "${HERMES_VALIDATE_LOCAL_IMAGES:-0}" == "1" ]]; then
   command -v docker >/dev/null 2>&1 || { echo "docker is required for HERMES_VALIDATE_LOCAL_IMAGES=1" >&2; exit 6; }
   for context in control-plane credential-service router-gateway smart-router execution-broker kubernetes-broker node-agent; do
-    docker build --pull=false -t "hermes-validation/${context}:0.5.11-dev.2" "$context"
+    docker build --pull=false -t "hermes-validation/${context}:0.5.11-dev.3" "$context"
   done
 fi
 
-echo "Hermes 0.5.11-dev.2 validation: PASS"
+echo "Hermes 0.5.11-dev.3 validation: PASS"

@@ -1,5 +1,5 @@
 imageNamespace: afsharidevops
-imageTag: 0.5.11-dev.2
+imageTag: 0.5.11-dev.3
 imagePullPolicy: IfNotPresent
 
 router:

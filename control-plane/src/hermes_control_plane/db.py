@@ -248,6 +248,137 @@ def init_db() -> None:
             """
         )
 
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS cluster_blueprints (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                description TEXT,
+                provider TEXT NOT NULL,
+                provider_version TEXT NOT NULL,
+                kubernetes_version TEXT NOT NULL,
+                network_plugin TEXT NOT NULL,
+                hubble_enabled INTEGER NOT NULL,
+                radar_enabled INTEGER NOT NULL,
+                topology_json TEXT NOT NULL,
+                addon_defaults_json TEXT NOT NULL,
+                addon_versions_json TEXT NOT NULL,
+                labels_json TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS cluster_profiles (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                environment_id TEXT NOT NULL,
+                blueprint_id TEXT NOT NULL,
+                server_ids_json TEXT NOT NULL,
+                overrides_json TEXT NOT NULL,
+                labels_json TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                FOREIGN KEY(environment_id) REFERENCES environments(id),
+                FOREIGN KEY(blueprint_id) REFERENCES cluster_blueprints(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS clusters (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                environment_id TEXT NOT NULL,
+                profile_id TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                kubernetes_version TEXT NOT NULL,
+                network_plugin TEXT NOT NULL,
+                state TEXT NOT NULL,
+                labels_json TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                FOREIGN KEY(environment_id) REFERENCES environments(id),
+                FOREIGN KEY(profile_id) REFERENCES cluster_profiles(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS node_roles (
+                id TEXT PRIMARY KEY,
+                profile_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                server_ids_json TEXT NOT NULL,
+                configuration_json TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                FOREIGN KEY(profile_id) REFERENCES cluster_profiles(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS provisioning_runs (
+                id TEXT PRIMARY KEY,
+                cluster_id TEXT NOT NULL,
+                profile_id TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                state TEXT NOT NULL,
+                stage TEXT NOT NULL,
+                changeset_id TEXT NOT NULL,
+                provider_job_ids_json TEXT NOT NULL,
+                plan_json TEXT NOT NULL,
+                result_json TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                FOREIGN KEY(cluster_id) REFERENCES clusters(id),
+                FOREIGN KEY(profile_id) REFERENCES cluster_profiles(id),
+                FOREIGN KEY(changeset_id) REFERENCES changesets(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS addon_plans (
+                id TEXT PRIMARY KEY,
+                cluster_id TEXT NOT NULL,
+                state TEXT NOT NULL,
+                changeset_id TEXT NOT NULL,
+                plan_json TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                FOREIGN KEY(cluster_id) REFERENCES clusters(id),
+                FOREIGN KEY(changeset_id) REFERENCES changesets(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS upgrade_plans (
+                id TEXT PRIMARY KEY,
+                cluster_id TEXT NOT NULL,
+                state TEXT NOT NULL,
+                changeset_id TEXT NOT NULL,
+                plan_json TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                FOREIGN KEY(cluster_id) REFERENCES clusters(id),
+                FOREIGN KEY(changeset_id) REFERENCES changesets(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS backup_plans (
+                id TEXT PRIMARY KEY,
+                cluster_id TEXT NOT NULL,
+                state TEXT NOT NULL,
+                changeset_id TEXT NOT NULL,
+                plan_json TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                FOREIGN KEY(cluster_id) REFERENCES clusters(id),
+                FOREIGN KEY(changeset_id) REFERENCES changesets(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS kubernetes_intelligence_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cluster_id TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                observed_at INTEGER NOT NULL,
+                summary_json TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                FOREIGN KEY(cluster_id) REFERENCES clusters(id)
+            );
+            """
+        )
+
         # Alpha.1 compatibility: preserve the old integrations table and extend it in place.
         if not _columns(conn, "integrations"):
             conn.execute(
@@ -375,7 +506,13 @@ def init_db() -> None:
             "INSERT OR IGNORE INTO system_state (key,value,updated_at) VALUES ('policy_generation','1',?)",
             (int(time.time()),),
         )
-        conn.execute("PRAGMA user_version = 6")
+        blueprint_cols = _columns(conn, "cluster_blueprints")
+        if "provider_version" not in blueprint_cols:
+            conn.execute("ALTER TABLE cluster_blueprints ADD COLUMN provider_version TEXT NOT NULL DEFAULT 'legacy-unpinned'")
+        if "addon_versions_json" not in blueprint_cols:
+            conn.execute("ALTER TABLE cluster_blueprints ADD COLUMN addon_versions_json TEXT NOT NULL DEFAULT '{}'")
+
+        conn.execute("PRAGMA user_version = 7")
         conn.commit()
 
 

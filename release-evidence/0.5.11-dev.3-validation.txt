@@ -1,0 +1,22 @@
+0.5.11-dev.3-source-security: PASS
+0.5.11-dev.3-config-static: PASS
+control-plane tests:
+............................................                             [100%]
+44 passed in 7.90s
+credential-service tests:
+............                                                             [100%]
+12 passed in 0.51s
+kubernetes-broker tests:
+..................                                                       [100%]
+18 passed in 0.19s
+execution-broker tests:
+..                                                                       [100%]
+2 passed in 0.06s
+smart-router tests:
+........................................................................ [ 61%]
+.............................................                            [100%]
+docker compose config: SKIP (docker unavailable)
+helm lint: SKIP (helm unavailable)
+Hermes 0.5.11-dev.3 validation: PASS
+
+smart-router collected tests: 117

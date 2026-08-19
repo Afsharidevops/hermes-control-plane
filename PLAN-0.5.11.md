@@ -24,7 +24,7 @@ Includes shared application/adapter substrate, signed agent-task envelopes, repl
 
 ## 0.5.11-dev.2 — trust + bootstrap foundation
 
-**Status: implementation complete in this handoff; validate/apply/push on `dev/0.5.11`.**
+**Status: COMPLETE / FROZEN at `a71b03a54ed2f619d3605c0c08d46de35ad5911c`; do not redo.**
 
 ### Credential boundary
 
@@ -78,14 +78,17 @@ GitHub Actions uses `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` GitHub Secrets an
 
 ## 0.5.11-dev.3 — cluster factory + core infrastructure
 
-Next milestone only after dev.2 is applied and CI-validated:
+**Status: implemented and locally validated in the dev.3 checkpoint workspace; requires application/commit on the real Git checkout because this archive contains no `.git`.**
 
-- ClusterBlueprint/ClusterProfile/Cluster lifecycle;
-- production Kubespray, lab/edge K3s, hardened RKE2;
-- Cilium + Hubble;
-- Radar Kubernetes intelligence;
-- storage, ingress, TLS, GitOps, observability, cost, backup and core day-2;
-- useful diagnostics inspired by Aban implemented natively where valuable.
+- persisted ClusterBlueprint/ClusterProfile/Cluster/NodeRole lifecycle resources;
+- persisted ProvisioningRun/AddonPlan/UpgradePlan/BackupPlan resources;
+- deterministic production Kubespray, lab/edge K3s and hardened RKE2 execution specs with explicit provider-version pins;
+- Cilium + Hubble networking/visibility contracts;
+- Radar Kubernetes intelligence with Hermes-native operational UI/contracts;
+- deterministic lab-minimal/lab-full/production/production-ha/production-hardened operational profiles;
+- governed Cilium/Hubble, kube-vip, MetalLB, storage, ingress, TLS, GitOps, observability, cost and backup add-on catalog with explicit version pins;
+- backup-before-upgrade and restore-verification day-2 foundations;
+- native diagnostics inspired by useful Aban ideas, with no kubectl-aban-plugin runtime dependency.
 
 ## 0.5.11-dev.4 — operations center + next-deploy infrastructure
 

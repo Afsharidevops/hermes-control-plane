@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.5.11-dev.3
+
+- add persisted typed ClusterBlueprint, ClusterProfile, Cluster, NodeRole, ProvisioningRun, AddonPlan, UpgradePlan and BackupPlan resources
+- add deterministic production Kubespray, lab/edge K3s and hardened RKE2 execution-spec contracts sourced from Server Registry and PASS preflight state, with explicit provider-version pins
+- bind cluster provisioning to HIGH-risk ChangeSets and exact-hash provider jobs per node
+- make Cilium the Cluster Factory network contract and retain Hubble authorization/redaction/aggregation requirements
+- add Hermes-native Cluster Factory and Radar/Hubble intelligence UI views without adding mutation bypasses
+- add five deterministic operational profiles (`lab-minimal`, `lab-full`, `production`, `production-ha`, `production-hardened`) plus governed Cilium/Hubble, kube-vip, MetalLB, storage, ingress, TLS, GitOps, observability, cost and backup add-ons with explicit version-pin requirements
+- add typed upgrade and backup planning foundations plus native read-only diagnostics inspired by useful Aban ideas without a kubectl-aban-plugin runtime dependency
+- add dev.3 source/security and config/static gates and update apply/validate/push handoff scripts for the frozen dev.2 boundary
+
 ## 0.5.11-dev.2
 
 - complete the isolated Credential Service with encrypted local storage, external references, safe metadata/name update, rotation, revocation, safe testing, metadata-only synchronization, audit and failure-closed behavior

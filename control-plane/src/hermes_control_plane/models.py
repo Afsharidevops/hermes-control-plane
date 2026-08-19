@@ -285,3 +285,111 @@ class ProviderJobTransition(StrictModel):
 
 class ProviderJobRetry(StrictModel):
     reason: str = Field(min_length=1, max_length=1000)
+
+
+class ClusterBlueprintCreate(StrictModel):
+    name: str = Field(min_length=1, max_length=120)
+    description: str | None = Field(default=None, max_length=1000)
+    provider: Literal["kubespray", "k3s", "rke2"] = "kubespray"
+    provider_version: str = Field(min_length=1, max_length=80)
+    kubernetes_version: str = Field(min_length=1, max_length=80)
+    network_plugin: Literal["cilium"] = "cilium"
+    hubble_enabled: bool = True
+    radar_enabled: bool = True
+    topology: dict[str, Any] = Field(default_factory=dict)
+    addon_defaults: list[str] = Field(default_factory=list, max_length=32)
+    addon_versions: dict[str, str] = Field(default_factory=dict)
+    labels: dict[str, str] = Field(default_factory=dict)
+
+
+class OperationalProfileBlueprintCreate(StrictModel):
+    name: str = Field(min_length=1, max_length=120)
+    description: str | None = Field(default=None, max_length=1000)
+    operational_profile: Literal["lab-minimal", "lab-full", "production", "production-ha", "production-hardened"]
+    kubernetes_version: str = Field(min_length=1, max_length=80)
+    provider_version: str = Field(min_length=1, max_length=80)
+    addon_versions: dict[str, str] = Field(default_factory=dict)
+    labels: dict[str, str] = Field(default_factory=dict)
+
+
+class ClusterProfileCreate(StrictModel):
+    name: str = Field(min_length=1, max_length=120)
+    environment_id: str = Field(min_length=1, max_length=80)
+    blueprint_id: str = Field(min_length=1, max_length=120)
+    server_ids: list[str] = Field(min_length=1, max_length=256)
+    overrides: dict[str, Any] = Field(default_factory=dict)
+    labels: dict[str, str] = Field(default_factory=dict)
+
+
+class ClusterCreate(StrictModel):
+    name: str = Field(min_length=1, max_length=120)
+    environment_id: str = Field(min_length=1, max_length=80)
+    profile_id: str = Field(min_length=1, max_length=120)
+    labels: dict[str, str] = Field(default_factory=dict)
+
+
+class NodeRoleCreate(StrictModel):
+    profile_id: str = Field(min_length=1, max_length=120)
+    role: Literal["control-plane", "worker", "control-plane-worker"]
+    server_ids: list[str] = Field(min_length=1, max_length=256)
+    configuration: dict[str, Any] = Field(default_factory=dict)
+
+
+class ProvisioningRunCreate(StrictModel):
+    requested_by: str = Field(min_length=1, max_length=160)
+    source_channel: Literal["telegram", "hermes-bot", "api"] = "api"
+    ttl_seconds: int = Field(default=3600, ge=60, le=86400)
+
+
+class AddonPlanCreate(StrictModel):
+    requested_by: str = Field(min_length=1, max_length=160)
+    source_channel: Literal["telegram", "hermes-bot", "api"] = "api"
+    addons: list[str] = Field(min_length=1, max_length=32)
+    versions: dict[str, str] = Field(default_factory=dict)
+    configuration: dict[str, Any] = Field(default_factory=dict)
+    ttl_seconds: int = Field(default=1800, ge=60, le=86400)
+
+
+class UpgradePlanCreate(StrictModel):
+    requested_by: str = Field(min_length=1, max_length=160)
+    source_channel: Literal["telegram", "hermes-bot", "api"] = "api"
+    target_version: str = Field(min_length=1, max_length=80)
+    strategy: dict[str, Any] = Field(default_factory=lambda: {"mode": "rolling", "max_unavailable": 1})
+    ttl_seconds: int = Field(default=3600, ge=60, le=86400)
+
+
+class BackupPlanCreate(StrictModel):
+    requested_by: str = Field(min_length=1, max_length=160)
+    source_channel: Literal["telegram", "hermes-bot", "api"] = "api"
+    provider: Literal["velero"] = "velero"
+    schedule: str = Field(min_length=1, max_length=120)
+    retention_count: int = Field(default=14, ge=1, le=3650)
+    scope: dict[str, Any] = Field(default_factory=dict)
+    ttl_seconds: int = Field(default=1800, ge=60, le=86400)
+
+
+class RadarSnapshotCreate(StrictModel):
+    observed_at: int
+    health_score: int = Field(ge=0, le=100)
+    resource_counts: dict[str, int] = Field(default_factory=dict)
+    degraded_workloads: list[str] = Field(default_factory=list, max_length=256)
+    warning_event_counts: dict[str, int] = Field(default_factory=dict)
+    addon_health: dict[str, str] = Field(default_factory=dict)
+
+
+class HubbleFlowSummaryCreate(StrictModel):
+    window_start: int
+    window_end: int
+    verdict_counts: dict[str, int] = Field(default_factory=dict)
+    workload_pairs: list[dict[str, Any]] = Field(default_factory=list, max_length=256)
+    namespace_pairs: list[dict[str, Any]] = Field(default_factory=list, max_length=256)
+    service_pairs: list[dict[str, Any]] = Field(default_factory=list, max_length=256)
+    protocol_counts: dict[str, int] = Field(default_factory=dict)
+    port_counts: dict[str, int] = Field(default_factory=dict)
+    http_method_counts: dict[str, int] = Field(default_factory=dict)
+    http_status_class_counts: dict[str, int] = Field(default_factory=dict)
+    rps: float = Field(default=0.0, ge=0)
+    byte_count: int = Field(default=0, ge=0)
+    latency_ms: dict[str, float] = Field(default_factory=dict)
+    tcp_state_counts: dict[str, int] = Field(default_factory=dict)
+    policy_drop_counts: dict[str, int] = Field(default_factory=dict)

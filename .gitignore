@@ -20,5 +20,3 @@ data/*/*
 *.crt
 *.kubeconfig
 secrets/
-.venv-dev2/
-*.py[cod]

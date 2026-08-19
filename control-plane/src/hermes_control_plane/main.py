@@ -23,6 +23,7 @@ from . import db
 from .canonical import canonical_json, sha256_hex
 from . import kubernetes as kubernetes_broker
 from . import preflight as host_preflight
+from . import cluster_factory
 from .providers import PROVIDERS, provider_descriptor
 from .tickets import issue_ticket
 from .models import (
@@ -57,10 +58,21 @@ from .models import (
     BootstrapPlanCreate,
     ProviderJobTransition,
     ProviderJobRetry,
+    ClusterBlueprintCreate,
+    OperationalProfileBlueprintCreate,
+    ClusterProfileCreate,
+    ClusterCreate,
+    NodeRoleCreate,
+    ProvisioningRunCreate,
+    AddonPlanCreate,
+    UpgradePlanCreate,
+    BackupPlanCreate,
+    RadarSnapshotCreate,
+    HubbleFlowSummaryCreate,
 )
 from .risk import approval_required, classify
 
-VERSION = "0.5.11-dev.2"
+VERSION = "0.5.11-dev.3"
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 TERMINAL_CHANGESET_STATES = {
     "REJECTED", "CANCELLED", "EXPIRED", "EXECUTED", "FAILED",
@@ -84,6 +96,10 @@ ADAPTER_CAPABILITIES: dict[str, dict[str, Any]] = {
     "radar.discover": {"adapter": "radar", "mode": "read", "default_risk": "READ", "reversible": False, "credential_class": "kubeconfig", "connection_modes": ["direct", "agent"], "approval": "none", "target_restrictions": ["read intelligence only"]},
     "radar.apply": {"adapter": "radar", "mode": "write", "default_risk": "HIGH", "reversible": True, "credential_class": "kubeconfig", "connection_modes": ["direct", "agent"], "approval": "policy", "target_restrictions": ["must execute through Hermes ChangeSet"]},
     "hubble.flows": {"adapter": "hubble", "mode": "read", "default_risk": "READ", "reversible": False, "credential_class": "kubeconfig", "connection_modes": ["direct", "agent"], "approval": "none", "target_restrictions": ["authorization, redaction, aggregation before AI/UI"]},
+    "cluster.provision.apply": {"adapter": "bootstrap", "mode": "write", "default_risk": "HIGH", "reversible": False, "credential_class": "ssh", "connection_modes": ["agent"], "approval": "policy", "target_restrictions": ["ClusterBlueprint/Profile/NodeRole typed plan", "all nodes PASS preflight", "exact ChangeSet hash"]},
+    "cluster.addons.apply": {"adapter": "provider", "mode": "write", "default_risk": "HIGH", "reversible": True, "credential_class": "kubeconfig", "connection_modes": ["direct", "agent"], "approval": "policy", "target_restrictions": ["typed AddonPlan", "explicit version pins", "exact ChangeSet hash"]},
+    "cluster.upgrade": {"adapter": "bootstrap", "mode": "write", "default_risk": "HIGH", "reversible": False, "credential_class": "ssh", "connection_modes": ["agent"], "approval": "policy", "target_restrictions": ["typed UpgradePlan", "backup-first", "provider compatibility gate"]},
+    "cluster.backup.apply": {"adapter": "provider", "mode": "write", "default_risk": "HIGH", "reversible": True, "credential_class": "kubeconfig", "connection_modes": ["direct", "agent"], "approval": "policy", "target_restrictions": ["typed BackupPlan", "restore verification required"]},
     "ssh.runbook.execute": {"adapter": "ssh", "mode": "write", "default_risk": "HIGH", "reversible": False, "credential_class": "ssh", "connection_modes": ["agent"], "approval": "policy", "target_restrictions": ["structured runbook only", "no unrestricted shell endpoint"]},
     "github.gitops": {"adapter": "github", "mode": "write", "default_risk": "HIGH", "reversible": True, "credential_class": "token", "connection_modes": ["direct"], "approval": "policy", "target_restrictions": ["controlled files", "protected branch policy"]},
     "gitlab.gitops": {"adapter": "gitlab", "mode": "write", "default_risk": "HIGH", "reversible": True, "credential_class": "token", "connection_modes": ["direct"], "approval": "policy", "target_restrictions": ["controlled files", "protected branch policy"]},
@@ -104,7 +120,7 @@ async def lifespan(_: FastAPI):
 app = FastAPI(
     title="Hermes Control Plane API",
     version=VERSION,
-    description="Hermes Control Plane 0.5.11-dev.2 development API",
+    description="Hermes Control Plane 0.5.11-dev.3 development API",
     lifespan=lifespan,
 )
 
@@ -352,6 +368,92 @@ def _server_snapshot(conn, server_id: str) -> dict[str, Any]:
     return snapshot
 
 
+def _blueprint_dict(row: Any) -> dict[str, Any]:
+    item = _row_json(row, {"topology_json": "topology", "labels_json": "labels"})
+    item["addon_defaults"] = json.loads(item.pop("addon_defaults_json") or "[]")
+    item["addon_versions"] = json.loads(item.pop("addon_versions_json") or "{}")
+    item["hubble_enabled"] = bool(item["hubble_enabled"])
+    item["radar_enabled"] = bool(item["radar_enabled"])
+    return item
+
+
+def _profile_dict(row: Any) -> dict[str, Any]:
+    item = _row_json(row, {"overrides_json": "overrides", "labels_json": "labels"})
+    item["server_ids"] = json.loads(item.pop("server_ids_json") or "[]")
+    return item
+
+
+def _cluster_dict(row: Any) -> dict[str, Any]:
+    return _row_json(row, {"labels_json": "labels"})
+
+
+def _node_role_dict(row: Any) -> dict[str, Any]:
+    item = _row_json(row, {"configuration_json": "configuration"})
+    item["server_ids"] = json.loads(item.pop("server_ids_json") or "[]")
+    return item
+
+
+def _plan_resource_dict(row: Any) -> dict[str, Any]:
+    item = dict(row)
+    item["plan"] = json.loads(item.pop("plan_json") or "{}")
+    return item
+
+
+def _provisioning_run_dict(row: Any) -> dict[str, Any]:
+    item = dict(row)
+    item["provider_job_ids"] = json.loads(item.pop("provider_job_ids_json") or "[]")
+    item["plan"] = json.loads(item.pop("plan_json") or "{}")
+    item["result"] = json.loads(item.pop("result_json") or "null")
+    return item
+
+
+def _get_blueprint(conn, blueprint_id: str):
+    row = conn.execute("SELECT * FROM cluster_blueprints WHERE id=?", (blueprint_id,)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="cluster blueprint not found")
+    return row
+
+
+def _get_profile(conn, profile_id: str):
+    row = conn.execute("SELECT * FROM cluster_profiles WHERE id=?", (profile_id,)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="cluster profile not found")
+    return row
+
+
+def _get_cluster(conn, cluster_id: str):
+    row = conn.execute("SELECT * FROM clusters WHERE id=?", (cluster_id,)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="cluster not found")
+    return row
+
+
+def _cluster_snapshot(conn, cluster_id: str) -> dict[str, Any]:
+    cluster = _cluster_dict(_get_cluster(conn, cluster_id))
+    profile = _profile_dict(_get_profile(conn, cluster["profile_id"]))
+    blueprint = _blueprint_dict(_get_blueprint(conn, profile["blueprint_id"]))
+    roles = [_node_role_dict(row) for row in conn.execute("SELECT * FROM node_roles WHERE profile_id=? AND status='configured' ORDER BY id", (profile["id"],)).fetchall()]
+    servers = [_server_snapshot(conn, server_id) for server_id in sorted(profile["server_ids"])]
+    snapshot = {
+        "entity_type": "cluster",
+        "kind": "kubernetes-cluster",
+        "id": cluster["id"],
+        "name": cluster["name"],
+        "environment_id": cluster["environment_id"],
+        "profile_id": cluster["profile_id"],
+        "provider": cluster["provider"],
+        "kubernetes_version": cluster["kubernetes_version"],
+        "network_plugin": cluster["network_plugin"],
+        "state": cluster["state"],
+        "status": cluster["status"],
+        "blueprint": {"id": blueprint["id"], "provider": blueprint["provider"], "provider_version": blueprint["provider_version"], "kubernetes_version": blueprint["kubernetes_version"], "network_plugin": blueprint["network_plugin"], "hubble_enabled": blueprint["hubble_enabled"], "radar_enabled": blueprint["radar_enabled"], "addon_versions": blueprint["addon_versions"]},
+        "node_roles": [{"id": role["id"], "role": role["role"], "server_ids": role["server_ids"]} for role in roles],
+        "server_snapshots": servers,
+    }
+    snapshot["snapshot_hash"] = sha256_hex(snapshot)
+    return snapshot
+
+
 def _application_dict(row: Any) -> dict[str, Any]:
     return _row_json(
         row,
@@ -410,6 +512,8 @@ def _target_snapshot(conn, target_id: str) -> dict[str, Any]:
     if not row:
         if target_id.startswith("srv_"):
             return _server_snapshot(conn, target_id)
+        if target_id.startswith("clu_"):
+            return _cluster_snapshot(conn, target_id)
         raise HTTPException(status_code=404, detail="target not found")
     target = _target_dict(row)
     snapshot = {
@@ -516,6 +620,10 @@ def system() -> dict[str, Any]:
             "credential_refs": conn.execute("SELECT COUNT(*) FROM credential_refs").fetchone()[0],
             "servers": conn.execute("SELECT COUNT(*) FROM servers").fetchone()[0],
             "provider_jobs": conn.execute("SELECT COUNT(*) FROM provider_jobs").fetchone()[0],
+            "cluster_blueprints": conn.execute("SELECT COUNT(*) FROM cluster_blueprints").fetchone()[0],
+            "cluster_profiles": conn.execute("SELECT COUNT(*) FROM cluster_profiles").fetchone()[0],
+            "clusters": conn.execute("SELECT COUNT(*) FROM clusters").fetchone()[0],
+            "provisioning_runs": conn.execute("SELECT COUNT(*) FROM provisioning_runs").fetchone()[0],
             "changesets": conn.execute("SELECT COUNT(*) FROM changesets").fetchone()[0],
             "applications": conn.execute("SELECT COUNT(*) FROM applications").fetchone()[0],
             "agents": conn.execute("SELECT COUNT(*) FROM agents").fetchone()[0],
@@ -527,7 +635,7 @@ def system() -> dict[str, Any]:
         "version": VERSION,
         "stage": "development",
         "runtime": os.getenv("HERMES_RUNTIME", "docker"),
-        "capabilities": ["integration-registry", "target-registry", "application-registry", "adapter-capability-contract", "credential-references", "server-registry", "ssh-preflight", "provider-lifecycle-contract", "bootstrap-jobs", "radar-provider-foundation", "hubble-provider-foundation", "changeset-planning", "risk-engine", "approval-binding", "audit", "agent-enrollment", "agent-signed-task-envelope", "kubernetes-discovery", "kubernetes-server-dry-run", "kubernetes-guarded-delete", "kubernetes-rollback", "kubernetes-rollout-verification", "helm-server-dry-run", "helm-rollback", "signed-execution-tickets"],
+        "capabilities": ["integration-registry", "target-registry", "application-registry", "adapter-capability-contract", "credential-references", "server-registry", "ssh-preflight", "provider-lifecycle-contract", "bootstrap-jobs", "cluster-factory", "cluster-blueprints", "cluster-profiles", "node-roles", "provisioning-runs", "addon-plans", "upgrade-plans", "backup-plans", "kubespray-production-path", "k3s-edge-path", "rke2-hardened-path", "cilium-hubble", "radar-kubernetes-intelligence", "native-diagnostics", "changeset-planning", "risk-engine", "approval-binding", "audit", "agent-enrollment", "agent-signed-task-envelope", "kubernetes-discovery", "kubernetes-server-dry-run", "kubernetes-guarded-delete", "kubernetes-rollback", "kubernetes-rollout-verification", "helm-server-dry-run", "helm-rollback", "signed-execution-tickets"],
         "execution_enabled": os.getenv("HERMES_EXECUTION_ENABLED", "false").lower() == "true",
         "policy_generation": policy_generation,
         "mutation_control": {
@@ -2123,3 +2231,452 @@ def enforce_audit_retention(days: int = Query(ge=1, le=3650), actor: str = Query
         db.audit(conn, "audit.retention_enforced", actor, "audit", "global", {"days": days, "cutoff": cutoff, "deleted": deleted})
         conn.commit()
     return {"retention_days": days, "deleted": deleted, "cutoff": cutoff}
+
+
+# --- 0.5.11-dev.3 Cluster Factory + core infrastructure/day-2 contracts ---
+
+@app.get("/v1/cluster-factory/contracts")
+def cluster_factory_contracts() -> dict[str, Any]:
+    return {
+        "resource_types": ["ClusterBlueprint", "ClusterProfile", "Cluster", "NodeRole", "ProvisioningRun", "AddonPlan", "UpgradePlan", "BackupPlan"],
+        "providers": cluster_factory.CLUSTER_PROVIDERS,
+        "addons": cluster_factory.ADDON_CATALOG,
+        "operational_profiles": cluster_factory.OPERATIONAL_PROFILES,
+        "radar": cluster_factory.RADAR_CONTRACT,
+        "hubble": cluster_factory.HUBBLE_CONTRACT,
+        "diagnostics": cluster_factory.NATIVE_DIAGNOSTICS,
+        "mutation_invariant": "intent -> typed plan -> ChangeSet -> deterministic preview/diff -> risk -> policy -> approval -> exact-hash binding -> constrained execution -> verification -> audit",
+        "aban_runtime_dependency": False,
+    }
+
+
+@app.get("/v1/cluster-blueprints")
+def list_cluster_blueprints(authorization: str | None = Header(default=None)) -> list[dict[str, Any]]:
+    _require_admin(authorization)
+    with closing(db.connect()) as conn:
+        rows = conn.execute("SELECT * FROM cluster_blueprints ORDER BY name").fetchall()
+    return [_blueprint_dict(row) for row in rows]
+
+
+def _validate_blueprint_addon_pins(*, addon_defaults: list[str], addon_versions: dict[str, str], hubble_enabled: bool, radar_enabled: bool) -> None:
+    required = ["cilium", "hermes-agent"]
+    if hubble_enabled:
+        required.append("hubble")
+    if radar_enabled:
+        required.append("radar")
+    selected = list(dict.fromkeys([*required, *addon_defaults]))
+    try:
+        cluster_factory._require_supported_addons(selected, addon_versions)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.get("/v1/cluster-factory/operational-profiles")
+def list_operational_profiles() -> dict[str, Any]:
+    return cluster_factory.OPERATIONAL_PROFILES
+
+
+@app.post("/v1/cluster-blueprints", status_code=201)
+def create_cluster_blueprint(payload: ClusterBlueprintCreate, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_admin(authorization)
+    _validate_blueprint_addon_pins(addon_defaults=payload.addon_defaults, addon_versions=payload.addon_versions, hubble_enabled=payload.hubble_enabled, radar_enabled=payload.radar_enabled)
+    blueprint_id = f"cbp_{uuid.uuid4().hex[:16]}"
+    now = int(time.time())
+    with closing(db.connect()) as conn:
+        try:
+            conn.execute(
+                "INSERT INTO cluster_blueprints (id,name,description,provider,provider_version,kubernetes_version,network_plugin,hubble_enabled,radar_enabled,topology_json,addon_defaults_json,addon_versions_json,labels_json,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (blueprint_id, payload.name, payload.description, payload.provider, payload.provider_version, payload.kubernetes_version, payload.network_plugin, int(payload.hubble_enabled), int(payload.radar_enabled), json.dumps(payload.topology, sort_keys=True), json.dumps(payload.addon_defaults), json.dumps(payload.addon_versions, sort_keys=True), json.dumps(payload.labels, sort_keys=True), "configured", now, now),
+            )
+        except Exception as exc:
+            if "UNIQUE constraint failed" in str(exc):
+                raise HTTPException(status_code=409, detail="cluster blueprint name already exists") from exc
+            raise
+        db.audit(conn, "cluster_blueprint.created", "admin", "cluster_blueprint", blueprint_id, {"provider": payload.provider, "provider_version": payload.provider_version, "kubernetes_version": payload.kubernetes_version})
+        conn.commit()
+        row = _get_blueprint(conn, blueprint_id)
+    return _blueprint_dict(row)
+
+
+@app.post("/v1/cluster-blueprints/from-operational-profile", status_code=201)
+def create_blueprint_from_operational_profile(payload: OperationalProfileBlueprintCreate, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_admin(authorization)
+    preset = cluster_factory.OPERATIONAL_PROFILES[payload.operational_profile]
+    addons = list(preset["addons"])
+    _validate_blueprint_addon_pins(addon_defaults=addons, addon_versions=payload.addon_versions, hubble_enabled=True, radar_enabled=True)
+    labels = {**payload.labels, "operational_profile": payload.operational_profile}
+    blueprint_id = f"cbp_{uuid.uuid4().hex[:16]}"
+    now = int(time.time())
+    with closing(db.connect()) as conn:
+        try:
+            conn.execute(
+                "INSERT INTO cluster_blueprints (id,name,description,provider,provider_version,kubernetes_version,network_plugin,hubble_enabled,radar_enabled,topology_json,addon_defaults_json,addon_versions_json,labels_json,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (blueprint_id, payload.name, payload.description, preset["provider"], payload.provider_version, payload.kubernetes_version, "cilium", 1, 1, json.dumps(preset["topology"], sort_keys=True), json.dumps(addons), json.dumps(payload.addon_versions, sort_keys=True), json.dumps(labels, sort_keys=True), "configured", now, now),
+            )
+        except Exception as exc:
+            if "UNIQUE constraint failed" in str(exc):
+                raise HTTPException(status_code=409, detail="cluster blueprint name already exists") from exc
+            raise
+        db.audit(conn, "cluster_blueprint.created_from_operational_profile", "admin", "cluster_blueprint", blueprint_id, {"operational_profile": payload.operational_profile, "provider": preset["provider"], "provider_version": payload.provider_version, "kubernetes_version": payload.kubernetes_version})
+        conn.commit()
+        row = _get_blueprint(conn, blueprint_id)
+    return _blueprint_dict(row)
+
+
+@app.get("/v1/cluster-blueprints/{blueprint_id}")
+def get_cluster_blueprint(blueprint_id: str, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_admin(authorization)
+    with closing(db.connect()) as conn:
+        row = _get_blueprint(conn, blueprint_id)
+    return _blueprint_dict(row)
+
+
+@app.get("/v1/cluster-profiles")
+def list_cluster_profiles(authorization: str | None = Header(default=None)) -> list[dict[str, Any]]:
+    _require_admin(authorization)
+    with closing(db.connect()) as conn:
+        rows = conn.execute("SELECT * FROM cluster_profiles ORDER BY name").fetchall()
+    return [_profile_dict(row) for row in rows]
+
+
+@app.post("/v1/cluster-profiles", status_code=201)
+def create_cluster_profile(payload: ClusterProfileCreate, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_admin(authorization)
+    if len(payload.server_ids) != len(set(payload.server_ids)):
+        raise HTTPException(status_code=422, detail="cluster profile server_ids must be unique")
+    profile_id = f"cpf_{uuid.uuid4().hex[:16]}"
+    now = int(time.time())
+    with closing(db.connect()) as conn:
+        _get_environment(conn, payload.environment_id)
+        blueprint = _get_blueprint(conn, payload.blueprint_id)
+        if blueprint["status"] != "configured":
+            raise HTTPException(status_code=409, detail="cluster blueprint is disabled")
+        for server_id in payload.server_ids:
+            server = _get_server(conn, server_id)
+            if server["environment_id"] != payload.environment_id:
+                raise HTTPException(status_code=409, detail=f"server {server_id} is in a different environment")
+            if server["status"] != "configured":
+                raise HTTPException(status_code=409, detail=f"server {server_id} is disabled")
+        try:
+            conn.execute(
+                "INSERT INTO cluster_profiles (id,name,environment_id,blueprint_id,server_ids_json,overrides_json,labels_json,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (profile_id, payload.name, payload.environment_id, payload.blueprint_id, json.dumps(payload.server_ids), json.dumps(payload.overrides, sort_keys=True), json.dumps(payload.labels, sort_keys=True), "configured", now, now),
+            )
+        except Exception as exc:
+            if "UNIQUE constraint failed" in str(exc):
+                raise HTTPException(status_code=409, detail="cluster profile name already exists") from exc
+            raise
+        db.audit(conn, "cluster_profile.created", "admin", "cluster_profile", profile_id, {"blueprint_id": payload.blueprint_id, "server_count": len(payload.server_ids)})
+        conn.commit()
+        row = _get_profile(conn, profile_id)
+    return _profile_dict(row)
+
+
+@app.get("/v1/cluster-profiles/{profile_id}")
+def get_cluster_profile(profile_id: str, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_admin(authorization)
+    with closing(db.connect()) as conn:
+        row = _get_profile(conn, profile_id)
+    return _profile_dict(row)
+
+
+@app.get("/v1/node-roles")
+def list_node_roles(profile_id: str | None = None, authorization: str | None = Header(default=None)) -> list[dict[str, Any]]:
+    _require_admin(authorization)
+    with closing(db.connect()) as conn:
+        rows = conn.execute("SELECT * FROM node_roles WHERE (? IS NULL OR profile_id=?) ORDER BY created_at,id", (profile_id, profile_id)).fetchall()
+    return [_node_role_dict(row) for row in rows]
+
+
+@app.post("/v1/node-roles", status_code=201)
+def create_node_role(payload: NodeRoleCreate, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_admin(authorization)
+    if len(payload.server_ids) != len(set(payload.server_ids)):
+        raise HTTPException(status_code=422, detail="NodeRole server_ids must be unique")
+    role_id = f"nrl_{uuid.uuid4().hex[:16]}"
+    now = int(time.time())
+    with closing(db.connect()) as conn:
+        profile = _profile_dict(_get_profile(conn, payload.profile_id))
+        outside = sorted(set(payload.server_ids) - set(profile["server_ids"]))
+        if outside:
+            raise HTTPException(status_code=409, detail=f"NodeRole servers are not in profile: {', '.join(outside)}")
+        assigned: set[str] = set()
+        for row in conn.execute("SELECT server_ids_json FROM node_roles WHERE profile_id=? AND status='configured'", (payload.profile_id,)).fetchall():
+            assigned.update(json.loads(row["server_ids_json"] or "[]"))
+        overlap = sorted(assigned.intersection(payload.server_ids))
+        if overlap:
+            raise HTTPException(status_code=409, detail=f"servers already have a NodeRole: {', '.join(overlap)}")
+        conn.execute(
+            "INSERT INTO node_roles (id,profile_id,role,server_ids_json,configuration_json,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)",
+            (role_id, payload.profile_id, payload.role, json.dumps(payload.server_ids), json.dumps(payload.configuration, sort_keys=True), "configured", now, now),
+        )
+        db.audit(conn, "node_role.created", "admin", "node_role", role_id, {"profile_id": payload.profile_id, "role": payload.role, "server_ids": payload.server_ids})
+        conn.commit()
+        row = conn.execute("SELECT * FROM node_roles WHERE id=?", (role_id,)).fetchone()
+    return _node_role_dict(row)
+
+
+@app.get("/v1/clusters")
+def list_clusters(authorization: str | None = Header(default=None)) -> list[dict[str, Any]]:
+    _require_admin(authorization)
+    with closing(db.connect()) as conn:
+        rows = conn.execute("SELECT * FROM clusters ORDER BY name").fetchall()
+    return [_cluster_dict(row) for row in rows]
+
+
+@app.post("/v1/clusters", status_code=201)
+def create_cluster(payload: ClusterCreate, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_admin(authorization)
+    cluster_id = f"clu_{uuid.uuid4().hex[:16]}"
+    now = int(time.time())
+    with closing(db.connect()) as conn:
+        _get_environment(conn, payload.environment_id)
+        profile = _profile_dict(_get_profile(conn, payload.profile_id))
+        if profile["environment_id"] != payload.environment_id:
+            raise HTTPException(status_code=409, detail="cluster and profile environments must match")
+        blueprint = _blueprint_dict(_get_blueprint(conn, profile["blueprint_id"]))
+        try:
+            conn.execute(
+                "INSERT INTO clusters (id,name,environment_id,profile_id,provider,kubernetes_version,network_plugin,state,labels_json,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (cluster_id, payload.name, payload.environment_id, payload.profile_id, blueprint["provider"], blueprint["kubernetes_version"], blueprint["network_plugin"], "DRAFT", json.dumps(payload.labels, sort_keys=True), "configured", now, now),
+            )
+        except Exception as exc:
+            if "UNIQUE constraint failed" in str(exc):
+                raise HTTPException(status_code=409, detail="cluster name already exists") from exc
+            raise
+        db.audit(conn, "cluster.created", "admin", "cluster", cluster_id, {"profile_id": payload.profile_id, "provider": blueprint["provider"]})
+        conn.commit()
+        row = _get_cluster(conn, cluster_id)
+    return _cluster_dict(row)
+
+
+@app.get("/v1/clusters/{cluster_id}")
+def get_cluster(cluster_id: str, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_admin(authorization)
+    with closing(db.connect()) as conn:
+        row = _get_cluster(conn, cluster_id)
+    return _cluster_dict(row)
+
+
+@app.get("/v1/provisioning-runs")
+def list_provisioning_runs(authorization: str | None = Header(default=None)) -> list[dict[str, Any]]:
+    _require_admin(authorization)
+    with closing(db.connect()) as conn:
+        rows = conn.execute("SELECT * FROM provisioning_runs ORDER BY created_at DESC,id DESC").fetchall()
+    return [_provisioning_run_dict(row) for row in rows]
+
+
+@app.post("/v1/clusters/{cluster_id}/provisioning-runs", status_code=201)
+def create_provisioning_run(cluster_id: str, payload: ProvisioningRunCreate, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_bot(authorization)
+    _require_bot_origin(payload.source_channel)
+    with closing(db.connect()) as conn:
+        cluster = _cluster_dict(_get_cluster(conn, cluster_id))
+        if cluster["state"] not in {"DRAFT", "ERROR"}:
+            raise HTTPException(status_code=409, detail=f"cluster cannot be provisioned from state {cluster['state']}")
+        profile = _profile_dict(_get_profile(conn, cluster["profile_id"]))
+        blueprint = _blueprint_dict(_get_blueprint(conn, profile["blueprint_id"]))
+        roles = [_node_role_dict(row) for row in conn.execute("SELECT * FROM node_roles WHERE profile_id=? AND status='configured' ORDER BY created_at,id", (profile["id"],)).fetchall()]
+        servers = [_server_dict(_get_server(conn, server_id)) for server_id in profile["server_ids"]]
+        try:
+            typed_plan = cluster_factory.provisioning_plan(cluster=cluster, blueprint=blueprint, profile=profile, node_roles=roles, servers=servers)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        params = {"resource_type": "ProvisioningRun", "typed_plan": typed_plan, "profile_id": profile["id"], "provider": blueprint["provider"]}
+        changeset = _insert_changeset(
+            conn, operation="cluster.provision.apply", adapter="bootstrap", target_id=cluster_id,
+            requested_by=payload.requested_by, source_channel=payload.source_channel, source_revision=None,
+            parameters=params, policy_generation=db.get_policy_generation(conn), ttl_seconds=payload.ttl_seconds,
+        )
+        preview = {"summary": f"Provision cluster {cluster['name']} with {blueprint['provider']}", "details": typed_plan, "source": "cluster-factory-deterministic-planner"}
+        conn.execute("UPDATE changesets SET preview_json=?,state='PREVIEWED',updated_at=? WHERE id=?", (json.dumps(preview, sort_keys=True), int(time.time()), changeset["id"]))
+        now = int(time.time())
+        job_ids: list[str] = []
+        for node in typed_plan["nodes"]:
+            job_id = f"job_{uuid.uuid4().hex[:16]}"
+            job_ids.append(job_id)
+            request = {"cluster_id": cluster_id, "provider": blueprint["provider"], "node": node, "typed_plan_hash": typed_plan["plan_hash"]}
+            conn.execute(
+                "INSERT INTO provider_jobs (id,provider_id,server_id,changeset_id,operation,state,stage,attempt,max_attempts,plan_hash,request_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (job_id, blueprint["provider"], node["server_id"], changeset["id"], "cluster.provision.apply", "WAITING_APPROVAL", "plan", 1, 3, changeset["plan_hash"], json.dumps(request, sort_keys=True), now, now),
+            )
+            _provider_job_event(conn, job_id, "plan", "WAITING_APPROVAL", "Cluster provisioning node job is blocked on exact ChangeSet approval", {"cluster_id": cluster_id, "role": node["role"]})
+        run_id = f"prn_{uuid.uuid4().hex[:16]}"
+        conn.execute(
+            "INSERT INTO provisioning_runs (id,cluster_id,profile_id,provider,state,stage,changeset_id,provider_job_ids_json,plan_json,result_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (run_id, cluster_id, profile["id"], blueprint["provider"], "WAITING_APPROVAL", "plan", changeset["id"], json.dumps(job_ids), json.dumps(typed_plan, sort_keys=True), None, now, now),
+        )
+        conn.execute("UPDATE clusters SET state='PLANNED',updated_at=? WHERE id=?", (now, cluster_id))
+        db.audit(conn, "cluster.provisioning_planned", payload.requested_by, "provisioning_run", run_id, {"cluster_id": cluster_id, "changeset_id": changeset["id"], "provider_job_ids": job_ids, "typed_plan_hash": typed_plan["plan_hash"]})
+        conn.commit()
+        row = conn.execute("SELECT * FROM provisioning_runs WHERE id=?", (run_id,)).fetchone()
+        chg = conn.execute("SELECT * FROM changesets WHERE id=?", (changeset["id"],)).fetchone()
+    return {**_provisioning_run_dict(row), "changeset": _changeset_dict(chg)}
+
+
+@app.post("/v1/provisioning-runs/{run_id}/refresh")
+def refresh_provisioning_run(run_id: str, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_admin(authorization)
+    now = int(time.time())
+    with closing(db.connect()) as conn:
+        row = conn.execute("SELECT * FROM provisioning_runs WHERE id=?", (run_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="provisioning run not found")
+        run = _provisioning_run_dict(row)
+        jobs = [conn.execute("SELECT * FROM provider_jobs WHERE id=?", (job_id,)).fetchone() for job_id in run["provider_job_ids"]]
+        if any(job is None for job in jobs):
+            raise HTTPException(status_code=409, detail="provisioning run references a missing provider job")
+        states = [job["state"] for job in jobs]
+        if all(state == "SUCCEEDED" for state in states):
+            state, stage, cluster_state = "SUCCEEDED", "verify", "READY"
+        elif any(state == "FAILED" for state in states):
+            state, stage, cluster_state = "FAILED", "verify", "ERROR"
+        elif any(state == "RUNNING" for state in states):
+            state, stage, cluster_state = "RUNNING", "apply", "PROVISIONING"
+        elif all(state == "READY" for state in states):
+            state, stage, cluster_state = "READY", "apply", "PLANNED"
+        else:
+            state, stage, cluster_state = "WAITING_APPROVAL", "plan", "PLANNED"
+        result = {"provider_job_states": {job["id"]: job["state"] for job in jobs}}
+        conn.execute("UPDATE provisioning_runs SET state=?,stage=?,result_json=?,updated_at=? WHERE id=?", (state, stage, json.dumps(result, sort_keys=True), now, run_id))
+        conn.execute("UPDATE clusters SET state=?,updated_at=? WHERE id=?", (cluster_state, now, run["cluster_id"]))
+        db.audit(conn, "provisioning_run.refreshed", "admin", "provisioning_run", run_id, {"state": state, "cluster_state": cluster_state})
+        conn.commit()
+        updated = conn.execute("SELECT * FROM provisioning_runs WHERE id=?", (run_id,)).fetchone()
+    return _provisioning_run_dict(updated)
+
+
+@app.get("/v1/addon-plans")
+def list_addon_plans(authorization: str | None = Header(default=None)) -> list[dict[str, Any]]:
+    _require_admin(authorization)
+    with closing(db.connect()) as conn:
+        rows = conn.execute("SELECT * FROM addon_plans ORDER BY created_at DESC,id DESC").fetchall()
+    return [_plan_resource_dict(row) for row in rows]
+
+
+@app.post("/v1/clusters/{cluster_id}/addon-plans", status_code=201)
+def create_addon_plan(cluster_id: str, payload: AddonPlanCreate, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_bot(authorization)
+    _require_bot_origin(payload.source_channel)
+    with closing(db.connect()) as conn:
+        cluster = _cluster_dict(_get_cluster(conn, cluster_id))
+        if cluster["state"] != "READY":
+            raise HTTPException(status_code=409, detail="cluster must be READY before add-on planning")
+        try:
+            typed_plan = cluster_factory.addon_plan(cluster=cluster, addons=payload.addons, versions=payload.versions, configuration=payload.configuration)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        changeset = _insert_changeset(conn, operation="cluster.addons.apply", adapter="provider", target_id=cluster_id, requested_by=payload.requested_by, source_channel=payload.source_channel, source_revision=None, parameters={"resource_type": "AddonPlan", "typed_plan": typed_plan}, policy_generation=db.get_policy_generation(conn), ttl_seconds=payload.ttl_seconds)
+        preview = {"summary": f"Apply {len(payload.addons)} governed add-ons to {cluster['name']}", "details": typed_plan, "source": "cluster-factory-addon-planner"}
+        conn.execute("UPDATE changesets SET preview_json=?,state='PREVIEWED',updated_at=? WHERE id=?", (json.dumps(preview, sort_keys=True), int(time.time()), changeset["id"]))
+        plan_id, now = f"adp_{uuid.uuid4().hex[:16]}", int(time.time())
+        conn.execute("INSERT INTO addon_plans (id,cluster_id,state,changeset_id,plan_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?)", (plan_id, cluster_id, "PLANNED", changeset["id"], json.dumps(typed_plan, sort_keys=True), now, now))
+        db.audit(conn, "addon_plan.created", payload.requested_by, "addon_plan", plan_id, {"cluster_id": cluster_id, "changeset_id": changeset["id"], "plan_hash": typed_plan["plan_hash"]})
+        conn.commit()
+        row = conn.execute("SELECT * FROM addon_plans WHERE id=?", (plan_id,)).fetchone()
+        chg = conn.execute("SELECT * FROM changesets WHERE id=?", (changeset["id"],)).fetchone()
+    return {**_plan_resource_dict(row), "changeset": _changeset_dict(chg)}
+
+
+@app.get("/v1/upgrade-plans")
+def list_upgrade_plans(authorization: str | None = Header(default=None)) -> list[dict[str, Any]]:
+    _require_admin(authorization)
+    with closing(db.connect()) as conn:
+        rows = conn.execute("SELECT * FROM upgrade_plans ORDER BY created_at DESC,id DESC").fetchall()
+    return [_plan_resource_dict(row) for row in rows]
+
+
+@app.post("/v1/clusters/{cluster_id}/upgrade-plans", status_code=201)
+def create_upgrade_plan(cluster_id: str, payload: UpgradePlanCreate, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_bot(authorization)
+    _require_bot_origin(payload.source_channel)
+    with closing(db.connect()) as conn:
+        cluster = _cluster_dict(_get_cluster(conn, cluster_id))
+        if cluster["state"] != "READY":
+            raise HTTPException(status_code=409, detail="cluster must be READY before upgrade planning")
+        if payload.target_version == cluster["kubernetes_version"]:
+            raise HTTPException(status_code=422, detail="target_version must differ from the current Kubernetes version")
+        typed_plan = cluster_factory.upgrade_plan(cluster=cluster, provider=cluster["provider"], target_version=payload.target_version, strategy=payload.strategy)
+        changeset = _insert_changeset(conn, operation="cluster.upgrade", adapter="bootstrap", target_id=cluster_id, requested_by=payload.requested_by, source_channel=payload.source_channel, source_revision=None, parameters={"resource_type": "UpgradePlan", "typed_plan": typed_plan}, policy_generation=db.get_policy_generation(conn), ttl_seconds=payload.ttl_seconds)
+        preview = {"summary": f"Upgrade {cluster['name']} from {cluster['kubernetes_version']} to {payload.target_version}", "details": typed_plan, "source": "cluster-factory-upgrade-planner"}
+        conn.execute("UPDATE changesets SET preview_json=?,state='PREVIEWED',updated_at=? WHERE id=?", (json.dumps(preview, sort_keys=True), int(time.time()), changeset["id"]))
+        plan_id, now = f"upg_{uuid.uuid4().hex[:16]}", int(time.time())
+        conn.execute("INSERT INTO upgrade_plans (id,cluster_id,state,changeset_id,plan_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?)", (plan_id, cluster_id, "PLANNED", changeset["id"], json.dumps(typed_plan, sort_keys=True), now, now))
+        db.audit(conn, "upgrade_plan.created", payload.requested_by, "upgrade_plan", plan_id, {"cluster_id": cluster_id, "changeset_id": changeset["id"], "plan_hash": typed_plan["plan_hash"]})
+        conn.commit()
+        row = conn.execute("SELECT * FROM upgrade_plans WHERE id=?", (plan_id,)).fetchone()
+        chg = conn.execute("SELECT * FROM changesets WHERE id=?", (changeset["id"],)).fetchone()
+    return {**_plan_resource_dict(row), "changeset": _changeset_dict(chg)}
+
+
+@app.get("/v1/backup-plans")
+def list_backup_plans(authorization: str | None = Header(default=None)) -> list[dict[str, Any]]:
+    _require_admin(authorization)
+    with closing(db.connect()) as conn:
+        rows = conn.execute("SELECT * FROM backup_plans ORDER BY created_at DESC,id DESC").fetchall()
+    return [_plan_resource_dict(row) for row in rows]
+
+
+@app.post("/v1/clusters/{cluster_id}/backup-plans", status_code=201)
+def create_backup_plan(cluster_id: str, payload: BackupPlanCreate, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_bot(authorization)
+    _require_bot_origin(payload.source_channel)
+    with closing(db.connect()) as conn:
+        cluster = _cluster_dict(_get_cluster(conn, cluster_id))
+        if cluster["state"] != "READY":
+            raise HTTPException(status_code=409, detail="cluster must be READY before backup planning")
+        typed_plan = cluster_factory.backup_plan(cluster=cluster, provider=payload.provider, schedule=payload.schedule, retention_count=payload.retention_count, scope=payload.scope)
+        changeset = _insert_changeset(conn, operation="cluster.backup.apply", adapter="provider", target_id=cluster_id, requested_by=payload.requested_by, source_channel=payload.source_channel, source_revision=None, parameters={"resource_type": "BackupPlan", "typed_plan": typed_plan}, policy_generation=db.get_policy_generation(conn), ttl_seconds=payload.ttl_seconds)
+        preview = {"summary": f"Configure governed backup plan for {cluster['name']}", "details": typed_plan, "source": "cluster-factory-backup-planner"}
+        conn.execute("UPDATE changesets SET preview_json=?,state='PREVIEWED',updated_at=? WHERE id=?", (json.dumps(preview, sort_keys=True), int(time.time()), changeset["id"]))
+        plan_id, now = f"bkp_{uuid.uuid4().hex[:16]}", int(time.time())
+        conn.execute("INSERT INTO backup_plans (id,cluster_id,state,changeset_id,plan_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?)", (plan_id, cluster_id, "PLANNED", changeset["id"], json.dumps(typed_plan, sort_keys=True), now, now))
+        db.audit(conn, "backup_plan.created", payload.requested_by, "backup_plan", plan_id, {"cluster_id": cluster_id, "changeset_id": changeset["id"], "plan_hash": typed_plan["plan_hash"]})
+        conn.commit()
+        row = conn.execute("SELECT * FROM backup_plans WHERE id=?", (plan_id,)).fetchone()
+        chg = conn.execute("SELECT * FROM changesets WHERE id=?", (changeset["id"],)).fetchone()
+    return {**_plan_resource_dict(row), "changeset": _changeset_dict(chg)}
+
+
+@app.post("/v1/clusters/{cluster_id}/intelligence/radar", status_code=201)
+def record_radar_snapshot(cluster_id: str, payload: RadarSnapshotCreate, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_admin(authorization)
+    summary = payload.model_dump()
+    _validate_credential_metadata(summary)
+    with closing(db.connect()) as conn:
+        _get_cluster(conn, cluster_id)
+        now = int(time.time())
+        cur = conn.execute("INSERT INTO kubernetes_intelligence_snapshots (cluster_id,provider,observed_at,summary_json,created_at) VALUES (?,?,?,?,?)", (cluster_id, "radar", payload.observed_at, json.dumps(summary, sort_keys=True), now))
+        snapshot_id = int(cur.lastrowid)
+        db.audit(conn, "radar.snapshot_recorded", "admin", "cluster", cluster_id, {"snapshot_id": snapshot_id, "health_score": payload.health_score})
+        conn.commit()
+    return {"id": snapshot_id, "cluster_id": cluster_id, "provider": "radar", "summary": summary, "contract": cluster_factory.RADAR_CONTRACT}
+
+
+@app.post("/v1/clusters/{cluster_id}/intelligence/hubble", status_code=201)
+def record_hubble_summary(cluster_id: str, payload: HubbleFlowSummaryCreate, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_admin(authorization)
+    if payload.window_end < payload.window_start:
+        raise HTTPException(status_code=422, detail="Hubble window_end must be >= window_start")
+    summary = payload.model_dump()
+    _validate_credential_metadata(summary)
+    with closing(db.connect()) as conn:
+        _get_cluster(conn, cluster_id)
+        now = int(time.time())
+        cur = conn.execute("INSERT INTO kubernetes_intelligence_snapshots (cluster_id,provider,observed_at,summary_json,created_at) VALUES (?,?,?,?,?)", (cluster_id, "hubble", payload.window_end, json.dumps(summary, sort_keys=True), now))
+        snapshot_id = int(cur.lastrowid)
+        db.audit(conn, "hubble.summary_recorded", "admin", "cluster", cluster_id, {"snapshot_id": snapshot_id, "window_start": payload.window_start, "window_end": payload.window_end})
+        conn.commit()
+    return {"id": snapshot_id, "cluster_id": cluster_id, "provider": "hubble", "summary": summary, "contract": cluster_factory.HUBBLE_CONTRACT}
+
+
+@app.get("/v1/clusters/{cluster_id}/intelligence")
+def get_cluster_intelligence(cluster_id: str, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_admin(authorization)
+    with closing(db.connect()) as conn:
+        _get_cluster(conn, cluster_id)
+        latest: dict[str, Any] = {}
+        for provider in ("radar", "hubble"):
+            row = conn.execute("SELECT * FROM kubernetes_intelligence_snapshots WHERE cluster_id=? AND provider=? ORDER BY observed_at DESC,id DESC LIMIT 1", (cluster_id, provider)).fetchone()
+            latest[provider] = None if not row else {"id": row["id"], "observed_at": row["observed_at"], "summary": json.loads(row["summary_json"] or "{}")}
+    return {"cluster_id": cluster_id, "radar_contract": cluster_factory.RADAR_CONTRACT, "hubble_contract": cluster_factory.HUBBLE_CONTRACT, "latest": latest, "diagnostics": cluster_factory.NATIVE_DIAGNOSTICS}

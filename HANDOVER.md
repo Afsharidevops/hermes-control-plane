@@ -3,11 +3,12 @@
 **Stable base:** `v0.5.10` at `e73dd7c69767e709fb944a6356e47776a4464d92`
 **Active development branch:** `dev/0.5.11`
 **Do-not-redo baseline:** `0.5.11-dev.1` at `1764cad667717ec78156af8f9f3fcc30eb84c1f5`
-**Current development package:** `0.5.11-dev.2`
+**Frozen dev.2 boundary:** `a71b03a54ed2f619d3605c0c08d46de35ad5911c`
+**Current development package:** `0.5.11-dev.3`
 **Draft PR:** `#2` — keep Draft
-**Status:** dev.2 trust + bootstrap foundation is completed in this handoff and locally regression-tested; apply it to the existing branch, run `validate.sh`, then use `push.sh`. GitHub Actions remains the production image builder/publisher to Docker Hub.
+**Status:** dev.3 Cluster Factory + core infrastructure/day-2 is implemented and locally regression-tested in this checkpoint workspace on top of frozen dev.2 source. Because the checkpoint contains no `.git`, apply it to the real `dev/0.5.11` checkout, commit as new dev.3 history, run `validate.sh`, then use `push.sh`. GitHub Actions remains the production image builder/publisher to Docker Hub.
 
-`v0.5.10` and dev.1 are historical baselines and must not be recreated. See `RELEASE-STATUS-0.5.11-dev.2.md` and `docs/DEV2-TRUST-BOOTSTRAP.md` for the new slice. The historical handover below is retained only as release history.
+`v0.5.10` and dev.1 are historical baselines and must not be recreated. See `RELEASE-STATUS-0.5.11-dev.3.md` and `docs/DEV3-CLUSTER-FACTORY.md` for the new slice; dev.2 remains frozen and is documented separately. The historical handover below is retained only as release history.
 
 ---
 
