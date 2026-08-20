@@ -26,6 +26,7 @@ from . import preflight as host_preflight
 from . import cluster_factory
 from . import operations
 from . import operator_center
+from . import verification as unified_verification
 from . import radar as radar_provider
 from .providers import PROVIDERS, provider_descriptor
 from .tickets import issue_ticket, verify_ticket
@@ -76,6 +77,7 @@ from .models import (
     HubbleLiveQuery,
     KubernetesDiagnosticsQuery,
     KubernetesDiagnosticsBrokerResult,
+    UnifiedVerificationQuery,
     InfrastructureProviderCreate,
     InfrastructureProviderHealth,
     OperationsIntentPlanCreate,
@@ -98,6 +100,7 @@ BOT_SOURCE_CHANNELS = {"ui", "telegram", "hermes-bot", "api"}
 ADAPTER_CAPABILITIES: dict[str, dict[str, Any]] = {
     "kubernetes.discover": {"adapter": "kubernetes", "mode": "read", "default_risk": "READ", "reversible": False, "credential_class": "kubeconfig", "connection_modes": ["direct", "agent"], "approval": "none", "target_restrictions": ["namespace allowlist", "no Secret value reads"]},
     "kubernetes.diagnostics": {"adapter": "kubernetes", "mode": "read", "default_risk": "READ", "reversible": False, "credential_class": "kubeconfig", "connection_modes": ["direct", "agent"], "approval": "none", "target_restrictions": ["fixed read-only collectors", "namespace/cluster scope", "no Secret/env/log bodies", "bounded typed findings"]},
+    "cluster.verify": {"adapter": "kubernetes", "mode": "read", "default_risk": "READ", "reversible": False, "credential_class": "kubeconfig", "connection_modes": ["direct", "provider"], "approval": "none", "target_restrictions": ["active typed probes only", "bounded redacted evidence", "no mutation commands", "unsupported provider probes report SKIP"]},
     "kubernetes.apply": {"adapter": "kubernetes", "mode": "write", "default_risk": "HIGH", "reversible": True, "credential_class": "kubeconfig", "connection_modes": ["direct", "agent"], "approval": "policy", "target_restrictions": ["namespace/resource allowlists", "RBAC escalation denied by default"]},
     "helm.upgrade": {"adapter": "helm", "mode": "write", "default_risk": "HIGH", "reversible": True, "credential_class": "kubeconfig", "connection_modes": ["direct", "agent"], "approval": "policy", "target_restrictions": ["namespace allowlist"]},
     "docker.read": {"adapter": "docker", "mode": "read", "default_risk": "READ", "reversible": False, "credential_class": "docker-socket-local", "connection_modes": ["agent"], "approval": "none", "target_restrictions": ["socket broker/agent only"]},
@@ -3148,15 +3151,13 @@ def _validate_diagnostic_evidence(value: Any, *, depth: int = 0) -> None:
         raise HTTPException(status_code=502, detail="Kubernetes Broker diagnostic evidence string is too large")
 
 
-@app.post("/v1/clusters/{cluster_id}/diagnostics/run")
-async def run_cluster_diagnostics(cluster_id: str, payload: KubernetesDiagnosticsQuery, authorization: str | None = Header(default=None)) -> dict[str, Any]:
-    _require_admin(authorization)
+async def _execute_cluster_diagnostics(*, cluster_id: str, native_target_id: str, checks: list[str], actor: str) -> tuple[dict[str, Any], dict[str, Any]]:
     with closing(db.connect()) as conn:
         cluster = _cluster_dict(_get_cluster(conn, cluster_id))
-        snapshot = _native_kubernetes_target(conn, cluster, payload.native_target_id)
+        snapshot = _native_kubernetes_target(conn, cluster, native_target_id)
     raw = await kubernetes_broker.post(
         "/v1/diagnostics/run",
-        {"target_snapshot": snapshot, "checks": payload.checks},
+        {"target_snapshot": snapshot, "checks": checks},
     )
     if len(json.dumps(raw, separators=(",", ":"), ensure_ascii=False).encode("utf-8")) > 512_000:
         raise HTTPException(status_code=502, detail="Kubernetes Broker diagnostic response exceeds 512 KiB")
@@ -3170,18 +3171,95 @@ async def run_cluster_diagnostics(cluster_id: str, payload: KubernetesDiagnostic
         _validate_diagnostic_evidence(finding.evidence)
     normalized = result.model_dump()
     with closing(db.connect()) as conn:
-        db.audit(conn, "kubernetes.diagnostics.executed", "admin", "cluster", cluster_id, {
-            "target_id": payload.native_target_id,
+        db.audit(conn, "kubernetes.diagnostics.executed", actor, "cluster", cluster_id, {
+            "target_id": native_target_id,
             "check_ids": [item["id"] for item in normalized["checks"]],
             "overall_status": normalized["overall_status"],
             "observed_at": normalized["observed_at"],
         })
         conn.commit()
-    return {
-        "cluster_id": cluster_id,
+    return cluster, {"cluster_id": cluster_id, "native_target_id": native_target_id, **normalized}
+
+
+@app.post("/v1/clusters/{cluster_id}/diagnostics/run")
+async def run_cluster_diagnostics(cluster_id: str, payload: KubernetesDiagnosticsQuery, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_admin(authorization)
+    _, result = await _execute_cluster_diagnostics(
+        cluster_id=cluster_id, native_target_id=payload.native_target_id, checks=payload.checks, actor="admin"
+    )
+    return result
+
+
+@app.post("/v1/clusters/{cluster_id}/verify", status_code=201)
+async def run_cluster_unified_verification(cluster_id: str, payload: UnifiedVerificationQuery, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_admin(authorization)
+    try:
+        selected = unified_verification.selected_checks(payload.checks)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    diagnostic_ids = unified_verification.diagnostic_check_ids(selected)
+    cluster, diagnostics = await _execute_cluster_diagnostics(
+        cluster_id=cluster_id,
+        native_target_id=payload.native_target_id,
+        checks=diagnostic_ids,
+        actor="admin:unified-verification",
+    )
+    checks = unified_verification.from_diagnostics(diagnostics, selected)
+
+    if "radar" in selected:
+        integration = None
+        try:
+            with closing(db.connect()) as conn:
+                integration = _configured_radar_integration(conn, cluster, payload.radar_integration_id)
+        except HTTPException as exc:
+            if payload.radar_integration_id is not None or exc.status_code != 503:
+                raise
+        if integration is not None:
+            try:
+                health = await radar_provider.health(integration["endpoint"])
+                _validate_diagnostic_evidence(health)
+                unified_verification.replace_check(checks, {
+                    "id": "radar",
+                    "status": "PASS",
+                    "summary": "Configured Radar MCP endpoint completed an active initialize/health exchange.",
+                    "evidence": {"integration_id": integration["id"], "health": health},
+                })
+            except radar_provider.RadarError as exc:
+                unified_verification.replace_check(checks, {
+                    "id": "radar",
+                    "status": "FAIL",
+                    "summary": "Configured Radar integration failed its active MCP health exchange.",
+                    "evidence": {"integration_id": integration["id"], "error_type": type(exc).__name__},
+                })
+
+    for check in checks:
+        _validate_diagnostic_evidence(check.get("evidence") or {})
+    overall = unified_verification.overall_status(checks)
+    observed_at = int(diagnostics.get("observed_at") or time.time())
+    result_id = f"ver_{uuid.uuid4().hex[:16]}"
+    evidence = {
+        "source": "hermes-active-unified-verification",
         "native_target_id": payload.native_target_id,
-        **normalized,
+        "requested_checks": selected,
+        "diagnostic_check_ids": diagnostic_ids,
+        "mutation_commands_executed": False,
+        "credential_material_returned": False,
+        "unsupported_probes_report_skip": True,
     }
+    with closing(db.connect()) as conn:
+        conn.execute(
+            "INSERT INTO verification_results (id,operation_plan_id,changeset_id,subject_type,subject_id,status,checks_json,evidence_json,observed_at,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (result_id, None, None, "cluster", cluster_id, overall, json.dumps(checks, sort_keys=True), json.dumps(evidence, sort_keys=True), observed_at, int(time.time())),
+        )
+        db.audit(conn, "verification.active.executed", "admin", "verification", result_id, {
+            "cluster_id": cluster_id,
+            "target_id": payload.native_target_id,
+            "status": overall,
+            "check_ids": [check["id"] for check in checks],
+        })
+        conn.commit()
+        row = conn.execute("SELECT * FROM verification_results WHERE id=?", (result_id,)).fetchone()
+    return _verification_result_dict(row)
 
 
 @app.post("/v1/clusters/{cluster_id}/intelligence/hubble", status_code=201)
@@ -3757,7 +3835,7 @@ def _persist_runtime_verification(conn, *, job: Any, changeset: Any, payload: di
     evidence = verification.get("evidence") if isinstance(verification.get("evidence"), dict) else {}
     _validate_credential_metadata(evidence)
     statuses = {item["status"] for item in normalized}
-    overall = "FAIL" if "FAIL" in statuses else "WARN" if "WARN" in statuses else "PASS"
+    overall = "FAIL" if "FAIL" in statuses else "WARN" if "WARN" in statuses else "SKIP" if statuses == {"SKIP"} else "PASS"
     result_id = f"ver_{uuid.uuid4().hex[:16]}"
     observed_at = int(verification.get("observed_at") or time.time())
     now = int(time.time())
@@ -3928,7 +4006,7 @@ def record_verification(payload: VerificationResultCreate, authorization: str | 
         _validate_credential_metadata(check.get("evidence") or {})
     _validate_credential_metadata(payload.evidence)
     statuses = {check["status"] for check in checks}
-    overall = "FAIL" if "FAIL" in statuses else "WARN" if "WARN" in statuses else "PASS"
+    overall = "FAIL" if "FAIL" in statuses else "WARN" if "WARN" in statuses else "SKIP" if statuses == {"SKIP"} else "PASS"
     result_id = f"ver_{uuid.uuid4().hex[:16]}"
     now = int(time.time())
     with closing(db.connect()) as conn:

@@ -83,7 +83,7 @@ GROUPS: list[dict[str, Any]] = [
         "id": "operations",
         "label": "Operations",
         "surfaces": [
-            _surface("operations.diagnostics", "Diagnostics", "LIVE", "native diagnostics", "Executable read-only diagnostic engine.", action="diagnostics"),
+            _surface("operations.diagnostics", "Diagnostics", "LIVE", "native diagnostics + active unified verification", "Executable read-only diagnostic engine plus persisted active cluster verification.", action="diagnostics"),
             _surface("operations.deployments", "Deployments", "PARTIAL", "ChangeSets + operation jobs", "Governed plans/jobs are visible; broader executor closure remains."),
             _surface("operations.upgrades", "Upgrades", "PARTIAL", "UpgradePlan + day-2 contracts", "Upgrade planning exists; repeatable execution/verification remains."),
             _surface("operations.backups", "Backups", "PARTIAL", "BackupPlan + verification models", "Backup planning exists; active backup/restore execution remains."),

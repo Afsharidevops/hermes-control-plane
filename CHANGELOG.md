@@ -1,5 +1,6 @@
 # Changelog
 
+- Dev.5 active unified verification slice: live Kubernetes-broker probes mapped into deterministic PASS/WARN/FAIL/SKIP checks, optional active Radar health, bounded/redacted evidence, persistence and audit; unsupported host/etcd/agent/provider probes remain explicit SKIP instead of synthetic success.
 - Dev.5 trusted Kubernetes day-2 runtime slice: exact-preview-bound node cordon/uncordon/drain, workload restart/scale and pinned Helm-backed add-on/apply execution through the Kubernetes Broker with drift rejection and persisted active verification.
 - Dev.5 Operator Center UI slice: typed full-scope operator navigation for Kubernetes, Cluster Factory, infrastructure, operations and governance, with live data where available and explicit PARTIAL/CONTRACT_ONLY runtime states where executors are not yet complete.
 - Dev.5 native diagnostics runtime slice: executable broker-owned read-only checks for node/pod/workload/OOM/metrics/storage/events, Cilium/Hubble/DNS/ingress/NetworkPolicy, RBAC/workload security, Argo CD and rollout health with target-scope enforcement and bounded typed evidence.

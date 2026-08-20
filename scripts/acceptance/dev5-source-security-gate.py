@@ -24,6 +24,7 @@ models = text("control-plane/src/hermes_control_plane/models.py")
 factory = text("control-plane/src/hermes_control_plane/cluster_factory.py")
 providers = text("control-plane/src/hermes_control_plane/providers.py")
 operations = text("control-plane/src/hermes_control_plane/operations.py")
+unified_verification = text("control-plane/src/hermes_control_plane/verification.py")
 operator_center = text("control-plane/src/hermes_control_plane/operator_center.py")
 ui = text("control-plane/src/hermes_control_plane/static/index.html")
 tickets = text("control-plane/src/hermes_control_plane/tickets.py")
@@ -213,6 +214,29 @@ for forbidden in ('shell=True', 'os.system', 'kubectl exec', 'kubectl cp'):
     assert forbidden not in kube_broker, forbidden
 assert 'mutation_gate") != "changeset-exact-hash-approval"' in kube_broker
 assert 'raw_credentials_returned' in kube_broker
+
+# Dev.5 active unified verification executes real read probes and never upgrades missing provider evidence to success.
+for marker in (
+    'class UnifiedVerificationQuery',
+    '@app.post("/v1/clusters/{cluster_id}/verify", status_code=201)',
+    'verification.active.executed',
+    'unsupported_probes_report_skip',
+    'unified_verification.overall_status',
+):
+    assert marker in models or marker in cp_main, marker
+for check_id in (
+    'networking', 'api-server', 'nodes', 'cilium', 'hubble', 'dns', 'storage',
+    'ingress-tls', 'gitops', 'observability', 'radar', 'hermes-agent', 'baseline-security',
+):
+    assert f'"{check_id}"' in unified_verification or f'"{check_id}"' in operations, check_id
+for honest_skip in ('Active host/SSH verification requires', 'Direct etcd quorum verification', 'Hermes Agent verification requires'):
+    assert honest_skip in unified_verification, honest_skip
+assert 'prometheus_probe' in unified_verification
+assert 'not-configured' in unified_verification
+for forbidden in ('subprocess', 'os.system', 'shell=True', 'kubectl ', 'helm '):
+    assert forbidden not in unified_verification, forbidden
+assert 'radar_provider.health' in cp_main
+assert 'credential_material_returned' in cp_main
 
 # Generic typed provider contracts retain their credential boundary and no arbitrary command generation.
 for forbidden in ("subprocess", "os.system", "shell=True", "curl | sh"):

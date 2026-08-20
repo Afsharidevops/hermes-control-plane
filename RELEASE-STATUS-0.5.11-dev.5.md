@@ -29,6 +29,7 @@ Do not amend, reset, squash, force-push, move or recreate the frozen dev.4 tag.
 - live Operator Center views for current registries, ChangeSets/audit, Radar/Hubble intelligence summaries, native diagnostics, cluster/server/provisioning state and operation/verification data without adding mutation/approval bypass controls
 - trusted Kubernetes Broker day-2 runtime for node cordon/uncordon/drain, workload restart/scale and pinned Helm-backed add-on/apply operations
 - day-2 runtime planning now binds a broker-produced read-only live preview/precondition into the exact typed plan before approval, rejects live-state drift at execution, and persists active typed verification automatically
+- active unified cluster verification engine that executes live Kubernetes Broker probes, persists typed PASS/WARN/FAIL/SKIP results, optionally checks configured Radar health, and explicitly SKIPs unsupported provider/host/etcd/agent probes rather than inventing evidence
 
 ## Still release-blocking for dev.5 scope closure
 
@@ -36,7 +37,7 @@ Do not amend, reset, squash, force-push, move or recreate the frozen dev.4 tag.
 - Cluster Factory runtime/repeatability closure
 - provider/bare-metal/network executors or explicit user-approved deferral
 - air-gap mirror synchronization/integrity runtime
-- active unified verification engine
+- provider-specific verification extensions coupled to the remaining provider/bare-metal/network runtimes
 
 `v0.5.11-dev.5` must not be created until the full dev.5 closure scope is complete,
 local validation passes, and branch CI succeeds on the exact intended tag SHA.

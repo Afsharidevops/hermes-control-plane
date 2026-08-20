@@ -411,6 +411,12 @@ class KubernetesDiagnosticsQuery(StrictModel):
     checks: list[str] = Field(default_factory=list, max_length=32)
 
 
+class UnifiedVerificationQuery(StrictModel):
+    native_target_id: str = Field(min_length=1, max_length=160)
+    checks: list[str] = Field(default_factory=list, max_length=32)
+    radar_integration_id: str | None = Field(default=None, max_length=120)
+
+
 class DiagnosticFindingResult(StrictModel):
     id: str = Field(min_length=1, max_length=160)
     status: DiagnosticStatus

@@ -1,10 +1,10 @@
 # Hermes Control Plane
 
-> Dev.5 scope closure now includes Radar runtime, Cilium/Hubble Network Live, executable native diagnostics, and a full Hermes-native Operator Center UI scope contract. UI state is reported separately from provider/runtime completion.
+> Dev.5 scope closure now includes Radar runtime, Cilium/Hubble Network Live, executable native diagnostics, a full Hermes-native Operator Center UI scope contract, bounded trusted-Kubernetes day-2 execution, and active unified cluster verification. UI state is reported separately from provider/runtime completion.
 
 Hermes Control Plane is a self-hosted, AI-assisted DevOps control plane designed to run on a Docker/VM installation or Kubernetes while keeping privileged credentials and infrastructure execution outside the LLM trust boundary.
 
-> **0.5.11-dev.5 scope closure in progress:** dev.5 is forward-only from frozen `v0.5.11-dev.4` and closes runtime gaps found by the full roadmap audit. Radar runtime integration and Cilium/Hubble Network Live are complete for their local/runtime-path slices, and this source adds executable Hermes-native Kubernetes diagnostics through the trusted broker. Dev.5 is not yet release-complete; broader operator UI, day-2/Cluster Factory executors, provider runtimes or explicit deferrals, air-gap runtime and active unified verification remain closure work.
+> **0.5.11-dev.5 scope closure in progress:** dev.5 is forward-only from frozen `v0.5.11-dev.4` and closes runtime gaps found by the full roadmap audit. Radar runtime integration and Cilium/Hubble Network Live are complete for their local/runtime-path slices, and this source adds executable Hermes-native Kubernetes diagnostics through the trusted broker. Dev.5 is not yet release-complete; remaining Cluster Factory/provider executors or explicit deferrals, air-gap runtime, provider-coupled verification extensions and final scope re-audit remain closure work.
 
 > **0.5.11-dev.4 Full Operations Center + next-deploy infrastructure:** the frozen dev.3 Cluster Factory now feeds a shared Web/Telegram/AI intent backend, exact-snapshot fleet planning, advanced typed day-2 operations, VMware/OpenStack/AWS/Azure/GCP provider foundations, Redfish/IPMI/PXE bare-metal plans, typed switch/network contracts, digest-pinned air-gap mirroring and unified verification. Every mutation remains ChangeSet/policy/approval/exact-hash/target-drift governed, and raw infrastructure credentials remain behind the Credential Service. Production images remain GitHub Actions -> Docker Hub.
 

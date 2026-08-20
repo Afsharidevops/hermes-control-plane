@@ -149,3 +149,22 @@ Governance and drift properties:
 - broker failure, sensitive evidence, malformed verification or failed verification prevents a successful ChangeSet result
 
 This slice intentionally leaves `cluster.worker.add/remove/replace`, GitOps sync, Kubernetes/Cilium upgrade, etcd snapshot, restore/DR, certificate rotation, maintenance provider steps, decommission, infrastructure scale and template clone on their explicit provider-worker contracts. Those operations remain release-blocking until a real executor exists or the user explicitly defers them.
+
+## Slice 6 — Active unified cluster verification
+
+This slice turns the dev.4 persisted verification-result contract into an active read runtime for the cluster surfaces Hermes can actually probe today.
+
+The Control Plane now exposes `POST /v1/clusters/{cluster_id}/verify`. It:
+
+- validates the requested cluster and same-environment native Kubernetes target;
+- executes fixed read-only live collectors through the trusted Kubernetes Broker;
+- maps native diagnostic probes into the canonical unified checks (`networking`, `api-server`, `nodes`, `cilium`, `hubble`, `dns`, `storage`, `ingress-tls`, `gitops`, `observability`, `baseline-security`);
+- optionally performs an active MCP initialize/health exchange against a configured same-environment Radar integration;
+- persists the typed result into `verification_results` and emits `verification.active.executed` audit evidence;
+- preserves deterministic `PASS`, `WARN`, `FAIL`, and `SKIP` semantics, including `SKIP` when a real active collector does not exist.
+
+This slice intentionally does **not** infer active success from stored host preflight state, agent enrollment state, provider contracts, or a persisted result model. Host/SSH, direct etcd-quorum, Hermes Agent, and provider-specific verification remain `SKIP` until their trusted runtime collectors exist. Kubernetes Metrics API evidence is not mislabeled as Prometheus health; observability remains `WARN` when only `metrics.k8s.io` is actively available.
+
+All returned evidence is bounded and rechecked against the same forbidden sensitive-field rules used by native diagnostics. No mutation command path is introduced.
+
+Provider-specific verification remains coupled to the still-open provider/bare-metal/network runtime work.

@@ -63,6 +63,8 @@ assert "/intelligence/query" in ui
 assert "Collect Network Live" in ui
 assert "/network/live" in ui
 assert "Run Native Diagnostics" in ui
+assert "Run unified verification" in ui
+assert "/v1/clusters/${cluster}/verify" in ui
 assert "/diagnostics/run" in ui
 assert "native-diagnostics" in ui
 assert "<option>radar</option>" in ui
@@ -90,6 +92,8 @@ assert (ROOT / "control-plane/tests/test_dev5_hubble_runtime.py").is_file()
 assert (ROOT / "control-plane/tests/test_dev5_diagnostics_runtime.py").is_file()
 assert (ROOT / "control-plane/tests/test_dev5_operator_ui.py").is_file()
 assert (ROOT / "control-plane/tests/test_dev5_day2_runtime.py").is_file()
+assert (ROOT / "control-plane/tests/test_dev5_unified_verification.py").is_file()
+assert (ROOT / "control-plane/src/hermes_control_plane/verification.py").is_file()
 assert (ROOT / "kubernetes-broker/tests/test_day2_runtime.py").is_file()
 assert (ROOT / "control-plane/src/hermes_control_plane/operator_center.py").is_file()
 assert (ROOT / "kubernetes-broker/src/hermes_kubernetes_broker/hubble.py").is_file()
