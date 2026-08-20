@@ -2,6 +2,8 @@
 
 Hermes Control Plane is a self-hosted, AI-assisted DevOps control plane designed to run on a Docker/VM installation or Kubernetes while keeping privileged credentials and infrastructure execution outside the LLM trust boundary.
 
+> **0.5.11-dev.5 scope closure in progress:** dev.5 is forward-only from frozen `v0.5.11-dev.4` and closes runtime gaps found by the full roadmap audit. The first slice adds a real read-only Radar MCP runtime adapter with `AUTO`/`RADAR`/`NATIVE` provider modes, same-environment isolation, bounded native Kubernetes fallback, Hermes-side redaction, and no Radar write passthrough. Dev.5 is not yet release-complete; Hubble live traffic, executable diagnostics, broader operator UI, provider executors, air-gap runtime and active unified verification remain closure work.
+
 > **0.5.11-dev.4 Full Operations Center + next-deploy infrastructure:** the frozen dev.3 Cluster Factory now feeds a shared Web/Telegram/AI intent backend, exact-snapshot fleet planning, advanced typed day-2 operations, VMware/OpenStack/AWS/Azure/GCP provider foundations, Redfish/IPMI/PXE bare-metal plans, typed switch/network contracts, digest-pinned air-gap mirroring and unified verification. Every mutation remains ChangeSet/policy/approval/exact-hash/target-drift governed, and raw infrastructure credentials remain behind the Credential Service. Production images remain GitHub Actions -> Docker Hub.
 
 ## What is included

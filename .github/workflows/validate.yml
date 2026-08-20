@@ -110,6 +110,10 @@ jobs:
               "$SECURITY_PY" scripts/acceptance/dev4-source-security-gate.py
               "$SECURITY_PY" scripts/acceptance/dev4-config-static-gate.py
               ;;
+            0.5.11-dev.5)
+              "$SECURITY_PY" scripts/acceptance/dev5-source-security-gate.py
+              "$SECURITY_PY" scripts/acceptance/dev5-config-static-gate.py
+              ;;
             *)
               echo "No source security gate configured for VERSION=$(cat VERSION)" >&2
               exit 1

@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-DEV3_SHA="8547c44de4f6e8116d70f2690b50a50c895eba34"
-DEV3_TAG="v0.5.11-dev.3"
+DEV4_SHA="d4eb9b7ab2564301c09b8c0d36a2e9d53b843273"
+DEV4_TAG="v0.5.11-dev.4"
 BRANCH="dev/0.5.11"
-TAG="v0.5.11-dev.4"
+TAG="v0.5.11-dev.5"
 ROOT="${HERMES_REPO:-$PWD}"
 CREATE_COMMIT=0
 PUSH_TAG=0
@@ -26,12 +26,12 @@ done
 cd "$ROOT"
 [[ -d .git ]] || { echo "Not a Git working tree: $ROOT" >&2; exit 3; }
 [[ "$(git branch --show-current)" == "$BRANCH" ]] || { echo "Refusing: expected branch $BRANCH" >&2; exit 4; }
-git cat-file -e "$DEV3_SHA^{commit}" 2>/dev/null || { echo "Missing frozen dev.3 commit $DEV3_SHA" >&2; exit 5; }
-git merge-base --is-ancestor "$DEV3_SHA" HEAD || { echo "Refusing: frozen dev.3 boundary is not an ancestor of HEAD" >&2; exit 6; }
-[[ "$(git rev-parse "$DEV3_TAG^{commit}")" == "$DEV3_SHA" ]] || { echo "Refusing: $DEV3_TAG no longer peels to frozen boundary" >&2; exit 7; }
-[[ "$(cat VERSION)" == "0.5.11-dev.4" ]] || { echo "VERSION is not 0.5.11-dev.4" >&2; exit 8; }
+git cat-file -e "$DEV4_SHA^{commit}" 2>/dev/null || { echo "Missing frozen dev.4 commit $DEV4_SHA" >&2; exit 5; }
+git merge-base --is-ancestor "$DEV4_SHA" HEAD || { echo "Refusing: frozen dev.4 boundary is not an ancestor of HEAD" >&2; exit 6; }
+[[ "$(git rev-parse "$DEV4_TAG^{commit}")" == "$DEV4_SHA" ]] || { echo "Refusing: $DEV4_TAG no longer peels to frozen boundary" >&2; exit 7; }
+[[ "$(cat VERSION)" == "0.5.11-dev.5" ]] || { echo "VERSION is not 0.5.11-dev.5" >&2; exit 8; }
 command -v sha256sum >/dev/null 2>&1 || { echo "sha256sum is required" >&2; exit 13; }
-sha256sum --quiet -c MANIFEST.sha256 || { echo "Dev.4 source manifest verification failed" >&2; exit 14; }
+sha256sum --quiet -c MANIFEST.sha256 || { echo "Dev.5 source manifest verification failed" >&2; exit 14; }
 
 if [[ "$SKIP_VALIDATION" != "1" ]]; then
   ./validate.sh "$ROOT"
@@ -52,9 +52,6 @@ is_allowed_path() {
   grep -Fqx -- "$path" "$allowed_paths_file"
 }
 
-# Never let the guarded commit path sweep in a local virtualenv, secret, cache,
-# runtime artifact, or unrelated operator edit. Only manifest-governed release
-# files (plus the manifest itself) may be dirty when --commit is requested.
 if [[ "$CREATE_COMMIT" == "1" ]]; then
   unexpected=()
   while IFS= read -r path; do
@@ -74,7 +71,6 @@ if [[ "$CREATE_COMMIT" == "1" ]]; then
   done < "$manifest_paths_file"
   git add -- MANIFEST.sha256
 
-  # Defense in depth: the index itself must contain only approved release paths.
   unexpected_staged=()
   while IFS= read -r path; do
     [[ -z "$path" ]] && continue
@@ -88,7 +84,7 @@ if [[ "$CREATE_COMMIT" == "1" ]]; then
   fi
 
   if ! git diff --cached --quiet; then
-    git commit -m "feat: add 0.5.11-dev.4 operations center foundations"
+    git commit -m "feat: add 0.5.11-dev.5 scope closure runtime integration"
   fi
 fi
 
@@ -98,7 +94,6 @@ if [[ -n "$(git status --porcelain)" ]]; then
   exit 9
 fi
 
-# Keep PR #2 Draft: this script intentionally performs no PR state mutation.
 git push origin "$BRANCH"
 
 if [[ "$PUSH_TAG" == "1" ]]; then
@@ -108,7 +103,7 @@ if [[ "$PUSH_TAG" == "1" ]]; then
   if git rev-parse "$TAG" >/dev/null 2>&1; then
     [[ "$(git rev-list -n1 "$TAG")" == "$head_sha" ]] || { echo "$TAG already exists on another commit" >&2; exit 12; }
   else
-    git tag -a "$TAG" -m "Hermes 0.5.11-dev.4"
+    git tag -a "$TAG" -m "Hermes 0.5.11-dev.5"
   fi
   git push origin "$TAG"
 fi

@@ -5,7 +5,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 RiskLevel = Literal["READ", "LOW", "HIGH", "CRITICAL"]
-IntegrationKind = Literal["kubernetes", "docker", "swarm", "ssh", "github", "gitlab", "registry", "helm"]
+IntegrationKind = Literal["kubernetes", "docker", "swarm", "ssh", "github", "gitlab", "registry", "helm", "radar"]
 ConnectionMode = Literal["direct", "agent"]
 
 
@@ -375,6 +375,26 @@ class RadarSnapshotCreate(StrictModel):
     degraded_workloads: list[str] = Field(default_factory=list, max_length=256)
     warning_event_counts: dict[str, int] = Field(default_factory=dict)
     addon_health: dict[str, str] = Field(default_factory=dict)
+
+
+ContextMode = Literal["AUTO", "RADAR", "NATIVE"]
+RadarReadTool = Literal[
+    "get_dashboard",
+    "get_neighborhood",
+    "get_resource",
+    "get_topology",
+    "issues",
+    "list_resources",
+    "search",
+]
+
+
+class RadarIntelligenceQuery(StrictModel):
+    mode: ContextMode = "AUTO"
+    tool: RadarReadTool
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    integration_id: str | None = Field(default=None, max_length=120)
+    native_target_id: str | None = Field(default=None, max_length=160)
 
 
 class HubbleFlowSummaryCreate(StrictModel):

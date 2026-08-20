@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.5.11-dev.5 (in progress)
+
+- begin scope-closure work on top of frozen `v0.5.11-dev.4` without rewriting frozen history
+- add a real HTTP MCP Radar read adapter with initialization/session handling and a fixed allowlist for dashboard, issues, resource list/detail, search, topology and neighborhood
+- make Radar a first-class integration kind and add executable `AUTO`, `RADAR`, and `NATIVE` cluster-intelligence query modes
+- add same-environment Radar/native-target isolation, strict RADAR fail-closed behavior and AUTO fallback through the existing constrained Kubernetes Broker
+- add defense-in-depth redaction for Kubernetes Secret bodies, direct workload environment values, authorization/token/password-shaped fields, and bounded provider responses
+- explicitly forbid direct Control Plane credential-material resolution for authenticated Radar endpoints; authenticated provider access must use a credential-service/provider-worker boundary
+- add Hermes-native live intelligence controls and dev.5 Radar runtime/security regression tests
+- move guarded apply/validate/push scripts and CI source gates to the exact frozen dev.4 boundary and dev.5 version
+
 ## 0.5.11-dev.4
 
 - add a shared typed Operations Center intent backend for Web/UI, Telegram, Hermes Bot/AI and API channels while keeping mutations bot-authenticated and ChangeSet-governed

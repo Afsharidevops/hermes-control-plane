@@ -25,6 +25,7 @@ from . import kubernetes as kubernetes_broker
 from . import preflight as host_preflight
 from . import cluster_factory
 from . import operations
+from . import radar as radar_provider
 from .providers import PROVIDERS, provider_descriptor
 from .tickets import issue_ticket, verify_ticket
 from .models import (
@@ -69,6 +70,7 @@ from .models import (
     UpgradePlanCreate,
     BackupPlanCreate,
     RadarSnapshotCreate,
+    RadarIntelligenceQuery,
     HubbleFlowSummaryCreate,
     InfrastructureProviderCreate,
     InfrastructureProviderHealth,
@@ -79,7 +81,7 @@ from .models import (
 )
 from .risk import approval_required, classify
 
-VERSION = "0.5.11-dev.4"
+VERSION = "0.5.11-dev.5"
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 TERMINAL_CHANGESET_STATES = {
     "REJECTED", "CANCELLED", "EXPIRED", "EXECUTED", "FAILED",
@@ -132,7 +134,7 @@ async def lifespan(_: FastAPI):
 app = FastAPI(
     title="Hermes Control Plane API",
     version=VERSION,
-    description="Hermes Control Plane 0.5.11-dev.4 development API",
+    description="Hermes Control Plane 0.5.11-dev.5 development API",
     lifespan=lifespan,
 )
 
@@ -1318,11 +1320,18 @@ async def test_integration_health(integration_id: str, authorization: str | None
     code = None
     try:
         timeout = float(os.getenv("HERMES_HEALTH_TIMEOUT_SECONDS", "5"))
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
-            response = await client.get(endpoint, headers={"User-Agent": f"hermes-control-plane/{VERSION}"})
-            code = response.status_code
-            status = "HEALTHY" if 200 <= code < 500 else "UNHEALTHY"
-            detail = f"HTTP {code}"
+        if row["kind"] == "radar":
+            if row["credential_ref"]:
+                raise radar_provider.RadarProtocolError("direct Radar health does not accept credential material; use an internal no-auth/RBAC-scoped Radar endpoint")
+            result = await radar_provider.health(endpoint, timeout=timeout)
+            status = "HEALTHY" if result.get("ok") else "UNHEALTHY"
+            detail = f"MCP {result.get('protocol_version', 'unknown')}"
+        else:
+            async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
+                response = await client.get(endpoint, headers={"User-Agent": f"hermes-control-plane/{VERSION}"})
+                code = response.status_code
+                status = "HEALTHY" if 200 <= code < 500 else "UNHEALTHY"
+                detail = f"HTTP {code}"
     except Exception as exc:
         detail = f"{type(exc).__name__}: {str(exc)[:240]}"
 
@@ -2764,6 +2773,218 @@ def create_backup_plan(cluster_id: str, payload: BackupPlanCreate, authorization
         row = conn.execute("SELECT * FROM backup_plans WHERE id=?", (plan_id,)).fetchone()
         chg = conn.execute("SELECT * FROM changesets WHERE id=?", (changeset["id"],)).fetchone()
     return {**_plan_resource_dict(row), "changeset": _changeset_dict(chg)}
+
+
+def _configured_radar_integration(conn, cluster: dict[str, Any], integration_id: str | None) -> dict[str, Any]:
+    if integration_id:
+        row = conn.execute("SELECT * FROM integrations WHERE id=?", (integration_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Radar integration not found")
+    else:
+        row = conn.execute(
+            "SELECT * FROM integrations WHERE kind='radar' AND environment_id=? AND status='configured' ORDER BY name,id LIMIT 1",
+            (cluster["environment_id"],),
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=503, detail="no configured Radar integration exists for the cluster environment")
+    integration = _integration_dict(row)
+    if integration["kind"] != "radar":
+        raise HTTPException(status_code=422, detail="integration_id must reference a Radar integration")
+    if integration["environment_id"] != cluster["environment_id"]:
+        raise HTTPException(status_code=403, detail="Radar integration belongs to a different environment")
+    if integration["status"] != "configured":
+        raise HTTPException(status_code=409, detail="Radar integration is disabled")
+    if integration["connection_mode"] != "direct":
+        raise HTTPException(status_code=501, detail="agent-routed Radar integration is not implemented yet")
+    if not integration.get("endpoint"):
+        raise HTTPException(status_code=422, detail="Radar integration has no MCP endpoint")
+    if integration.get("credential_ref"):
+        raise HTTPException(status_code=501, detail="authenticated Radar credential delivery must use a provider worker; direct Control Plane secret resolution is forbidden")
+    _reject_embedded_url_credentials(integration["endpoint"], "Radar endpoint")
+    return integration
+
+
+def _native_kubernetes_target(conn, cluster: dict[str, Any], target_id: str | None) -> dict[str, Any]:
+    if not target_id:
+        raise HTTPException(status_code=503, detail="native_target_id is required for native Kubernetes fallback")
+    row = conn.execute("SELECT * FROM targets WHERE id=?", (target_id,)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="native Kubernetes target not found")
+    target = _target_dict(row)
+    if target["kind"] != "kubernetes":
+        raise HTTPException(status_code=422, detail="native_target_id must reference a Kubernetes target")
+    if target["environment_id"] != cluster["environment_id"]:
+        raise HTTPException(status_code=403, detail="native Kubernetes target belongs to a different environment")
+    if target["status"] != "configured":
+        raise HTTPException(status_code=409, detail="native Kubernetes target is disabled")
+    return _target_snapshot(conn, target["id"])
+
+
+def _native_inventory(discovery: dict[str, Any]) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for bucket in ("namespaces", "nodes", "workloads"):
+        value = discovery.get(bucket)
+        if isinstance(value, dict):
+            for item in value.get("items") or []:
+                if isinstance(item, dict):
+                    items.append(item)
+    return items
+
+
+def _native_resource_identity(item: dict[str, Any]) -> dict[str, Any]:
+    metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+    return {
+        "kind": item.get("kind"),
+        "apiVersion": item.get("apiVersion"),
+        "name": metadata.get("name"),
+        "namespace": metadata.get("namespace"),
+        "labels": metadata.get("labels") or {},
+        "spec": item.get("spec") or {},
+        "status": item.get("status") or {},
+    }
+
+
+def _native_intelligence_result(tool: str, arguments: dict[str, Any], discovery: dict[str, Any]) -> dict[str, Any]:
+    discovery = radar_provider.redact(discovery)
+    inventory = [_native_resource_identity(item) for item in _native_inventory(discovery)]
+    namespace = str(arguments.get("namespace") or "").strip()
+    if namespace:
+        inventory = [item for item in inventory if not item.get("namespace") or item.get("namespace") == namespace or (str(item.get("kind")).lower() == "namespace" and item.get("name") == namespace)]
+
+    if tool == "get_dashboard":
+        by_kind: dict[str, int] = {}
+        issues = []
+        for item in inventory:
+            kind = str(item.get("kind") or "Unknown")
+            by_kind[kind] = by_kind.get(kind, 0) + 1
+            status = item.get("status") or {}
+            desired = status.get("replicas")
+            ready = status.get("readyReplicas", status.get("numberReady"))
+            if isinstance(desired, int) and isinstance(ready, int) and ready < desired:
+                issues.append({"kind": kind, "namespace": item.get("namespace"), "name": item.get("name"), "ready": ready, "desired": desired})
+        return {"coverage": "native-inventory", "resource_counts": by_kind, "issues": issues[:200]}
+
+    if tool == "list_resources":
+        kind = str(arguments.get("kind") or "").lower()
+        if not kind:
+            raise HTTPException(status_code=422, detail="native list_resources requires kind")
+        matches = [item for item in inventory if str(item.get("kind") or "").lower() == kind]
+        return {"coverage": "native-discovery", "items": matches[:200], "count": len(matches)}
+
+    if tool == "get_resource":
+        kind = str(arguments.get("kind") or "").lower()
+        name = str(arguments.get("name") or "")
+        for item in inventory:
+            if str(item.get("kind") or "").lower() == kind and item.get("name") == name and (not namespace or item.get("namespace") in {None, namespace}):
+                return {"coverage": "native-discovery", "resource": item}
+        raise HTTPException(status_code=404, detail="native resource not found in bounded discovery inventory")
+
+    if tool == "search":
+        query = str(arguments.get("query") or "").strip().lower()
+        if not query:
+            raise HTTPException(status_code=422, detail="native search requires a non-empty query")
+        tokens = [token for token in query.split() if token]
+        limit = min(int(arguments.get("limit") or 100), 200)
+        matches = []
+        for item in inventory:
+            haystack = json.dumps(item, sort_keys=True).lower()
+            if all(token in haystack for token in tokens):
+                matches.append(item)
+                if len(matches) >= limit:
+                    break
+        return {"coverage": "native-bounded-search", "items": matches, "count": len(matches)}
+
+    if tool == "issues":
+        issues = []
+        for item in inventory:
+            status = item.get("status") or {}
+            desired = status.get("replicas")
+            ready = status.get("readyReplicas", status.get("numberReady"))
+            if isinstance(desired, int) and isinstance(ready, int) and ready < desired:
+                issues.append({"severity": "warning", "kind": item.get("kind"), "namespace": item.get("namespace"), "name": item.get("name"), "summary": f"{ready}/{desired} replicas ready"})
+            if str(item.get("kind") or "").lower() == "node":
+                conditions = status.get("conditions") or []
+                ready_condition = next((c for c in conditions if isinstance(c, dict) and c.get("type") == "Ready"), None)
+                if ready_condition and ready_condition.get("status") != "True":
+                    issues.append({"severity": "critical", "kind": "Node", "name": item.get("name"), "summary": "Node is not Ready"})
+        return {"coverage": "native-bounded-health", "items": issues[:200], "count": len(issues)}
+
+    if tool == "get_topology":
+        nodes = []
+        edges = []
+        namespace_ids: set[str] = set()
+        for item in inventory:
+            rid = f"{item.get('kind')}:{item.get('namespace') or '_cluster'}:{item.get('name')}"
+            nodes.append({"id": rid, "kind": item.get("kind"), "namespace": item.get("namespace"), "name": item.get("name")})
+            if item.get("namespace"):
+                nsid = f"Namespace:_cluster:{item['namespace']}"
+                namespace_ids.add(nsid)
+                edges.append({"from": rid, "to": nsid, "relationship": "in-namespace"})
+        existing = {node["id"] for node in nodes}
+        for nsid in sorted(namespace_ids - existing):
+            nodes.append({"id": nsid, "kind": "Namespace", "namespace": None, "name": nsid.rsplit(":", 1)[-1]})
+        return {"coverage": "native-inventory-topology", "nodes": nodes[:1000], "edges": edges[:2000]}
+
+    raise HTTPException(status_code=501, detail=f"native Hermes fallback is not implemented for Radar tool {tool}")
+
+
+async def _query_native_intelligence(cluster: dict[str, Any], payload: RadarIntelligenceQuery) -> dict[str, Any]:
+    with closing(db.connect()) as conn:
+        snapshot = _native_kubernetes_target(conn, cluster, payload.native_target_id)
+    discovery = await kubernetes_broker.post("/v1/discover", {"target_snapshot": snapshot})
+    return _native_intelligence_result(payload.tool, payload.arguments, discovery)
+
+
+@app.post("/v1/clusters/{cluster_id}/intelligence/query")
+async def query_cluster_intelligence(cluster_id: str, payload: RadarIntelligenceQuery, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_admin(authorization)
+    try:
+        radar_provider.validate_read_tool(payload.tool, payload.arguments)
+    except radar_provider.RadarProtocolError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    with closing(db.connect()) as conn:
+        cluster = _cluster_dict(_get_cluster(conn, cluster_id))
+
+    radar_error: str | None = None
+    if payload.mode != "NATIVE":
+        try:
+            with closing(db.connect()) as conn:
+                integration = _configured_radar_integration(conn, cluster, payload.integration_id)
+            result = await radar_provider.query(
+                integration["endpoint"],
+                payload.tool,
+                payload.arguments,
+                timeout=float(os.getenv("HERMES_RADAR_TIMEOUT_SECONDS", "10")),
+            )
+            with closing(db.connect()) as conn:
+                db.audit(conn, "radar.intelligence.queried", "admin", "cluster", cluster_id, {"mode": payload.mode, "tool": payload.tool, "provider": "radar", "integration_id": integration["id"], "argument_keys": sorted(payload.arguments)})
+                conn.commit()
+            return {"cluster_id": cluster_id, "mode": payload.mode, "provider": "radar", "fallback": False, "integration_id": integration["id"], "data": result}
+        except HTTPException as exc:
+            if payload.mode == "RADAR":
+                raise
+            radar_error = str(exc.detail)
+        except radar_provider.RadarError as exc:
+            if payload.mode == "RADAR":
+                raise HTTPException(status_code=502, detail=str(exc)) from exc
+            radar_error = str(exc)
+
+    try:
+        native = await _query_native_intelligence(cluster, payload)
+    except HTTPException as exc:
+        if payload.mode == "AUTO" and radar_error:
+            raise HTTPException(status_code=503, detail={"radar": radar_error, "native": exc.detail}) from exc
+        raise
+    except Exception as exc:
+        if payload.mode == "AUTO" and radar_error:
+            raise HTTPException(status_code=503, detail={"radar": radar_error, "native": type(exc).__name__}) from exc
+        raise
+
+    with closing(db.connect()) as conn:
+        db.audit(conn, "kubernetes.intelligence.native_queried", "admin", "cluster", cluster_id, {"mode": payload.mode, "tool": payload.tool, "provider": "native", "native_target_id": payload.native_target_id, "radar_fallback": bool(radar_error), "argument_keys": sorted(payload.arguments)})
+        conn.commit()
+    return {"cluster_id": cluster_id, "mode": payload.mode, "provider": "native", "fallback": bool(radar_error), "radar_error": radar_error, "native_target_id": payload.native_target_id, "data": radar_provider.redact(native)}
 
 
 @app.post("/v1/clusters/{cluster_id}/intelligence/radar", status_code=201)
