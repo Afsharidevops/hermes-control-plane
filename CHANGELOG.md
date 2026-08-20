@@ -1,5 +1,6 @@
 # Changelog
 
+- Dev.5 OCI mirror runtime slice: ChangeSet-governed allowlisted registry-to-registry OCI image copy via fixed Skopeo arguments, full multi-arch copy, preserved digests, environment-only authfile boundary, idempotent destination-tag checks and independent source/destination manifest verification; Helm/package repository protocols remain open.
 - Dev.5 artifact mirror runtime slice: ChangeSet-governed controlled file/allowlisted-HTTPS artifact blob synchronization, atomic publication, idempotent retry and independent source/destination SHA-256 verification; unsupported OCI/repository protocol pairs remain explicit contracts.
 - Dev.5 active unified verification slice: live Kubernetes-broker probes mapped into deterministic PASS/WARN/FAIL/SKIP checks, optional active Radar health, bounded/redacted evidence, persistence and audit; unsupported host/etcd/agent/provider probes remain explicit SKIP instead of synthetic success.
 - Dev.5 trusted Kubernetes day-2 runtime slice: exact-preview-bound node cordon/uncordon/drain, workload restart/scale and pinned Helm-backed add-on/apply execution through the Kubernetes Broker with drift rejection and persisted active verification.

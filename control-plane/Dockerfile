@@ -1,5 +1,6 @@
 FROM python:3.12-slim
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PYTHONPATH=/app/src
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates skopeo && rm -rf /var/lib/apt/lists/*
 RUN groupadd --gid 10020 hermes && useradd --uid 10020 --gid 10020 --create-home hermes
 WORKDIR /app
 COPY requirements.txt .

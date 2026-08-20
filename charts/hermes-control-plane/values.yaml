@@ -18,6 +18,8 @@ controlPlane:
   executionEnabled: false
   artifactMirror:
     httpsHostAllowlist: ""
+    ociSourceRegistryAllowlist: ""
+    ociDestinationRegistryAllowlist: ""
     maxBytes: 536870912
     timeoutSeconds: 60
   service:

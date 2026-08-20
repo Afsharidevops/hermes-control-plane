@@ -61,7 +61,7 @@ GROUPS: list[dict[str, Any]] = [
             _surface("cluster-factory.provision", "Provision", "PARTIAL", "ProvisioningRun + provider jobs", "Governed provisioning plans exist; provider-worker repeatability closure remains."),
             _surface("cluster-factory.templates", "Templates", "LIVE", "ClusterBlueprint/ClusterProfile", "Deterministic blueprint and profile definitions."),
             _surface("cluster-factory.bare-metal", "Bare Metal", "CONTRACT_ONLY", "Redfish/IPMI/PXE provider contracts", "UI surface exists; real bare-metal executors remain release-blocking."),
-            _surface("cluster-factory.images-artifacts", "Images / Artifacts", "PARTIAL", "artifact inventory + trusted blob mirror runtime", "Digest-pinned file/allowlisted-HTTPS to local-file synchronization is executable; OCI registry and repository metadata mirroring remain open."),
+            _surface("cluster-factory.images-artifacts", "Images / Artifacts", "PARTIAL", "artifact inventory + trusted blob mirror runtime", "Digest-pinned file/allowlisted-HTTPS blob sync and allowlisted OCI-image registry-to-registry copy are executable; Helm/package repository metadata mirroring remains open."),
         ],
     },
     {
@@ -100,7 +100,7 @@ GROUPS: list[dict[str, Any]] = [
             _surface("governance.credentials", "Credentials", "LIVE", "Credential Service references", "Metadata-only references; raw credentials are never rendered."),
             _surface("governance.agents", "Agents", "LIVE", "Hermes Agent registry", "Enrollment, heartbeat and task state."),
             _surface("governance.integrations", "Integrations", "LIVE", "integration registry", "Provider/integration metadata and health."),
-            _surface("governance.artifact-mirror", "Artifact Mirror", "PARTIAL", "artifact inventory + trusted blob mirror runtime", "ChangeSet-governed file/allowlisted-HTTPS to local-file sync is executable with source/destination SHA-256 verification; registry/repository protocol sync remains open."),
+            _surface("governance.artifact-mirror", "Artifact Mirror", "PARTIAL", "artifact inventory + trusted blob mirror runtime", "ChangeSet-governed blob sync plus digest-pinned OCI-image registry copy is executable with independent source/destination verification; Helm/package repository protocols remain open."),
             _surface("governance.audit", "Audit", "LIVE", "Hermes audit", "Governance and execution audit events."),
             _surface("governance.ai-routing", "AI Routing", "PARTIAL", "shared intent backend/router metadata", "Shared channel contract exists; dedicated routing control UI remains bounded."),
             _surface("governance.settings", "Settings", "PARTIAL", "system/environment configuration", "System/runtime state and environment configuration; secret settings are intentionally absent."),

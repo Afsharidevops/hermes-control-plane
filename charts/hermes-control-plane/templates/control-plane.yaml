@@ -46,6 +46,8 @@ spec:
             - {name: HERMES_ARTIFACT_SOURCE_ROOT, value: /data/artifact-source}
             - {name: HERMES_ARTIFACT_MIRROR_ROOT, value: /data/artifact-mirror}
             - {name: HERMES_ARTIFACT_HTTPS_HOST_ALLOWLIST, value: {{ .Values.controlPlane.artifactMirror.httpsHostAllowlist | quote }}}
+            - {name: HERMES_ARTIFACT_OCI_SOURCE_REGISTRY_ALLOWLIST, value: {{ .Values.controlPlane.artifactMirror.ociSourceRegistryAllowlist | quote }}}
+            - {name: HERMES_ARTIFACT_OCI_DESTINATION_REGISTRY_ALLOWLIST, value: {{ .Values.controlPlane.artifactMirror.ociDestinationRegistryAllowlist | quote }}}
             - {name: HERMES_ARTIFACT_MIRROR_MAX_BYTES, value: {{ .Values.controlPlane.artifactMirror.maxBytes | quote }}}
             - {name: HERMES_ARTIFACT_MIRROR_TIMEOUT_SECONDS, value: {{ .Values.controlPlane.artifactMirror.timeoutSeconds | quote }}}
           securityContext:

@@ -299,10 +299,10 @@ assert "ghcr.io" not in workflow.lower()
 assert "linux/amd64,linux/arm64" in workflow
 
 
-# Dev.5 artifact mirror has a real constrained blob-sync runtime without pretending registry protocols are complete.
+# Dev.5 artifact mirror has constrained blob-sync and OCI-image registry runtimes without pretending all repository protocols are complete.
 for marker in (
-    'ARTIFACT_RUNTIME_SOURCE_SCHEMES = {"file", "https"}',
-    'ARTIFACT_RUNTIME_DESTINATION_SCHEMES = {"file"}',
+    'ARTIFACT_RUNTIME_SOURCE_SCHEMES = {"file", "https", "oci"}',
+    'ARTIFACT_RUNTIME_DESTINATION_SCHEMES = {"file", "oci"}',
     'validate_artifact_mirror_parameters',
     'artifact_mirror_runtime_capable',
     '"artifact-mirror-contract"',
@@ -322,10 +322,29 @@ for marker in (
     'raw_credentials_returned',
 ):
     assert marker in artifact_mirror, marker
-for forbidden in ('subprocess', 'os.system', 'shell=True', 'eval(', 'exec('):
+for marker in (
+    'HERMES_ARTIFACT_OCI_SOURCE_REGISTRY_ALLOWLIST',
+    'HERMES_ARTIFACT_OCI_DESTINATION_REGISTRY_ALLOWLIST',
+    'HERMES_ARTIFACT_OCI_SOURCE_AUTHFILE',
+    'HERMES_ARTIFACT_OCI_DESTINATION_AUTHFILE',
+    'HERMES_ARTIFACT_AUTH_ROOT',
+    '"copy"',
+    '"--all"',
+    '"--preserve-digests"',
+    '"--digestfile"',
+    'subprocess.run',
+    'stdin=subprocess.DEVNULL',
+    'stdout=subprocess.PIPE',
+    'stderr=subprocess.PIPE',
+    'authfiles_from_environment_only',
+):
+    assert marker in artifact_mirror, marker
+for forbidden in ('os.system', 'shell=True', 'eval(', 'exec('):
     assert forbidden not in artifact_mirror, forbidden
 assert 'artifact-mirror-worker' in cp_main
 assert 'source=executor' in cp_main
 assert 'sync_state' in cp_main
+dockerfile = text('control-plane/Dockerfile')
+assert 'apt-get install -y --no-install-recommends ca-certificates skopeo' in dockerfile
 
 print("0.5.11-dev.5-source-security: PASS")

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -13,7 +14,7 @@ os.environ["HERMES_APPROVAL_BOT_TOKEN"] = "test-approval"
 os.environ["HERMES_APPROVAL_HMAC_KEY"] = "approval-hmac-key-0123456789abcdef0123456789abcdef"
 os.environ["HERMES_EXECUTION_HMAC_KEY"] = "execution-ticket-key-0123456789abcdef0123456789abcdef"
 
-from hermes_control_plane import db  # noqa: E402
+from hermes_control_plane import artifact_mirror, db  # noqa: E402
 from hermes_control_plane.main import app  # noqa: E402
 
 ADMIN = {"Authorization": "Bearer test-admin"}
@@ -171,7 +172,7 @@ def test_artifact_protocol_contract_stays_non_executable_and_parameters_are_stri
     item = client.post(
         "/v1/artifact-mirror/items",
         headers=ADMIN,
-        json={"name": "oci-cilium", "kind": "oci-image", "source": "oci://registry.example/cilium", "destination": "oci://mirror.local/cilium", "version": "1.19.4", "digest": digest},
+        json={"name": "repo-package", "kind": "package", "source": "apt://repo.example/stable", "destination": "apt://mirror.local/stable", "version": "1.2.3", "digest": digest},
     )
     assert item.status_code == 201, item.text
     planned = client.post(
@@ -190,3 +191,144 @@ def test_artifact_protocol_contract_stays_non_executable_and_parameters_are_stri
     )
     assert bad.status_code == 422
     assert "verification cannot be disabled" in bad.text
+
+
+
+def test_oci_registry_mirror_is_digest_pinned_multiarch_and_idempotent(client: TestClient, monkeypatch, tmp_path: Path):
+    manifest = b'{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}'
+    digest = _digest(manifest)
+    monkeypatch.setenv("HERMES_ARTIFACT_OCI_SOURCE_REGISTRY_ALLOWLIST", "registry.example")
+    monkeypatch.setenv("HERMES_ARTIFACT_OCI_DESTINATION_REGISTRY_ALLOWLIST", "mirror.local")
+    monkeypatch.setenv("HERMES_ARTIFACT_AUTH_ROOT", str(tmp_path / "auth"))
+
+    state = {"copied": False}
+    calls: list[list[str]] = []
+
+    def fake_run(command, **kwargs):
+        calls.append(list(command))
+        assert command[0] == "skopeo"
+        assert kwargs.get("stdin") is subprocess.DEVNULL
+        assert kwargs.get("stdout") is subprocess.PIPE
+        assert kwargs.get("stderr") is subprocess.PIPE
+        if command[1] == "inspect":
+            ref = command[-1]
+            if ref.startswith("docker://registry.example/"):
+                return subprocess.CompletedProcess(command, 0, stdout=manifest, stderr=b"")
+            if ref == "docker://mirror.local/hermes/cilium:1.19.4" and not state["copied"]:
+                return subprocess.CompletedProcess(command, 1, stdout=b"", stderr=b"manifest unknown")
+            if ref.startswith("docker://mirror.local/"):
+                return subprocess.CompletedProcess(command, 0, stdout=manifest, stderr=b"")
+        if command[1] == "copy":
+            assert "--all" in command
+            assert "--preserve-digests" in command
+            assert "--retry-times" in command
+            assert command[-2] == f"docker://registry.example/cilium/cilium@{digest}"
+            assert command[-1] == "docker://mirror.local/hermes/cilium:1.19.4"
+            digest_path = Path(command[command.index("--digestfile") + 1])
+            digest_path.write_text(digest + "\n", encoding="utf-8")
+            state["copied"] = True
+            return subprocess.CompletedProcess(command, 0, stdout=b"", stderr=b"")
+        raise AssertionError(command)
+
+    monkeypatch.setattr(artifact_mirror.subprocess, "run", fake_run)
+
+    created = client.post(
+        "/v1/artifact-mirror/items",
+        headers=ADMIN,
+        json={
+            "name": "oci-cilium-runtime",
+            "kind": "oci-image",
+            "source": "oci://registry.example/cilium/cilium",
+            "destination": "oci://mirror.local/hermes/cilium",
+            "version": "1.19.4",
+            "digest": digest,
+        },
+    )
+    assert created.status_code == 201, created.text
+    planned = client.post(
+        "/v1/operations-center/intents/plan",
+        headers=BOT,
+        json={
+            "requested_by": "hermes-bot:airgap",
+            "source_channel": "hermes-bot",
+            "domain": "artifact",
+            "operation": "artifact.mirror.apply",
+            "target_id": created.json()["id"],
+            "parameters": {"verify_destination": True},
+        },
+    )
+    assert planned.status_code == 201, planned.text
+    body = planned.json()
+    assert body["operation_job"]["executor"] == "artifact-mirror-worker"
+    assert body["operation_plan"]["plan"]["runtime"]["state"] == "RUNTIME_CAPABLE"
+    auth = _approve_and_authorize(client, body)
+    executed = client.post(
+        f"/v1/operation-jobs/{body['operation_job']['id']}/execute",
+        headers=BOT,
+        json={"execution_ticket": auth["execution_ticket"], "signature": auth["signature"], "actor": "hermes-bot:airgap"},
+    )
+    assert executed.status_code == 200, executed.text
+    result = executed.json()
+    assert result["operation_job"]["state"] == "SUCCEEDED"
+    assert result["runtime_result"]["state"] == "MIRRORED"
+    assert result["runtime_result"]["digest"] == digest
+    assert result["runtime_result"]["verification"]["evidence"]["multi_arch"] == "all"
+    assert result["runtime_result"]["verification"]["evidence"]["raw_credentials_returned"] is False
+
+    # Exact retry observes the already-published tag and does not invoke copy again.
+    second = client.post(
+        "/v1/operations-center/intents/plan",
+        headers=BOT,
+        json={
+            "requested_by": "hermes-bot:airgap-retry",
+            "source_channel": "hermes-bot",
+            "domain": "artifact",
+            "operation": "artifact.mirror.apply",
+            "target_id": created.json()["id"],
+            "parameters": {"verify_destination": True},
+        },
+    ).json()
+    second_auth = _approve_and_authorize(client, second)
+    retried = client.post(
+        f"/v1/operation-jobs/{second['operation_job']['id']}/execute",
+        headers=BOT,
+        json={"execution_ticket": second_auth["execution_ticket"], "signature": second_auth["signature"], "actor": "hermes-bot:airgap-retry"},
+    )
+    assert retried.status_code == 200, retried.text
+    assert retried.json()["runtime_result"]["state"] == "ALREADY_MIRRORED"
+    assert sum(1 for call in calls if len(call) > 1 and call[1] == "copy") == 1
+
+
+def test_oci_registry_mirror_rejects_unallowlisted_registry_and_embedded_reference_tags(client: TestClient, monkeypatch):
+    manifest = b'{"schemaVersion":2}'
+    digest = _digest(manifest)
+    monkeypatch.setenv("HERMES_ARTIFACT_OCI_SOURCE_REGISTRY_ALLOWLIST", "registry.example")
+    monkeypatch.setenv("HERMES_ARTIFACT_OCI_DESTINATION_REGISTRY_ALLOWLIST", "mirror.local")
+
+    created = client.post(
+        "/v1/artifact-mirror/items",
+        headers=ADMIN,
+        json={
+            "name": "oci-untrusted",
+            "kind": "oci-image",
+            "source": "oci://evil.example/cilium/cilium",
+            "destination": "oci://mirror.local/hermes/cilium",
+            "version": "1.19.4",
+            "digest": digest,
+        },
+    )
+    assert created.status_code == 201
+    planned = client.post(
+        "/v1/operations-center/intents/plan",
+        headers=BOT,
+        json={"requested_by": "hermes-bot:airgap", "source_channel": "hermes-bot", "domain": "artifact", "operation": "artifact.mirror.apply", "target_id": created.json()["id"], "parameters": {"verify_destination": True}},
+    ).json()
+    auth = _approve_and_authorize(client, planned)
+    executed = client.post(
+        f"/v1/operation-jobs/{planned['operation_job']['id']}/execute",
+        headers=BOT,
+        json={"execution_ticket": auth["execution_ticket"], "signature": auth["signature"], "actor": "hermes-bot:airgap"},
+    )
+    assert executed.status_code == 200
+    assert executed.json()["runtime_result"]["state"] == "FAILED"
+    assert "allowlisted" in executed.json()["runtime_result"]["verification"]["checks"][0]["summary"]

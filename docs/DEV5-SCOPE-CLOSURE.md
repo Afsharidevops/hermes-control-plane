@@ -206,9 +206,7 @@ Security/runtime properties:
 - `artifact_mirror_items.status` remains the operational enable/disable state; mirror success/failure is stored separately in `verification_json.sync_state`, so retry planning remains possible
 
 This is deliberately **partial air-gap closure**, not a claim that every artifact
-protocol is complete. OCI registry-to-registry image copy, Helm OCI registry push,
-OS/Python package repository metadata mirroring, and authenticated repository
-credential delivery remain release-blocking runtime work. Plans using unsupported
+protocol is complete. The original blob-only slice did not close registry protocols. A later dev.5 slice now adds bounded OCI-image registry-to-registry copy; Helm OCI registry publication, OS/Python package repository metadata mirroring, broader signature policy, and generalized authenticated repository credential delivery remain release-blocking runtime work. Plans using unsupported
 protocol pairs are retained for compatibility but receive executor
 `artifact-mirror-contract` and cannot enter the trusted runtime execution path.
 
@@ -257,3 +255,34 @@ Planning reads the existing `schedules.velero.io` object or its explicit absence
 Execution re-reads the Schedule and rejects drift before mutation. An absent Schedule is created from the fixed CR, an already-exact Schedule is an idempotent no-op, and a bounded differing Schedule is updated only through the fixed cron/template merge patch. Active verification re-reads the Schedule and requires exact approved cron/scope/snapshot/TTL, no deletion, no validation errors, no `FailedValidation` state and no fields outside the bounded contract. Runtime evidence exposes only bounded status such as phase and whether a prior backup exists; it never returns Backup logs, Secret data or backup-storage credentials. Arbitrary Schedule YAML, arbitrary `velero` CLI/shell and Schedule deletion are not accepted.
 
 This closes bounded Velero recurring Schedule create/update semantics, not direct etcd snapshot/restore, provider backup-storage lifecycle, provider-specific DR or full Cluster Factory/provider execution.
+
+
+## Slice 12 — Trusted OCI image registry synchronization runtime
+
+This slice extends `artifact.mirror.apply` for artifact kind `oci-image` when both endpoints use `oci://registry/repository`. It is a constrained OCI image path, not a generic repository client.
+
+Runtime path:
+
+```text
+ArtifactMirrorItem(oci-image, pinned sha256)
+  -> exact typed ArtifactMirrorPlan / ChangeSet / execution ticket
+  -> source/destination registry allowlist checks
+  -> source raw-manifest digest verification
+  -> fixed skopeo copy --all --preserve-digests
+  -> destination tag + digest-reference raw-manifest verification
+  -> typed verification / persisted audit
+```
+
+Security/runtime properties:
+
+- source and destination registry hosts must be explicitly allowlisted; empty allowlists disable the OCI runtime
+- `oci://` references contain only registry/repository; the approved SHA-256 is appended to the source internally and the approved artifact version becomes the destination tag
+- arbitrary tags/digests embedded in caller endpoint strings are rejected
+- the worker invokes only the fixed `skopeo` command through `subprocess.run` with `shell=False` semantics; no caller-provided CLI switches are accepted
+- `--all` copies the full multi-platform image/index and `--preserve-digests` fails if digest identity cannot be maintained
+- source and destination raw manifests are independently SHA-256 hashed; both the destination tag and destination digest reference must resolve to the approved digest
+- an already-correct destination tag is an idempotent PASS; a mismatched existing tag fails closed unless the exact approved plan sets `replace_existing=true`
+- optional source/destination authfiles are read only from trusted environment-mounted paths below `HERMES_ARTIFACT_AUTH_ROOT`; auth material never enters the plan, audit, or returned evidence
+- stderr is never returned to the caller, and runtime evidence attests `arbitrary_shell=false` and `raw_credentials_returned=false`
+
+This is still **partial air-gap closure**. Helm OCI artifacts, OS/Python/package repository metadata, repository signatures/policy beyond Skopeo's configured trust behavior, dependency graph resolution, offline reference rewriting and generalized repository credential delivery remain open.
