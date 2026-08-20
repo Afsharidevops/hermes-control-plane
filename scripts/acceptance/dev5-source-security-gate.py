@@ -211,7 +211,7 @@ for operation in (
     'cluster.node.cordon', 'cluster.node.uncordon', 'cluster.node.drain',
     'cluster.workload.restart', 'cluster.workload.scale',
     'cluster.addon.install', 'cluster.addon.upgrade', 'cluster.helm.apply',
-    'cluster.gitops.sync', 'cluster.cilium.upgrade',
+    'cluster.gitops.sync', 'cluster.cilium.upgrade', 'cluster.backup.velero',
 ):
     assert f'"{operation}"' in kube_broker, operation
 for forbidden in ('shell=True', 'os.system', 'kubectl exec', 'kubectl cp'):
@@ -227,6 +227,11 @@ for marker in (
     'hubble_provider.collect',
     'cilium-ready',
     'hubble-ready',
+    'backups.velero.io',
+    'Velero Backup state changed after preview',
+    'different approved specification',
+    '--for=jsonpath={.status.phase}=Completed',
+    'velero-backup-completed',
 ):
     assert marker in kube_broker, marker
 

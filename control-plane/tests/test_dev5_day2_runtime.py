@@ -257,3 +257,78 @@ def test_cilium_upgrade_is_trusted_kubernetes_runtime_and_wrong_gitops_revision_
     )
     assert bad.status_code == 422
     assert "commit digest" in bad.text
+
+
+def test_velero_backup_is_trusted_runtime_with_preview_binding_and_active_verification(client: TestClient, monkeypatch):
+    cluster, target = _cluster_and_target(client, ["velero", "apps"])
+    seen = []
+
+    async def fake_post(path: str, payload: dict) -> dict:
+        seen.append((path, payload))
+        if path == "/v1/day2/preview":
+            assert payload["operation"] == "cluster.backup.velero"
+            return {
+                "kind": "kubernetes-day2-velero-backup-preview",
+                "operation": "cluster.backup.velero",
+                "before": {"exists": False, "backup_name": "hermes-test", "namespace": "velero"},
+                "desired": {"backup_name": "hermes-test", "namespace": "velero", "included_namespaces": ["apps"], "snapshot_volumes": True, "ttl_hours": 72},
+                "preconditions": {"velero_backup_state_hash": "e" * 64},
+                "secret_output_suppressed": True,
+            }
+        assert path == "/v1/day2/execute"
+        return {
+            "schema_version": 1,
+            "operation": "cluster.backup.velero",
+            "typed_plan_hash": payload["ticket"]["plan"]["parameters"]["typed_plan"]["plan_hash"],
+            "target_snapshot_hash": payload["ticket"]["plan"]["parameters"]["typed_plan"]["targets"][1]["snapshot_hash"],
+            "result": {"backup": {"backup_name": "hermes-test", "namespace": "velero", "phase": "Completed", "errors": 0}},
+            "verification": {
+                "observed_at": 1787164000,
+                "checks": [{"id": "velero-backup-completed", "status": "PASS", "summary": "Velero backup completed", "evidence": {"backup_name": "hermes-test", "phase": "Completed", "errors": 0}}],
+                "evidence": {"source": "kubernetes-broker-active-verification", "arbitrary_shell": False, "raw_credentials_returned": False},
+            },
+        }
+
+    monkeypatch.setattr(kubernetes_broker, "post", fake_post)
+    planned = client.post(
+        "/v1/operations-center/intents/plan",
+        headers=BOT,
+        json={
+            "requested_by": "hermes-bot:backup",
+            "source_channel": "hermes-bot",
+            "domain": "day2",
+            "operation": "cluster.backup.velero",
+            "target_id": cluster["id"],
+            "parameters": {
+                "native_target_id": target["id"],
+                "backup_name": "hermes-test",
+                "namespace": "velero",
+                "included_namespaces": ["apps"],
+                "snapshot_volumes": True,
+                "ttl_hours": 72,
+            },
+        },
+    )
+    assert planned.status_code == 201, planned.text
+    body = planned.json()
+    assert body["operation_job"]["executor"] == "kubernetes-broker"
+    assert body["operation_plan"]["plan"]["kind"] == "VeleroBackupPlan"
+    assert body["operation_plan"]["plan"]["runtime_preview"]["preconditions"]["velero_backup_state_hash"] == "e" * 64
+    _approve(client, body["changeset"])
+    auth = client.post(f"/v1/operation-jobs/{body['operation_job']['id']}/authorize", headers=BOT).json()
+    executed = client.post(
+        f"/v1/operation-jobs/{body['operation_job']['id']}/execute",
+        headers=BOT,
+        json={"execution_ticket": auth["execution_ticket"], "signature": auth["signature"], "actor": "hermes-bot:backup"},
+    )
+    assert executed.status_code == 200, executed.text
+    assert executed.json()["verification"]["status"] == "PASS"
+    assert [x[0] for x in seen] == ["/v1/day2/preview", "/v1/day2/execute"]
+
+    bad = client.post(
+        "/v1/operations-center/intents/plan",
+        headers=BOT,
+        json={"requested_by": "hermes-bot:backup", "source_channel": "hermes-bot", "domain": "day2", "operation": "cluster.backup.velero", "target_id": cluster["id"], "parameters": {"native_target_id": target["id"], "backup_name": "hermes-test", "namespace": "velero", "included_namespaces": ["apps"], "ttl_hours": 0}},
+    )
+    assert bad.status_code == 422
+    assert "ttl_hours" in bad.text

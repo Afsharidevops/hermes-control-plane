@@ -136,3 +136,4 @@
 - introduced isolated `hermes-control-plane-*` Docker image naming
 
 - 0.5.11-dev.5: add exact-commit Argo CD GitOps sync and pinned Cilium upgrade execution through the trusted Kubernetes Broker with drift-bound previews and active verification.
+- 0.5.11-dev.5: add bounded one-shot Velero Backup execution through the trusted Kubernetes Broker with exact state/spec binding and active completion verification.

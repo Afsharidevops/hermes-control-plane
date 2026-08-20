@@ -86,7 +86,7 @@ GROUPS: list[dict[str, Any]] = [
             _surface("operations.diagnostics", "Diagnostics", "LIVE", "native diagnostics + active unified verification", "Executable read-only diagnostic engine plus persisted active cluster verification.", action="diagnostics"),
             _surface("operations.deployments", "Deployments", "PARTIAL", "ChangeSets + operation jobs", "Governed plans/jobs are visible; broader executor closure remains."),
             _surface("operations.upgrades", "Upgrades", "PARTIAL", "UpgradePlan + trusted Cilium upgrade runtime", "Pinned Cilium Helm upgrade with active Cilium/Hubble verification is executable; Kubernetes/provider upgrades remain partial."),
-            _surface("operations.backups", "Backups", "PARTIAL", "BackupPlan + verification models", "Backup planning exists; active backup/restore execution remains."),
+            _surface("operations.backups", "Backups", "PARTIAL", "BackupPlan + trusted Velero backup runtime", "One-shot Velero Backup execution is ChangeSet-governed and actively verified; restore, schedules and provider-specific backup paths remain open."),
             _surface("operations.recovery", "Recovery", "CONTRACT_ONLY", "restore/DR operation contracts", "Recovery UI/contract exists; active runtime remains release-blocking."),
             _surface("operations.maintenance", "Maintenance", "CONTRACT_ONLY", "day-2 operation contracts", "Maintenance UI/contract exists; executor runtime remains release-blocking."),
         ],

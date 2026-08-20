@@ -149,7 +149,7 @@ Governance and drift properties:
 - successful broker execution must return typed active verification checks; Hermes persists them and marks the operation plan VERIFIED only on PASS
 - broker failure, sensitive evidence, malformed verification or failed verification prevents a successful ChangeSet result
 
-This slice intentionally left `cluster.worker.add/remove/replace`, GitOps sync, Kubernetes/Cilium upgrade, etcd snapshot, restore/DR, certificate rotation, maintenance provider steps, decommission, infrastructure scale and template clone on their explicit provider-worker contracts at that point; Slice 8 closes the trusted Argo CD sync and Cilium-upgrade subset. Those operations remain release-blocking until a real executor exists or the user explicitly defers them.
+This slice intentionally left `cluster.worker.add/remove/replace`, GitOps sync, Kubernetes/Cilium upgrade, etcd snapshot, restore/DR, certificate rotation, maintenance provider steps, decommission, infrastructure scale and template clone on their explicit provider-worker contracts at that point; Slice 8 closes the trusted Argo CD sync and Cilium-upgrade subset, and Slice 9 closes a bounded one-shot Velero backup subset. The remaining operations stay release-blocking until a real executor exists or the user explicitly defers them.
 
 ## Slice 6 — Active unified cluster verification
 
@@ -226,3 +226,12 @@ This slice extends the exact-preview-bound Kubernetes day-2 executor with two ad
 `cluster.cilium.upgrade` now executes through the existing pinned Helm runtime only when the approved parameters target release `cilium`, namespace `kube-system`, a Cilium chart reference, and an explicit pinned version. The Helm release snapshot is exact-preview-bound before approval. After execution Hermes actively verifies Helm deployment state, Cilium agent Pod readiness, and sanitized Hubble Relay reachability through the trusted broker.
 
 This remains partial day-2/Cluster Factory closure. Worker lifecycle, Kubernetes version upgrades, etcd snapshot/restore, certificate rotation, provider maintenance/decommission, infrastructure scale, disaster recovery and template cloning still require real trusted provider/provisioner executors or explicit user-approved deferral. Broader Flux/non-Argo GitOps execution also remains open.
+
+
+## Slice 9 — Trusted one-shot Velero backup runtime
+
+`cluster.backup.velero` is now executable through the trusted Kubernetes Broker without exposing backup-storage credentials to the Control Plane. Planning accepts only a fixed typed subset: a DNS-safe Backup name, Velero namespace, bounded included/excluded namespace lists, `snapshot_volumes`, and a bounded TTL in hours. The broker enforces target namespace scope; an all-namespace backup requires `cluster_read`.
+
+Planning reads the existing `backups.velero.io` object (or its explicit absence), server-side dry-runs only Hermes' fixed `velero.io/v1` `Backup` manifest, and binds that backup-state hash into the approved ChangeSet. Execution re-reads the state and rejects drift. If the Backup does not exist, Hermes creates only that fixed CR; if it already exists, Hermes reuses it only when the live Backup spec exactly matches the approved namespace scope, snapshot setting and TTL and the object is not deleting or failed. The broker waits for `status.phase=Completed` and actively verifies terminal phase, zero errors, exact approved spec, and bounded volume-snapshot counters. Backup logs, Secret data, hooks, arbitrary CR fields, arbitrary `velero` CLI arguments, and arbitrary shell are not accepted or returned.
+
+This is partial backup/restore closure. Scheduled Velero `Schedule` management, restore execution, etcd snapshot/restore, backup-storage-provider lifecycle, and provider-specific DR remain release-blocking.

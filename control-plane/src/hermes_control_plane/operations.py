@@ -96,6 +96,7 @@ DAY2_OPERATIONS: dict[str, dict[str, Any]] = {
     "cluster.gitops.sync": {"kind": "GitOpsOperationPlan", "stages": ["preflight", "render", "diff", "sync", "verify"]},
     "cluster.kubernetes.upgrade": {"kind": "KubernetesUpgradePlan", "stages": ["preflight", "backup", "control-plane", "workers", "addons", "verify"]},
     "cluster.cilium.upgrade": {"kind": "CiliumUpgradePlan", "stages": ["preflight", "backup", "upgrade", "cilium-verify", "hubble-verify"]},
+    "cluster.backup.velero": {"kind": "VeleroBackupPlan", "stages": ["preflight", "create", "wait", "verify"]},
     "cluster.etcd.snapshot": {"kind": "EtcdSnapshotPlan", "stages": ["preflight", "snapshot", "integrity-verify"]},
     "cluster.restore": {"kind": "RestorePlan", "stages": ["preflight", "restore", "workload-verify", "network-verify"]},
     "cluster.certificate.rotate": {"kind": "CertificateRotationPlan", "stages": ["preflight", "rotate", "component-restart", "verify"]},
@@ -126,6 +127,7 @@ KUBERNETES_DAY2_RUNTIME_OPERATIONS: dict[str, dict[str, Any]] = {
     "cluster.helm.apply": {"executor": "kubernetes-broker", "verification": ["helm-release-ready"]},
     "cluster.gitops.sync": {"executor": "kubernetes-broker", "verification": ["gitops-synced", "gitops-healthy"]},
     "cluster.cilium.upgrade": {"executor": "kubernetes-broker", "verification": ["helm-release-ready", "cilium-ready", "hubble-ready"]},
+    "cluster.backup.velero": {"executor": "kubernetes-broker", "verification": ["velero-backup-completed"]},
 }
 
 
@@ -169,6 +171,29 @@ def validate_kubernetes_day2_parameters(operation: str, parameters: dict[str, An
             raise ValueError("GitOps sync requires a full 40- or 64-character commit digest")
         if "prune" in parameters and not isinstance(parameters["prune"], bool):
             raise ValueError("prune must be boolean when provided")
+    elif operation == "cluster.backup.velero":
+        backup_name = str(parameters.get("backup_name") or "")
+        if not backup_name or len(backup_name) > 253:
+            raise ValueError("backup_name is required for Velero backup")
+        namespace = str(parameters.get("namespace") or "velero")
+        if not namespace or len(namespace) > 253:
+            raise ValueError("namespace is required for Velero backup")
+        included = parameters.get("included_namespaces", ["*"])
+        excluded = parameters.get("excluded_namespaces", [])
+        for key, value in (("included_namespaces", included), ("excluded_namespaces", excluded)):
+            if not isinstance(value, list) or len(value) > 64 or any(not isinstance(item, str) or not item or len(item) > 253 for item in value):
+                raise ValueError(f"{key} must be a list of at most 64 namespace names")
+        if not included:
+            raise ValueError("included_namespaces must contain at least one namespace or '*'")
+        if "*" in included and len(included) != 1:
+            raise ValueError("included_namespaces '*' must be used alone")
+        if "*" in excluded:
+            raise ValueError("excluded_namespaces cannot contain '*'")
+        if "snapshot_volumes" in parameters and not isinstance(parameters["snapshot_volumes"], bool):
+            raise ValueError("snapshot_volumes must be boolean when provided")
+        ttl_hours = parameters.get("ttl_hours", 72)
+        if not isinstance(ttl_hours, int) or isinstance(ttl_hours, bool) or ttl_hours < 1 or ttl_hours > 8760:
+            raise ValueError("ttl_hours must be an integer between 1 and 8760")
     else:
         for key in ("release", "chart", "namespace", "version"):
             if not str(parameters.get(key) or ""):

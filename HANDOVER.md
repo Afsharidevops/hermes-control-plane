@@ -8,7 +8,7 @@
 **Frozen dev.4 boundary:** `d4eb9b7ab2564301c09b8c0d36a2e9d53b843273`, tag `v0.5.11-dev.4`
 **Current development package:** `0.5.11-dev.5`
 **Draft PR:** `#2` — keep Draft
-**Status:** dev.5 scope closure is in progress as forward-only commits on top of frozen dev.4. Radar runtime, Cilium/Hubble Network Live, executable native diagnostics, Operator Center UI, trusted Kubernetes day-2 execution and active unified verification are already committed/pushed with exact-SHA `validate` CI success through `65ae56235abc85875cbb38a10116e74f9b5340a9`. The current uncommitted slice adds a trusted ChangeSet-governed artifact blob mirror runtime for controlled file/allowlisted-HTTPS sources with atomic SHA-256-verified local publication; OCI registry/repository protocols remain explicitly partial. Do not amend, move, or recreate dev.4. Dev.5 must still close provider/Cluster Factory runtime gaps, remaining air-gap protocols, provider-coupled verification extensions, and the final audit before `v0.5.11-dev.5` is created. Production image publication remains GitHub Actions -> Docker Hub.
+**Status:** dev.5 scope closure is in progress as forward-only commits on top of frozen dev.4. Radar, Hubble, native diagnostics, Operator Center, trusted Kubernetes day-2, active unified verification, Artifact Mirror blob synchronization, and GitOps/Cilium lifecycle slices are committed/pushed with exact-SHA `validate` CI success through `d75595cc918411245531209d0e26d099b5882e10`. The current uncommitted slice adds bounded ChangeSet-governed one-shot Velero Backup execution through the trusted Kubernetes Broker; schedules, restores, etcd snapshot/restore and provider-backed DR remain open. Do not amend, move, or recreate dev.4. Dev.5 must still close provider/Cluster Factory runtime gaps, remaining air-gap protocols, provider-coupled verification extensions, and the final audit before `v0.5.11-dev.5` is created. Production image publication remains GitHub Actions -> Docker Hub.
 
 Dev.4 adds the shared Web/Telegram/AI typed intent backend, fleet exact-target snapshots, advanced day-2 plans, VMware/OpenStack/AWS/Azure/GCP foundations, Redfish/IPMI/PXE and typed switch/network contracts, digest-pinned air-gap artifact mirroring, constrained generic operation jobs with signed exact-plan execution tickets and unified verification. It does **not** claim live provider/cloud/bare-metal/switch execution without separate disposable-target evidence.
 
@@ -349,3 +349,7 @@ R2 must now be overlaid on the same branch and tested with execution disabled. E
 
 ## 0.5.11-dev.5 GitOps/Cilium runtime slice
 Exact-commit Argo CD Application sync and pinned Cilium Helm upgrade are executable through the trusted Kubernetes Broker with exact preview binding, drift rejection and active verification. Remaining worker/Kubernetes-upgrade/etcd/restore/provider lifecycle is still release-blocking.
+
+
+## 0.5.11-dev.5 Velero backup runtime slice
+One-shot `velero.io/v1` Backup creation is executable through the trusted Kubernetes Broker using exact preview-state binding, namespace-scope enforcement, fixed manifests and active terminal-phase verification. Velero schedules/restores and direct etcd snapshot/restore remain release-blocking.
