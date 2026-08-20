@@ -30,13 +30,14 @@ Do not amend, reset, squash, force-push, move or recreate the frozen dev.4 tag.
 - trusted Kubernetes Broker day-2 runtime for node cordon/uncordon/drain, workload restart/scale and pinned Helm-backed add-on/apply operations
 - day-2 runtime planning now binds a broker-produced read-only live preview/precondition into the exact typed plan before approval, rejects live-state drift at execution, and persists active typed verification automatically
 - active unified cluster verification engine that executes live Kubernetes Broker probes, persists typed PASS/WARN/FAIL/SKIP results, optionally checks configured Radar health, and explicitly SKIPs unsupported provider/host/etcd/agent probes rather than inventing evidence
+- ChangeSet-governed artifact blob synchronization runtime for controlled `file://` or allowlisted `https://` sources into the local mirror root, with byte/time bounds, redirect/root/symlink rejection, atomic writes, idempotent retries and independent source/destination SHA-256 verification
 
 ## Still release-blocking for dev.5 scope closure
 
 - remaining day-2/provider operations not covered by the trusted Kubernetes runtime (worker lifecycle, GitOps sync, Kubernetes/Cilium upgrades, etcd snapshot, restore/DR, certificate rotation, decommission)
 - Cluster Factory runtime/repeatability closure
 - provider/bare-metal/network executors or explicit user-approved deferral
-- air-gap mirror synchronization/integrity runtime
+- remaining air-gap protocol closure: OCI registry-to-registry copy, Helm OCI publication, package-repository metadata sync and authenticated repository credential delivery
 - provider-specific verification extensions coupled to the remaining provider/bare-metal/network runtimes
 
 `v0.5.11-dev.5` must not be created until the full dev.5 closure scope is complete,

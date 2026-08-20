@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any
+from urllib.parse import urlparse
 
 from .canonical import sha256_hex
 
@@ -293,7 +294,35 @@ def infrastructure_plan(
     })
 
 
+ARTIFACT_RUNTIME_SOURCE_SCHEMES = {"file", "https"}
+ARTIFACT_RUNTIME_DESTINATION_SCHEMES = {"file"}
+
+
+def validate_artifact_mirror_parameters(parameters: dict[str, Any]) -> None:
+    allowed = {"verify_destination", "replace_existing"}
+    unknown = sorted(set(parameters) - allowed)
+    if unknown:
+        raise ValueError(f"unsupported artifact mirror parameter(s): {', '.join(unknown)}")
+    if parameters.get("verify_destination", True) is not True:
+        raise ValueError("artifact mirror destination digest verification cannot be disabled")
+    if "replace_existing" in parameters and not isinstance(parameters["replace_existing"], bool):
+        raise ValueError("replace_existing must be boolean")
+
+
+def artifact_mirror_runtime_capable(plan: dict[str, Any]) -> bool:
+    artifact = plan.get("artifact") if isinstance(plan.get("artifact"), dict) else {}
+    return (
+        plan.get("operation") == "artifact.mirror.apply"
+        and urlparse(str(artifact.get("source") or "")).scheme.lower() in ARTIFACT_RUNTIME_SOURCE_SCHEMES
+        and urlparse(str(artifact.get("destination") or "")).scheme.lower() in ARTIFACT_RUNTIME_DESTINATION_SCHEMES
+    )
+
+
 def artifact_mirror_plan(*, artifact_snapshot: dict[str, Any], parameters: dict[str, Any]) -> dict[str, Any]:
+    validate_artifact_mirror_parameters(parameters)
+    source_scheme = urlparse(str(artifact_snapshot["source"])).scheme.lower()
+    destination_scheme = urlparse(str(artifact_snapshot["destination"])).scheme.lower()
+    runtime_capable = source_scheme in ARTIFACT_RUNTIME_SOURCE_SCHEMES and destination_scheme in ARTIFACT_RUNTIME_DESTINATION_SCHEMES
     return _finish({
         "schema_version": 4,
         "kind": "ArtifactMirrorPlan",
@@ -307,7 +336,15 @@ def artifact_mirror_plan(*, artifact_snapshot: dict[str, Any], parameters: dict[
             "version": artifact_snapshot["version"],
             "digest": artifact_snapshot["digest"],
         },
-        "parameters": parameters,
+        "parameters": {"verify_destination": True, "replace_existing": bool(parameters.get("replace_existing", False))},
+        "runtime": {
+            "state": "RUNTIME_CAPABLE" if runtime_capable else "CONTRACT_ONLY",
+            "executor": "artifact-mirror-worker" if runtime_capable else "artifact-mirror-contract",
+            "source_scheme": source_scheme,
+            "destination_scheme": destination_scheme,
+            "supported_source_schemes": sorted(ARTIFACT_RUNTIME_SOURCE_SCHEMES),
+            "supported_destination_schemes": sorted(ARTIFACT_RUNTIME_DESTINATION_SCHEMES),
+        },
         "stages": ["resolve-source", "fetch", "verify-source-digest", "mirror", "verify-destination-digest", "record-audit"],
         "digest_verification_required": True,
         "mutation_gate": MUTATION_GATE,

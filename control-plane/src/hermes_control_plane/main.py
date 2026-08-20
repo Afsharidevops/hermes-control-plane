@@ -27,6 +27,7 @@ from . import cluster_factory
 from . import operations
 from . import operator_center
 from . import verification as unified_verification
+from . import artifact_mirror
 from . import radar as radar_provider
 from .providers import PROVIDERS, provider_descriptor
 from .tickets import issue_ticket, verify_ticket
@@ -125,7 +126,7 @@ ADAPTER_CAPABILITIES: dict[str, dict[str, Any]] = {
     "cloud.apply": {"adapter": "cloud", "mode": "write", "default_risk": "HIGH", "reversible": True, "credential_class": "cloud", "connection_modes": ["provider"], "approval": "policy", "target_restrictions": ["typed provider contract", "credential-service delivery only", "exact ChangeSet hash"]},
     "bare-metal.apply": {"adapter": "bare-metal", "mode": "write", "default_risk": "HIGH", "reversible": False, "credential_class": "bmc", "connection_modes": ["provider"], "approval": "policy", "target_restrictions": ["typed Redfish/IPMI/PXE contract", "no generated shell", "exact ChangeSet hash"]},
     "network.apply": {"adapter": "network", "mode": "write", "default_risk": "HIGH", "reversible": True, "credential_class": "switch", "connection_modes": ["provider"], "approval": "policy", "target_restrictions": ["typed switch intent", "no arbitrary CLI", "exact ChangeSet hash"]},
-    "artifact.mirror.apply": {"adapter": "artifact", "mode": "write", "default_risk": "HIGH", "reversible": True, "credential_class": "registry-or-repository", "connection_modes": ["provider"], "approval": "policy", "target_restrictions": ["version and sha256 digest pinned", "source/destination digest verification"]},
+    "artifact.mirror.apply": {"adapter": "artifact", "mode": "write", "default_risk": "HIGH", "reversible": True, "credential_class": "registry-or-repository", "connection_modes": ["provider"], "approval": "policy", "target_restrictions": ["version and sha256 digest pinned", "source/destination digest verification", "trusted file/allowlisted-HTTPS to file runtime; registry protocols remain explicit contract-only"]},
 }
 
 
@@ -3775,8 +3776,12 @@ async def plan_operations_intent(payload: OperationsIntentPlanCreate, authorizat
             if not payload.target_id or not payload.target_id.startswith("art_"):
                 raise HTTPException(status_code=422, detail="artifact intent requires target_id for an artifact mirror item")
             artifact_snapshot = _artifact_mirror_snapshot(conn, payload.target_id)
-            typed_plan = operations.artifact_mirror_plan(artifact_snapshot=artifact_snapshot, parameters=payload.parameters)
-            result = _plan_mutation(conn, typed_plan=typed_plan, target_id=payload.target_id, subject_type="artifact", subject_id=payload.target_id, requested_by=payload.requested_by, source_channel=payload.source_channel, adapter="artifact", ttl_seconds=payload.ttl_seconds, executor="artifact-mirror-worker")
+            try:
+                typed_plan = operations.artifact_mirror_plan(artifact_snapshot=artifact_snapshot, parameters=payload.parameters)
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            artifact_executor = "artifact-mirror-worker" if operations.artifact_mirror_runtime_capable(typed_plan) else "artifact-mirror-contract"
+            result = _plan_mutation(conn, typed_plan=typed_plan, target_id=payload.target_id, subject_type="artifact", subject_id=payload.target_id, requested_by=payload.requested_by, source_channel=payload.source_channel, adapter="artifact", ttl_seconds=payload.ttl_seconds, executor=artifact_executor)
         else:
             raise HTTPException(status_code=422, detail="unsupported operations intent domain")
         conn.commit()
@@ -3813,15 +3818,15 @@ def authorize_operation_job(job_id: str, authorization: str | None = Header(defa
     return result
 
 
-def _persist_runtime_verification(conn, *, job: Any, changeset: Any, payload: dict[str, Any], actor: str) -> dict[str, Any]:
+def _persist_runtime_verification(conn, *, job: Any, changeset: Any, payload: dict[str, Any], actor: str, source: str = "kubernetes-broker") -> dict[str, Any]:
     verification = payload.get("verification") or {}
     checks = verification.get("checks") or []
     if not isinstance(checks, list) or not checks:
-        raise HTTPException(status_code=502, detail="Kubernetes Broker returned no active verification checks")
+        raise HTTPException(status_code=502, detail=f"{source} returned no active verification checks")
     normalized: list[dict[str, Any]] = []
     for check in checks:
         if not isinstance(check, dict):
-            raise HTTPException(status_code=502, detail="Kubernetes Broker returned malformed verification evidence")
+            raise HTTPException(status_code=502, detail=f"{source} returned malformed verification evidence")
         item = {
             "id": str(check.get("id") or "")[:160],
             "status": str(check.get("status") or ""),
@@ -3829,7 +3834,7 @@ def _persist_runtime_verification(conn, *, job: Any, changeset: Any, payload: di
             "evidence": check.get("evidence") if isinstance(check.get("evidence"), dict) else {},
         }
         if not item["id"] or item["status"] not in {"PASS", "FAIL", "WARN", "SKIP"} or not item["summary"]:
-            raise HTTPException(status_code=502, detail="Kubernetes Broker returned invalid typed verification fields")
+            raise HTTPException(status_code=502, detail=f"{source} returned invalid typed verification fields")
         _validate_credential_metadata(item["evidence"])
         normalized.append(item)
     evidence = verification.get("evidence") if isinstance(verification.get("evidence"), dict) else {}
@@ -3847,7 +3852,7 @@ def _persist_runtime_verification(conn, *, job: Any, changeset: Any, payload: di
         (result_id, job["operation_plan_id"], changeset["id"], plan_row["subject_type"], plan_row["subject_id"], overall, json.dumps(normalized, sort_keys=True), json.dumps(evidence, sort_keys=True), observed_at, now),
     )
     conn.execute("UPDATE operation_plans SET state=?,updated_at=? WHERE id=?", ("VERIFIED" if overall == "PASS" else "VERIFICATION_FAILED", now, job["operation_plan_id"]))
-    db.audit(conn, "verification.runtime_recorded", actor, "verification", result_id, {"operation_plan_id": job["operation_plan_id"], "changeset_id": changeset["id"], "status": overall, "source": "kubernetes-broker"})
+    db.audit(conn, "verification.runtime_recorded", actor, "verification", result_id, {"operation_plan_id": job["operation_plan_id"], "changeset_id": changeset["id"], "status": overall, "source": source})
     return {"id": result_id, "status": overall, "checks": normalized, "evidence": evidence, "observed_at": observed_at}
 
 
@@ -3860,14 +3865,16 @@ async def execute_operation_job(job_id: str, payload: OperationJobExecute, autho
             raise HTTPException(status_code=404, detail="operation job not found")
         if job["state"] != "READY":
             raise HTTPException(status_code=409, detail="operation job must be READY before trusted execution")
-        if job["executor"] != "kubernetes-broker":
-            raise HTTPException(status_code=422, detail="operation job does not have a trusted Kubernetes Broker runtime executor")
+        if job["executor"] not in {"kubernetes-broker", "artifact-mirror-worker"}:
+            raise HTTPException(status_code=422, detail="operation job does not have a trusted runtime executor")
         changeset, _, typed_plan, current_approval_ids = _verify_operation_job_authorization(conn, job)
         ticket_auth = _verify_operation_job_ticket(conn, job, payload.execution_ticket, payload.signature, require_fresh=True)
         if set(ticket_auth.get("approval_ids") or []) != set(current_approval_ids):
             raise HTTPException(status_code=409, detail="execution ticket approvals no longer match current exact-plan authorization")
-        if not operations.kubernetes_day2_runtime_capable(str(typed_plan.get("operation") or "")):
+        if job["executor"] == "kubernetes-broker" and not operations.kubernetes_day2_runtime_capable(str(typed_plan.get("operation") or "")):
             raise HTTPException(status_code=422, detail="typed operation is not supported by the trusted Kubernetes day-2 runtime")
+        if job["executor"] == "artifact-mirror-worker" and not operations.artifact_mirror_runtime_capable(typed_plan):
+            raise HTTPException(status_code=422, detail="typed operation is not supported by the trusted artifact mirror runtime")
         now = int(time.time())
         if current_approval_ids:
             placeholders = ",".join("?" for _ in current_approval_ids)
@@ -3880,23 +3887,27 @@ async def execute_operation_job(job_id: str, payload: OperationJobExecute, autho
         conn.execute("UPDATE operation_jobs SET state='RUNNING',stage='execute',updated_at=? WHERE id=?", (now, job_id))
         conn.execute("UPDATE operation_plans SET state='RUNNING',updated_at=? WHERE id=?", (now, job["operation_plan_id"]))
         conn.execute("UPDATE changesets SET state='EXECUTING',updated_at=? WHERE id=?", (now, changeset["id"]))
-        db.audit(conn, "operation_job.runtime_started", payload.actor, "operation_job", job_id, {"changeset_id": changeset["id"], "executor": "kubernetes-broker", "ticket_hash": ticket_auth["ticket_hash"]})
+        db.audit(conn, "operation_job.runtime_started", payload.actor, "operation_job", job_id, {"changeset_id": changeset["id"], "executor": job["executor"], "ticket_hash": ticket_auth["ticket_hash"]})
         conn.commit()
+        executor = str(job["executor"])
 
     try:
-        broker_result = await kubernetes_broker.post("/v1/day2/execute", {"ticket": payload.execution_ticket, "signature": payload.signature})
-        _validate_credential_metadata(broker_result)
+        if executor == "kubernetes-broker":
+            runtime_result = await kubernetes_broker.post("/v1/day2/execute", {"ticket": payload.execution_ticket, "signature": payload.signature})
+        else:
+            runtime_result = await asyncio.to_thread(artifact_mirror.execute, typed_plan)
+        _validate_credential_metadata(runtime_result)
     except HTTPException as exc:
         now = int(time.time())
         with closing(db.connect()) as conn:
             job = conn.execute("SELECT * FROM operation_jobs WHERE id=?", (job_id,)).fetchone()
             if job:
                 changeset = _changeset(conn, job["changeset_id"])
-                error = {"type": "kubernetes-broker-error", "status_code": exc.status_code, "detail": exc.detail}
+                error = {"type": f"{executor}-error", "status_code": exc.status_code, "detail": exc.detail}
                 conn.execute("UPDATE operation_jobs SET state='FAILED',stage='execute',result_json=?,updated_at=? WHERE id=?", (json.dumps(error, sort_keys=True), now, job_id))
                 conn.execute("UPDATE operation_plans SET state='FAILED',updated_at=? WHERE id=?", (now, job["operation_plan_id"]))
                 conn.execute("UPDATE changesets SET state='FAILED',executed_at=?,updated_at=? WHERE id=?", (now, now, changeset["id"]))
-                db.audit(conn, "operation_job.runtime_failed", payload.actor, "operation_job", job_id, {"changeset_id": changeset["id"], "executor": "kubernetes-broker", "error_type": "broker"})
+                db.audit(conn, "operation_job.runtime_failed", payload.actor, "operation_job", job_id, {"changeset_id": changeset["id"], "executor": executor, "error_type": "runtime"})
                 conn.commit()
         raise
 
@@ -3906,15 +3917,23 @@ async def execute_operation_job(job_id: str, payload: OperationJobExecute, autho
         if not job:
             raise HTTPException(status_code=409, detail="operation job disappeared during execution")
         changeset = _changeset(conn, job["changeset_id"])
-        verification = _persist_runtime_verification(conn, job=job, changeset=changeset, payload=broker_result, actor=payload.actor)
+        verification = _persist_runtime_verification(conn, job=job, changeset=changeset, payload=runtime_result, actor=payload.actor, source=executor)
         final_state = "SUCCEEDED" if verification["status"] == "PASS" else "FAILED"
-        result = {"state": final_state, "stage": "verify", "broker_result": broker_result, "verification_id": verification["id"], "completed_at": now}
+        result = {"state": final_state, "stage": "verify", "runtime_result": runtime_result, "verification_id": verification["id"], "completed_at": now}
         conn.execute("UPDATE operation_jobs SET state=?,stage='verify',result_json=?,updated_at=? WHERE id=?", (final_state, json.dumps(result, sort_keys=True), now, job_id))
-        conn.execute("UPDATE changesets SET state=?,execution_json=?,executed_at=?,updated_at=? WHERE id=?", ("EXECUTED" if final_state == "SUCCEEDED" else "FAILED", json.dumps(broker_result, sort_keys=True), now, now, changeset["id"]))
-        db.audit(conn, "operation_job.runtime_completed", payload.actor, "operation_job", job_id, {"changeset_id": changeset["id"], "executor": "kubernetes-broker", "verification_id": verification["id"], "verification_status": verification["status"]})
+        conn.execute("UPDATE changesets SET state=?,execution_json=?,executed_at=?,updated_at=? WHERE id=?", ("EXECUTED" if final_state == "SUCCEEDED" else "FAILED", json.dumps(runtime_result, sort_keys=True), now, now, changeset["id"]))
+        if executor == "artifact-mirror-worker":
+            artifact_id = str((typed_plan.get("artifact") or {}).get("id") or "")
+            if artifact_id:
+                mirror_verification = {"verification_id": verification["id"], "status": verification["status"], "sync_state": "MIRRORED" if final_state == "SUCCEEDED" else "FAILED", "checks": verification["checks"], "observed_at": verification["observed_at"]}
+                conn.execute("UPDATE artifact_mirror_items SET status='configured',verification_json=?,updated_at=? WHERE id=?", (json.dumps(mirror_verification, sort_keys=True), now, artifact_id))
+        db.audit(conn, "operation_job.runtime_completed", payload.actor, "operation_job", job_id, {"changeset_id": changeset["id"], "executor": executor, "verification_id": verification["id"], "verification_status": verification["status"]})
         conn.commit()
         updated = conn.execute("SELECT * FROM operation_jobs WHERE id=?", (job_id,)).fetchone()
-    return {"operation_job": _operation_job_dict(updated), "verification": verification, "broker_result": broker_result}
+    response = {"operation_job": _operation_job_dict(updated), "verification": verification, "runtime_result": runtime_result}
+    if executor == "kubernetes-broker":
+        response["broker_result"] = runtime_result
+    return response
 
 
 @app.post("/v1/operation-jobs/{job_id}/transition")

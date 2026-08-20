@@ -36,10 +36,11 @@ inventory topology. It is not presented as feature-equivalent to Radar.
 
 ## Remaining dev.5 closure
 
-Radar alone did not close the roadmap. The Hubble and diagnostics slices below close
-two more runtime gaps, while broader operator UI, day-2/provider executors,
-air-gap synchronization and active unified verification remain subsequent
-`0.5.11-dev.5` work unless explicitly deferred by the user.
+Radar alone did not close the roadmap. The follow-on slices below close Hubble,
+native diagnostics, Operator Center UI, bounded Kubernetes day-2 execution, active
+unified verification, and the first executable air-gap blob-mirroring runtime.
+Provider/Cluster Factory executors and full registry/repository protocol mirroring
+remain subsequent `0.5.11-dev.5` work unless explicitly deferred by the user.
 
 ## Slice 2 — Cilium/Hubble live-network runtime
 
@@ -119,10 +120,10 @@ Security/governance properties:
 - UI state and runtime state are explicitly separate so contract-only adapters
   cannot be mistaken for real-target integration evidence
 
-Remaining dev.5 release blockers are runtime/executor work: day-2/add-on active
-execution and verification, Cluster Factory repeatability, provider/bare-metal/
-network executors or explicit deferral, air-gap synchronization/integrity runtime,
-and the active unified verification engine.
+Remaining dev.5 release blockers are runtime/executor work: remaining Cluster
+Factory/day-2 provider operations, provider/bare-metal/network executors or
+explicit deferral, complete OCI/repository air-gap protocol synchronization, and
+provider-coupled verification extensions.
 
 
 ## Slice 5 — trusted Kubernetes day-2 execution + active verification
@@ -168,3 +169,45 @@ This slice intentionally does **not** infer active success from stored host pref
 All returned evidence is bounded and rechecked against the same forbidden sensitive-field rules used by native diagnostics. No mutation command path is introduced.
 
 Provider-specific verification remains coupled to the still-open provider/bare-metal/network runtime work.
+
+
+## Slice 7 — Trusted air-gap artifact blob synchronization runtime
+
+This slice converts the dev.4 artifact inventory/plan contract into executable
+ChangeSet-governed synchronization for digest-pinned blob artifacts that can be
+fetched from a controlled local source tree or an explicitly allowlisted HTTPS
+host and written into the controlled local mirror tree.
+
+Runtime path:
+
+```text
+ArtifactMirrorItem
+  -> typed ArtifactMirrorPlan
+  -> ChangeSet / exact-hash approval
+  -> signed operation execution ticket
+  -> trusted artifact mirror runtime
+  -> source SHA-256 verification
+  -> atomic destination write
+  -> destination SHA-256 verification
+  -> persisted verification + audit
+```
+
+Security/runtime properties:
+
+- the source must be `file://` below `HERMES_ARTIFACT_SOURCE_ROOT` or `https://` on an exact host listed in `HERMES_ARTIFACT_HTTPS_HOST_ALLOWLIST`; empty allowlist means network fetch is disabled
+- the destination must be `file://` below `HERMES_ARTIFACT_MIRROR_ROOT`
+- embedded URL credentials, redirects, root escapes and symlinked source/destination paths are rejected
+- artifact size and network timeout are bounded by `HERMES_ARTIFACT_MIRROR_MAX_BYTES` and `HERMES_ARTIFACT_MIRROR_TIMEOUT_SECONDS`
+- downloads stream into a temporary file; the source digest must match the pinned SHA-256 before an atomic `os.replace` publishes the destination
+- the destination digest is independently re-read and verified after publication
+- an already-correct destination is an idempotent PASS and does not rewrite the artifact
+- a mismatched existing destination is fail-closed unless the exact approved plan sets `replace_existing=true`
+- runtime output contains bounded typed verification and explicitly attests no arbitrary shell and no returned raw credentials
+- `artifact_mirror_items.status` remains the operational enable/disable state; mirror success/failure is stored separately in `verification_json.sync_state`, so retry planning remains possible
+
+This is deliberately **partial air-gap closure**, not a claim that every artifact
+protocol is complete. OCI registry-to-registry image copy, Helm OCI registry push,
+OS/Python package repository metadata mirroring, and authenticated repository
+credential delivery remain release-blocking runtime work. Plans using unsupported
+protocol pairs are retained for compatibility but receive executor
+`artifact-mirror-contract` and cannot enter the trusted runtime execution path.

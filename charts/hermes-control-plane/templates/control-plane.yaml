@@ -43,6 +43,11 @@ spec:
             - name: HERMES_EXECUTION_HMAC_KEY
               valueFrom: {secretKeyRef: {name: {{ include "hermes.secretName" . }}, key: execution-hmac-key}}
             - {name: HERMES_EXECUTION_ENABLED, value: {{ .Values.controlPlane.executionEnabled | quote }}}
+            - {name: HERMES_ARTIFACT_SOURCE_ROOT, value: /data/artifact-source}
+            - {name: HERMES_ARTIFACT_MIRROR_ROOT, value: /data/artifact-mirror}
+            - {name: HERMES_ARTIFACT_HTTPS_HOST_ALLOWLIST, value: {{ .Values.controlPlane.artifactMirror.httpsHostAllowlist | quote }}}
+            - {name: HERMES_ARTIFACT_MIRROR_MAX_BYTES, value: {{ .Values.controlPlane.artifactMirror.maxBytes | quote }}}
+            - {name: HERMES_ARTIFACT_MIRROR_TIMEOUT_SECONDS, value: {{ .Values.controlPlane.artifactMirror.timeoutSeconds | quote }}}
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

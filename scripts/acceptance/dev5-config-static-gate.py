@@ -94,6 +94,13 @@ assert (ROOT / "control-plane/tests/test_dev5_operator_ui.py").is_file()
 assert (ROOT / "control-plane/tests/test_dev5_day2_runtime.py").is_file()
 assert (ROOT / "control-plane/tests/test_dev5_unified_verification.py").is_file()
 assert (ROOT / "control-plane/src/hermes_control_plane/verification.py").is_file()
+assert (ROOT / "control-plane/tests/test_dev5_artifact_mirror_runtime.py").is_file()
+assert (ROOT / "control-plane/src/hermes_control_plane/artifact_mirror.py").is_file()
+assert services["control-plane"]["environment"]["HERMES_ARTIFACT_SOURCE_ROOT"] == "/data/artifact-source"
+assert services["control-plane"]["environment"]["HERMES_ARTIFACT_MIRROR_ROOT"] == "/data/artifact-mirror"
+assert "HERMES_ARTIFACT_HTTPS_HOST_ALLOWLIST" in services["control-plane"]["environment"]
+assert values["controlPlane"]["artifactMirror"]["maxBytes"] == 536870912
+assert values["controlPlane"]["artifactMirror"]["timeoutSeconds"] == 60
 assert (ROOT / "kubernetes-broker/tests/test_day2_runtime.py").is_file()
 assert (ROOT / "control-plane/src/hermes_control_plane/operator_center.py").is_file()
 assert (ROOT / "kubernetes-broker/src/hermes_kubernetes_broker/hubble.py").is_file()

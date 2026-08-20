@@ -1,5 +1,6 @@
 # Changelog
 
+- Dev.5 artifact mirror runtime slice: ChangeSet-governed controlled file/allowlisted-HTTPS artifact blob synchronization, atomic publication, idempotent retry and independent source/destination SHA-256 verification; unsupported OCI/repository protocol pairs remain explicit contracts.
 - Dev.5 active unified verification slice: live Kubernetes-broker probes mapped into deterministic PASS/WARN/FAIL/SKIP checks, optional active Radar health, bounded/redacted evidence, persistence and audit; unsupported host/etcd/agent/provider probes remain explicit SKIP instead of synthetic success.
 - Dev.5 trusted Kubernetes day-2 runtime slice: exact-preview-bound node cordon/uncordon/drain, workload restart/scale and pinned Helm-backed add-on/apply execution through the Kubernetes Broker with drift rejection and persisted active verification.
 - Dev.5 Operator Center UI slice: typed full-scope operator navigation for Kubernetes, Cluster Factory, infrastructure, operations and governance, with live data where available and explicit PARTIAL/CONTRACT_ONLY runtime states where executors are not yet complete.
@@ -16,6 +17,7 @@
 - explicitly forbid direct Control Plane credential-material resolution for authenticated Radar endpoints; authenticated provider access must use a credential-service/provider-worker boundary
 - add Hermes-native live intelligence controls and dev.5 Radar runtime/security regression tests
 - move guarded apply/validate/push scripts and CI source gates to the exact frozen dev.4 boundary and dev.5 version
+- add trusted artifact blob synchronization runtime with no redirects or embedded credentials, source/destination root confinement, byte/time limits, exact digest verification, idempotent retry, persisted verification and audit; full registry/repository protocol synchronization remains open
 
 ## 0.5.11-dev.4
 

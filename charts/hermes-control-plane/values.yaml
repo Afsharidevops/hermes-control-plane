@@ -16,6 +16,10 @@ routers:
 controlPlane:
   enabled: true
   executionEnabled: false
+  artifactMirror:
+    httpsHostAllowlist: ""
+    maxBytes: 536870912
+    timeoutSeconds: 60
   service:
     type: ClusterIP
     port: 8800

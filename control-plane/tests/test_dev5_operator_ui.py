@@ -77,9 +77,10 @@ def test_operator_center_does_not_upgrade_contract_only_runtime_to_live(client: 
         "infrastructure.azure",
         "infrastructure.gcp",
         "cluster-factory.bare-metal",
-        "governance.artifact-mirror",
     ):
         assert surfaces[surface_id]["runtime_state"] == "CONTRACT_ONLY"
+    assert surfaces["governance.artifact-mirror"]["runtime_state"] == "PARTIAL"
+    assert surfaces["cluster-factory.images-artifacts"]["runtime_state"] == "PARTIAL"
     assert surfaces["kubernetes.network-live"]["runtime_state"] == "LIVE"
     assert surfaces["operations.diagnostics"]["runtime_state"] == "LIVE"
     assert surfaces["kubernetes.logs"]["runtime_state"] == "PARTIAL"

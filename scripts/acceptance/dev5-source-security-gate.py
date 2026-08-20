@@ -25,6 +25,7 @@ factory = text("control-plane/src/hermes_control_plane/cluster_factory.py")
 providers = text("control-plane/src/hermes_control_plane/providers.py")
 operations = text("control-plane/src/hermes_control_plane/operations.py")
 unified_verification = text("control-plane/src/hermes_control_plane/verification.py")
+artifact_mirror = text("control-plane/src/hermes_control_plane/artifact_mirror.py")
 operator_center = text("control-plane/src/hermes_control_plane/operator_center.py")
 ui = text("control-plane/src/hermes_control_plane/static/index.html")
 tickets = text("control-plane/src/hermes_control_plane/tickets.py")
@@ -168,10 +169,12 @@ for surface_id in (
 for contract_only in (
     "cluster-factory.bare-metal", "infrastructure.vmware", "infrastructure.openstack",
     "infrastructure.aws", "infrastructure.azure", "infrastructure.gcp",
-    "governance.artifact-mirror",
 ):
     fragment = operator_center.split(f'"{contract_only}"', 1)[1].split("),", 1)[0]
     assert '"CONTRACT_ONLY"' in fragment, contract_only
+for partial_surface in ("cluster-factory.images-artifacts", "governance.artifact-mirror"):
+    fragment = operator_center.split(f'"{partial_surface}"', 1)[1].split("),", 1)[0]
+    assert '"PARTIAL"' in fragment, partial_surface
 assert 'Operator Center' in ui and '/v1/operator-center/contracts' in ui
 operator_section = ui.split('<section id="operator-center"', 1)[1].split('</section>', 1)[0]
 for forbidden in ("approveChange", "executeChange", "createChange", "kubectl", "helm upgrade"):
@@ -186,7 +189,7 @@ for marker in (
     assert marker in operations, marker
 for marker in (
     '@app.post("/v1/operation-jobs/{job_id}/execute")',
-    'job["executor"] != "kubernetes-broker"',
+    'job["executor"] not in {"kubernetes-broker", "artifact-mirror-worker"}',
     '"/v1/day2/preview"',
     '"/v1/day2/execute"',
     'verification.runtime_recorded',
@@ -265,5 +268,35 @@ assert "secrets.DOCKERHUB_USERNAME" in workflow
 assert "secrets.DOCKERHUB_TOKEN" in workflow
 assert "ghcr.io" not in workflow.lower()
 assert "linux/amd64,linux/arm64" in workflow
+
+
+# Dev.5 artifact mirror has a real constrained blob-sync runtime without pretending registry protocols are complete.
+for marker in (
+    'ARTIFACT_RUNTIME_SOURCE_SCHEMES = {"file", "https"}',
+    'ARTIFACT_RUNTIME_DESTINATION_SCHEMES = {"file"}',
+    'validate_artifact_mirror_parameters',
+    'artifact_mirror_runtime_capable',
+    '"artifact-mirror-contract"',
+):
+    assert marker in operations or marker in cp_main, marker
+for marker in (
+    'class _NoRedirect',
+    'HERMES_ARTIFACT_HTTPS_HOST_ALLOWLIST',
+    'HERMES_ARTIFACT_MIRROR_MAX_BYTES',
+    'HERMES_ARTIFACT_MIRROR_TIMEOUT_SECONDS',
+    'artifact HTTPS source host is not allowlisted',
+    'artifact source redirects are forbidden',
+    'os.replace(temp_path, destination_path)',
+    'source-digest',
+    'destination-digest',
+    'ALREADY_MIRRORED',
+    'raw_credentials_returned',
+):
+    assert marker in artifact_mirror, marker
+for forbidden in ('subprocess', 'os.system', 'shell=True', 'eval(', 'exec('):
+    assert forbidden not in artifact_mirror, forbidden
+assert 'artifact-mirror-worker' in cp_main
+assert 'source=executor' in cp_main
+assert 'sync_state' in cp_main
 
 print("0.5.11-dev.5-source-security: PASS")
