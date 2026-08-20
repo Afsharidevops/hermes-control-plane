@@ -27,10 +27,12 @@ Do not amend, reset, squash, force-push, move or recreate the frozen dev.4 tag.
 - diagnostics target-scope enforcement, fixed read-only collectors, bounded typed findings, no Secret/env/log reads, mutation attestation and Control Plane sensitive-evidence rejection
 - Hermes-native Operator Center UI contract and navigation covering the complete promised Kubernetes, Cluster Factory, infrastructure, operations and governance surface map while keeping UI state separate from runtime/provider state
 - live Operator Center views for current registries, ChangeSets/audit, Radar/Hubble intelligence summaries, native diagnostics, cluster/server/provisioning state and operation/verification data without adding mutation/approval bypass controls
+- trusted Kubernetes Broker day-2 runtime for node cordon/uncordon/drain, workload restart/scale and pinned Helm-backed add-on/apply operations
+- day-2 runtime planning now binds a broker-produced read-only live preview/precondition into the exact typed plan before approval, rejects live-state drift at execution, and persists active typed verification automatically
 
 ## Still release-blocking for dev.5 scope closure
 
-- day-2/add-on executor and active verification closure
+- remaining day-2/provider operations not covered by the trusted Kubernetes runtime (worker lifecycle, GitOps sync, Kubernetes/Cilium upgrades, etcd snapshot, restore/DR, certificate rotation, decommission)
 - Cluster Factory runtime/repeatability closure
 - provider/bare-metal/network executors or explicit user-approved deferral
 - air-gap mirror synchronization/integrity runtime

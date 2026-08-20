@@ -519,6 +519,12 @@ class VerificationResultCreate(StrictModel):
     evidence: dict[str, Any] = Field(default_factory=dict)
 
 
+class OperationJobExecute(StrictModel):
+    execution_ticket: dict[str, Any]
+    signature: str = Field(min_length=64, max_length=128)
+    actor: str = Field(default="hermes-bot", min_length=1, max_length=160)
+
+
 class OperationJobTransition(StrictModel):
     state: Literal["RUNNING", "PAUSED", "SUCCEEDED", "FAILED"]
     stage: str = Field(min_length=1, max_length=80)

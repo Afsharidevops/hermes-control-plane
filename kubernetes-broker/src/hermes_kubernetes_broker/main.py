@@ -68,6 +68,12 @@ class ExecuteRequest(StrictModel):
     signature: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
+class Day2PreviewRequest(StrictModel):
+    target_snapshot: dict[str, Any]
+    operation: str = Field(min_length=1, max_length=160)
+    parameters: dict[str, Any]
+
+
 class HubbleCollectRequest(StrictModel):
     target_snapshot: dict[str, Any]
     last: int = Field(default=50, ge=1, le=200)
@@ -1135,6 +1141,340 @@ def collect_hubble(payload: HubbleCollectRequest, authorization: str | None = He
         )
     except hubble_provider.HubbleError as exc:
         raise HTTPException(502, str(exc)) from exc
+
+
+KUBERNETES_DAY2_OPERATIONS = {
+    "cluster.node.cordon",
+    "cluster.node.uncordon",
+    "cluster.node.drain",
+    "cluster.workload.restart",
+    "cluster.workload.scale",
+    "cluster.addon.install",
+    "cluster.addon.upgrade",
+    "cluster.helm.apply",
+}
+
+
+def _day2_typed_plan(changeset_plan: dict[str, Any]) -> dict[str, Any]:
+    params = changeset_plan.get("parameters") or {}
+    typed = params.get("typed_plan") if isinstance(params, dict) else None
+    if not isinstance(typed, dict):
+        raise HTTPException(422, "execution ticket does not contain a typed day-2 plan")
+    typed_hash = str(typed.get("plan_hash") or "")
+    unhashed = dict(typed)
+    unhashed.pop("plan_hash", None)
+    if not typed_hash or sha256_hex(unhashed) != typed_hash:
+        raise HTTPException(409, "typed day-2 plan hash verification failed")
+    operation = str(typed.get("operation") or "")
+    if operation not in KUBERNETES_DAY2_OPERATIONS:
+        raise HTTPException(422, f"unsupported trusted Kubernetes day-2 operation: {operation}")
+    if typed.get("arbitrary_shell") is not False or typed.get("mutation_gate") != "changeset-exact-hash-approval":
+        raise HTTPException(409, "typed day-2 plan does not preserve Hermes mutation invariants")
+    return typed
+
+
+def _day2_target(typed: dict[str, Any]) -> dict[str, Any]:
+    matches = [item for item in (typed.get("targets") or []) if isinstance(item, dict) and item.get("kind") == "kubernetes"]
+    if len(matches) != 1:
+        raise HTTPException(422, "typed day-2 plan must contain exactly one Kubernetes target snapshot")
+    snapshot = matches[0]
+    if snapshot.get("status") not in {None, "configured"}:
+        raise HTTPException(409, "Kubernetes target is disabled")
+    return snapshot
+
+
+def _day2_parameters(typed: dict[str, Any]) -> dict[str, Any]:
+    parameters = typed.get("parameters") or {}
+    if not isinstance(parameters, dict):
+        raise HTTPException(422, "typed day-2 parameters are invalid")
+    return parameters
+
+
+def _day2_node_name(parameters: dict[str, Any]) -> str:
+    node = str(parameters.get("node") or "")
+    if not NAME_RE.fullmatch(node):
+        raise HTTPException(422, "invalid node name")
+    return node
+
+
+def _day2_workload(parameters: dict[str, Any], *, scaling: bool = False) -> tuple[str, str, str]:
+    kind = str(parameters.get("kind") or "").lower()
+    allowed = {"deployment", "statefulset"} if scaling else {"deployment", "statefulset", "daemonset"}
+    if kind not in allowed:
+        raise HTTPException(422, "unsupported workload kind for this day-2 operation")
+    name = str(parameters.get("name") or "")
+    if not NAME_RE.fullmatch(name):
+        raise HTTPException(422, "invalid workload name")
+    namespace = _namespace(str(parameters.get("namespace") or "default"))
+    return kind, name, namespace
+
+
+def _day2_helm(parameters: dict[str, Any]) -> tuple[str, str, str, str, str | None]:
+    release = str(parameters.get("release") or "")
+    chart = str(parameters.get("chart") or "")
+    namespace = _namespace(str(parameters.get("namespace") or "default"))
+    version = str(parameters.get("version") or "")
+    values_yaml = parameters.get("values_yaml")
+    if not NAME_RE.fullmatch(release):
+        raise HTTPException(422, "invalid Helm release name")
+    if not chart or len(chart) > 500 or any(ch.isspace() for ch in chart):
+        raise HTTPException(422, "invalid Helm chart reference")
+    if not version or version in {"latest", "*"} or len(version) > 160:
+        raise HTTPException(422, "Helm day-2 execution requires a pinned chart version")
+    if values_yaml is not None and not isinstance(values_yaml, str):
+        raise HTTPException(422, "values_yaml must be a string")
+    return release, chart, namespace, version, values_yaml
+
+
+def _node_unschedulable(snapshot: dict[str, Any], node: str) -> bool:
+    data = _run_json(["kubectl", "get", "node", node, "-o", "json"], snapshot)
+    return bool((data.get("spec") or {}).get("unschedulable", False))
+
+
+def _verification_check(check_id: str, passed: bool, summary: str, evidence: dict[str, Any] | None = None) -> dict[str, Any]:
+    return {"id": check_id, "status": "PASS" if passed else "FAIL", "summary": summary, "evidence": evidence or {}}
+
+
+def _day2_node_state(snapshot: dict[str, Any], node: str) -> dict[str, Any]:
+    data = _run_json(["kubectl", "get", "node", node, "-o", "json"], snapshot)
+    metadata = data.get("metadata") or {}
+    spec = data.get("spec") or {}
+    return {
+        "node": node,
+        "uid": metadata.get("uid"),
+        "unschedulable": bool(spec.get("unschedulable", False)),
+    }
+
+
+def _day2_workload_state(snapshot: dict[str, Any], kind: str, name: str, namespace: str) -> dict[str, Any]:
+    data = _run_json(["kubectl", "get", f"{kind}/{name}", "-n", namespace, "-o", "json"], snapshot)
+    metadata = data.get("metadata") or {}
+    spec = data.get("spec") or {}
+    template = spec.get("template") if isinstance(spec.get("template"), dict) else {}
+    template_meta = template.get("metadata") if isinstance(template.get("metadata"), dict) else {}
+    annotations = template_meta.get("annotations") if isinstance(template_meta.get("annotations"), dict) else {}
+    return {
+        "kind": kind,
+        "name": name,
+        "namespace": namespace,
+        "uid": metadata.get("uid"),
+        "generation": metadata.get("generation"),
+        "replicas": spec.get("replicas"),
+        "restart_annotation": annotations.get("kubectl.kubernetes.io/restartedAt"),
+    }
+
+
+def _day2_preview(snapshot: dict[str, Any], operation: str, parameters: dict[str, Any]) -> dict[str, Any]:
+    if operation not in KUBERNETES_DAY2_OPERATIONS:
+        raise HTTPException(422, f"unsupported trusted Kubernetes day-2 operation: {operation}")
+    _kubectl_toolchain(snapshot, refresh=True)
+    if operation.startswith("cluster.node."):
+        node = _day2_node_name(parameters)
+        before = _day2_node_state(snapshot, node)
+        desired = dict(before)
+        desired["unschedulable"] = operation != "cluster.node.uncordon"
+        return {
+            "kind": "kubernetes-day2-node-preview",
+            "operation": operation,
+            "before": before,
+            "desired": desired,
+            "preconditions": {"node_state_hash": sha256_hex(before)},
+            "secret_output_suppressed": True,
+        }
+    if operation in {"cluster.workload.restart", "cluster.workload.scale"}:
+        kind, name, namespace = _day2_workload(parameters, scaling=operation == "cluster.workload.scale")
+        _enforce_namespace(snapshot, namespace)
+        before = _day2_workload_state(snapshot, kind, name, namespace)
+        desired = {"kind": kind, "name": name, "namespace": namespace}
+        if operation == "cluster.workload.scale":
+            replicas = parameters.get("replicas")
+            if not isinstance(replicas, int) or isinstance(replicas, bool) or replicas < 0 or replicas > 10000:
+                raise HTTPException(422, "replicas must be an integer between 0 and 10000")
+            desired["replicas"] = replicas
+        else:
+            desired["restart"] = True
+        return {
+            "kind": "kubernetes-day2-workload-preview",
+            "operation": operation,
+            "before": before,
+            "desired": desired,
+            "preconditions": {"workload_state_hash": sha256_hex(before)},
+            "secret_output_suppressed": True,
+        }
+    release, chart, namespace, version, values_yaml = _day2_helm(parameters)
+    _enforce_namespace(snapshot, namespace)
+    before = _helm_release_snapshot(snapshot, release, namespace)
+    args = ["helm", "upgrade", release, chart, "--install", "--namespace", namespace, "--create-namespace", "--version", version, "--wait", "--timeout", "5m"]
+    values_path: Path | None = None
+    try:
+        if values_yaml:
+            if len(values_yaml.encode()) > 256_000:
+                raise HTTPException(413, "Helm values exceed 256 KiB limit")
+            values_path = _helm_values_file(values_yaml)
+            args += ["-f", str(values_path)]
+        dry_run = _run(args + ["--dry-run=server", "--hide-secret"], snapshot, timeout=max(COMMAND_TIMEOUT, 120))
+    finally:
+        if values_path is not None:
+            values_path.unlink(missing_ok=True)
+    return {
+        "kind": "kubernetes-day2-helm-preview",
+        "operation": operation,
+        "before": {
+            "exists": before.get("exists"),
+            "release": release,
+            "namespace": namespace,
+            "revision": before.get("revision"),
+            "status": ((before.get("status") or {}).get("info") or {}).get("status") if isinstance(before.get("status"), dict) else None,
+        },
+        "desired": {"release": release, "chart": chart, "namespace": namespace, "version": version},
+        "preconditions": {"release_snapshot_hash": _helm_snapshot_hash(before)},
+        "dry_run": dry_run,
+        "secret_output_suppressed": True,
+    }
+
+
+def _assert_day2_runtime_preconditions(snapshot: dict[str, Any], typed: dict[str, Any], parameters: dict[str, Any]) -> None:
+    preview = typed.get("runtime_preview") or {}
+    preconditions = preview.get("preconditions") if isinstance(preview, dict) else None
+    if not isinstance(preconditions, dict) or not preconditions:
+        raise HTTPException(409, "typed day-2 plan has no exact runtime preview preconditions")
+    operation = str(typed.get("operation") or "")
+    if operation.startswith("cluster.node."):
+        node = _day2_node_name(parameters)
+        current = _day2_node_state(snapshot, node)
+        expected = str(preconditions.get("node_state_hash") or "")
+        if not expected or not hmac.compare_digest(sha256_hex(current), expected):
+            raise HTTPException(409, "node state changed after preview; create and approve a new ChangeSet")
+        return
+    if operation in {"cluster.workload.restart", "cluster.workload.scale"}:
+        kind, name, namespace = _day2_workload(parameters, scaling=operation == "cluster.workload.scale")
+        _enforce_namespace(snapshot, namespace)
+        current = _day2_workload_state(snapshot, kind, name, namespace)
+        expected = str(preconditions.get("workload_state_hash") or "")
+        if not expected or not hmac.compare_digest(sha256_hex(current), expected):
+            raise HTTPException(409, "workload state changed after preview; create and approve a new ChangeSet")
+        return
+    release, _, namespace, _, _ = _day2_helm(parameters)
+    _enforce_namespace(snapshot, namespace)
+    current = _helm_release_snapshot(snapshot, release, namespace)
+    expected = str(preconditions.get("release_snapshot_hash") or "")
+    if not expected or not hmac.compare_digest(_helm_snapshot_hash(current), expected):
+        raise HTTPException(409, "Helm release changed after preview; create and approve a new ChangeSet")
+
+
+def _execute_day2(changeset_plan: dict[str, Any], preconditions: dict[str, Any]) -> dict[str, Any]:
+    typed = _day2_typed_plan(changeset_plan)
+    snapshot = _day2_target(typed)
+    parameters = _day2_parameters(typed)
+    operation = str(typed["operation"])
+    _kubectl_toolchain(snapshot, refresh=True)
+    _assert_day2_runtime_preconditions(snapshot, typed, parameters)
+    checks: list[dict[str, Any]] = []
+    result: dict[str, Any] = {"operation": operation}
+
+    if operation == "cluster.node.cordon":
+        node = _day2_node_name(parameters)
+        result["command"] = _run(["kubectl", "cordon", node], snapshot)
+        passed = _node_unschedulable(snapshot, node)
+        checks.append(_verification_check("node-unschedulable", passed, f"node {node} is cordoned", {"node": node, "unschedulable": passed}))
+    elif operation == "cluster.node.uncordon":
+        node = _day2_node_name(parameters)
+        result["command"] = _run(["kubectl", "uncordon", node], snapshot)
+        unschedulable = _node_unschedulable(snapshot, node)
+        checks.append(_verification_check("node-schedulable", not unschedulable, f"node {node} is schedulable", {"node": node, "unschedulable": unschedulable}))
+    elif operation == "cluster.node.drain":
+        node = _day2_node_name(parameters)
+        _run(["kubectl", "cordon", node], snapshot)
+        args = ["kubectl", "drain", node, "--ignore-daemonsets", "--timeout=5m"]
+        if bool(parameters.get("delete_emptydir_data", False)):
+            args.append("--delete-emptydir-data")
+        if bool(parameters.get("force", False)):
+            args.append("--force")
+        result["command"] = _run(args, snapshot, timeout=max(COMMAND_TIMEOUT, 360))
+        unschedulable = _node_unschedulable(snapshot, node)
+        checks.append(_verification_check("node-unschedulable", unschedulable, f"node {node} remains cordoned after drain", {"node": node, "unschedulable": unschedulable}))
+        checks.append(_verification_check("drain-complete", True, f"kubectl drain completed for {node}", {"node": node}))
+    elif operation == "cluster.workload.restart":
+        kind, name, namespace = _day2_workload(parameters)
+        _enforce_namespace(snapshot, namespace)
+        result["command"] = _run(["kubectl", "rollout", "restart", f"{kind}/{name}", "-n", namespace], snapshot)
+        rollout = _run(["kubectl", "rollout", "status", f"{kind}/{name}", "-n", namespace, "--timeout=5m"], snapshot, timeout=max(COMMAND_TIMEOUT, 360))
+        result["rollout"] = rollout
+        checks.append(_verification_check("rollout-complete", True, f"{kind}/{name} rollout completed", {"kind": kind, "name": name, "namespace": namespace}))
+    elif operation == "cluster.workload.scale":
+        kind, name, namespace = _day2_workload(parameters, scaling=True)
+        _enforce_namespace(snapshot, namespace)
+        replicas = parameters.get("replicas")
+        if not isinstance(replicas, int) or isinstance(replicas, bool) or replicas < 0 or replicas > 10000:
+            raise HTTPException(422, "replicas must be an integer between 0 and 10000")
+        result["command"] = _run(["kubectl", "scale", f"{kind}/{name}", f"--replicas={replicas}", "-n", namespace], snapshot)
+        rollout = _run(["kubectl", "rollout", "status", f"{kind}/{name}", "-n", namespace, "--timeout=5m"], snapshot, timeout=max(COMMAND_TIMEOUT, 360))
+        live = _run_json(["kubectl", "get", f"{kind}/{name}", "-n", namespace, "-o", "json"], snapshot)
+        desired = int((live.get("spec") or {}).get("replicas") or 0)
+        ready = int((live.get("status") or {}).get("readyReplicas") or 0)
+        result["rollout"] = rollout
+        checks.append(_verification_check("replicas-converged", desired == replicas and ready == replicas, f"{kind}/{name} replicas converged", {"desired": desired, "ready": ready, "requested": replicas}))
+        checks.append(_verification_check("rollout-complete", True, f"{kind}/{name} rollout completed", {"kind": kind, "name": name, "namespace": namespace}))
+    else:
+        release, chart, namespace, version, values_yaml = _day2_helm(parameters)
+        _enforce_namespace(snapshot, namespace)
+        args = ["helm", "upgrade", release, chart, "--install", "--namespace", namespace, "--create-namespace", "--version", version, "--wait", "--timeout", "5m"]
+        values_path: Path | None = None
+        try:
+            if values_yaml:
+                values_path = _helm_values_file(values_yaml)
+                args += ["-f", str(values_path)]
+            result["command"] = _run(args, snapshot, timeout=max(COMMAND_TIMEOUT, 360))
+            status = _run_json(["helm", "status", release, "--namespace", namespace, "-o", "json"], snapshot)
+        finally:
+            if values_path is not None:
+                values_path.unlink(missing_ok=True)
+        info = status.get("info") or {}
+        status_name = str(info.get("status") or status.get("status") or "").lower()
+        ready = status_name in {"deployed", "superseded"}
+        checks.append(_verification_check("helm-release-ready", ready, f"Helm release {release} status is {status_name or 'unknown'}", {"release": release, "namespace": namespace, "version": version, "status": status_name}))
+        result["release"] = {"release": release, "namespace": namespace, "chart": chart, "version": version, "status": status_name}
+
+    observed_at = int(time.time())
+    return {
+        "schema_version": 1,
+        "operation": operation,
+        "typed_plan_hash": typed["plan_hash"],
+        "target_snapshot_hash": snapshot.get("snapshot_hash"),
+        "result": result,
+        "verification": {
+            "observed_at": observed_at,
+            "checks": checks,
+            "evidence": {
+                "source": "kubernetes-broker-active-verification",
+                "mutation_commands_generated": False,
+                "arbitrary_shell": False,
+                "raw_credentials_returned": False,
+            },
+        },
+    }
+
+
+@app.post("/v1/day2/preview")
+def preview_day2(payload: Day2PreviewRequest, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_token(authorization)
+    snapshot = _target(payload.target_snapshot)
+    if snapshot.get("status") not in {None, "configured"}:
+        raise HTTPException(409, "Kubernetes target is disabled")
+    return _day2_preview(snapshot, payload.operation, payload.parameters)
+
+
+@app.post("/v1/day2/execute")
+def execute_day2(payload: ExecuteRequest, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_token(authorization)
+    if not EXECUTION_ENABLED:
+        raise HTTPException(403, "Kubernetes execution is disabled; enable HERMES_KUBERNETES_EXECUTION_ENABLED only after policy review")
+    plan, preconditions = _verify_ticket(payload.ticket, payload.signature)
+    if str(preconditions.get("executor") or "") != "kubernetes-broker":
+        raise HTTPException(409, "execution ticket is not bound to Kubernetes Broker")
+    if not str(preconditions.get("operation_job_id") or "").startswith("opj_"):
+        raise HTTPException(409, "execution ticket has no operation-job binding")
+    return _execute_day2(plan, preconditions)
 
 
 @app.post("/v1/preview")

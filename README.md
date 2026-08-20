@@ -196,3 +196,5 @@ For 9router, `hermesctl` also reconciles the routing objects expected by Router 
 
 - Dev.5 native diagnostics runtime: fixed read-only Kubernetes Broker collectors, target-scope enforcement, bounded typed findings, native security/network/GitOps/rollout checks, and Hermes-side sensitive-evidence rejection.
 - Dev.5 Hubble runtime slice: trusted Kubernetes Broker collector, pinned Hubble CLI, namespace authorization, typed redaction/aggregation, bounded history, SSE, and Hermes-native Network Live batch UI.
+
+- trusted Kubernetes day-2 runtime for cordon/uncordon/drain, workload restart/scale and pinned Helm-backed operations with exact live-preview preconditions and active verification

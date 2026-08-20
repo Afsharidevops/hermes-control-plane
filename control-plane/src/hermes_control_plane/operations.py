@@ -114,6 +114,60 @@ READ_OPERATIONS = {
     "audit.read": "AuditQuery",
 }
 
+KUBERNETES_DAY2_RUNTIME_OPERATIONS: dict[str, dict[str, Any]] = {
+    "cluster.node.cordon": {"executor": "kubernetes-broker", "verification": ["node-unschedulable"]},
+    "cluster.node.uncordon": {"executor": "kubernetes-broker", "verification": ["node-schedulable"]},
+    "cluster.node.drain": {"executor": "kubernetes-broker", "verification": ["node-unschedulable", "drain-complete"]},
+    "cluster.workload.restart": {"executor": "kubernetes-broker", "verification": ["rollout-complete"]},
+    "cluster.workload.scale": {"executor": "kubernetes-broker", "verification": ["replicas-converged", "rollout-complete"]},
+    "cluster.addon.install": {"executor": "kubernetes-broker", "verification": ["helm-release-ready"]},
+    "cluster.addon.upgrade": {"executor": "kubernetes-broker", "verification": ["helm-release-ready"]},
+    "cluster.helm.apply": {"executor": "kubernetes-broker", "verification": ["helm-release-ready"]},
+}
+
+
+def kubernetes_day2_runtime_capable(operation: str) -> bool:
+    return operation in KUBERNETES_DAY2_RUNTIME_OPERATIONS
+
+
+def validate_kubernetes_day2_parameters(operation: str, parameters: dict[str, Any]) -> None:
+    if operation not in KUBERNETES_DAY2_RUNTIME_OPERATIONS:
+        raise ValueError(f"operation {operation} does not have a trusted Kubernetes Broker runtime executor")
+    target_id = str(parameters.get("native_target_id") or "")
+    if not target_id.startswith("tgt_"):
+        raise ValueError("native_target_id referencing a configured Kubernetes target is required")
+    if operation.startswith("cluster.node."):
+        node = str(parameters.get("node") or "")
+        if not node or len(node) > 253:
+            raise ValueError("node is required for node lifecycle operations")
+        if operation == "cluster.node.drain":
+            for key in ("delete_emptydir_data", "force"):
+                if key in parameters and not isinstance(parameters[key], bool):
+                    raise ValueError(f"{key} must be boolean")
+    elif operation in {"cluster.workload.restart", "cluster.workload.scale"}:
+        kind = str(parameters.get("kind") or "").lower()
+        if kind not in {"deployment", "statefulset", "daemonset"}:
+            raise ValueError("kind must be deployment, statefulset, or daemonset")
+        if operation == "cluster.workload.scale" and kind == "daemonset":
+            raise ValueError("DaemonSets cannot be scaled with cluster.workload.scale")
+        for key in ("name", "namespace"):
+            if not str(parameters.get(key) or ""):
+                raise ValueError(f"{key} is required for workload operations")
+        if operation == "cluster.workload.scale":
+            replicas = parameters.get("replicas")
+            if not isinstance(replicas, int) or isinstance(replicas, bool) or replicas < 0 or replicas > 10000:
+                raise ValueError("replicas must be an integer between 0 and 10000")
+    else:
+        for key in ("release", "chart", "namespace", "version"):
+            if not str(parameters.get(key) or ""):
+                raise ValueError(f"{key} is required for Helm-backed day-2 operations")
+        if str(parameters.get("version")) in {"latest", "*"}:
+            raise ValueError("Helm-backed day-2 operations require an explicit pinned version")
+        values_yaml = parameters.get("values_yaml")
+        if values_yaml is not None and not isinstance(values_yaml, str):
+            raise ValueError("values_yaml must be a string when provided")
+
+
 VERIFICATION_CHECKS = [
     "hosts",
     "networking",
@@ -153,7 +207,7 @@ def read_query_plan(*, operation: str, selector: dict[str, Any], parameters: dic
     })
 
 
-def day2_plan(*, operation: str, targets: list[dict[str, Any]], parameters: dict[str, Any]) -> dict[str, Any]:
+def day2_plan(*, operation: str, targets: list[dict[str, Any]], parameters: dict[str, Any], runtime_preview: dict[str, Any] | None = None) -> dict[str, Any]:
     contract = DAY2_OPERATIONS.get(operation)
     if not contract:
         raise ValueError(f"unsupported day-2 operation: {operation}")
@@ -163,6 +217,7 @@ def day2_plan(*, operation: str, targets: list[dict[str, Any]], parameters: dict
         "operation": operation,
         "targets": targets,
         "parameters": parameters,
+        "runtime_preview": runtime_preview,
         "stages": contract["stages"],
         "verification_required": True,
         "mutation_gate": MUTATION_GATE,
@@ -266,6 +321,7 @@ def contracts() -> dict[str, Any]:
         "shared_intent_backend": True,
         "read_operations": READ_OPERATIONS,
         "day2_operations": DAY2_OPERATIONS,
+        "kubernetes_day2_runtime": KUBERNETES_DAY2_RUNTIME_OPERATIONS,
         "cloud_virtualization": CLOUD_PROVIDER_CONTRACTS,
         "bare_metal": BARE_METAL_PROVIDER_CONTRACTS,
         "network": NETWORK_PROVIDER_CONTRACTS,

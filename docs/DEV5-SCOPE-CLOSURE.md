@@ -123,3 +123,29 @@ Remaining dev.5 release blockers are runtime/executor work: day-2/add-on active
 execution and verification, Cluster Factory repeatability, provider/bare-metal/
 network executors or explicit deferral, air-gap synchronization/integrity runtime,
 and the active unified verification engine.
+
+
+## Slice 5 — trusted Kubernetes day-2 execution + active verification
+
+This slice converts a bounded subset of the dev.4 day-2 plan catalog into real governed execution through the existing trusted Kubernetes Broker. It does **not** claim that provider-worker operations are complete.
+
+Runtime-complete in this slice:
+
+- node cordon / uncordon / drain
+- workload rollout restart
+- Deployment / StatefulSet scale
+- pinned Helm-backed `cluster.helm.apply`, add-on install and add-on upgrade
+
+Governance and drift properties:
+
+- the operator supplies a same-environment configured Kubernetes `native_target_id`; the full target snapshot is bound into the typed day-2 plan
+- planning calls a read-only broker preview before ChangeSet creation; the preview contains only bounded safe state, an exact state hash and secret-suppression attestation
+- the runtime preview/precondition is included in the typed plan hash, so the existing ChangeSet approval and signed execution ticket bind the exact previewed state
+- execution re-reads the node/workload/Helm release and rejects drift before running the mutation
+- the Control Plane accepts execution only for jobs whose executor is exactly `kubernetes-broker` and whose ticket/approval bindings remain valid
+- broker commands are fixed argument vectors; there is no arbitrary shell, kubectl or Helm command passthrough
+- namespace authorization remains enforced by the Kubernetes target scope
+- successful broker execution must return typed active verification checks; Hermes persists them and marks the operation plan VERIFIED only on PASS
+- broker failure, sensitive evidence, malformed verification or failed verification prevents a successful ChangeSet result
+
+This slice intentionally leaves `cluster.worker.add/remove/replace`, GitOps sync, Kubernetes/Cilium upgrade, etcd snapshot, restore/DR, certificate rotation, maintenance provider steps, decommission, infrastructure scale and template clone on their explicit provider-worker contracts. Those operations remain release-blocking until a real executor exists or the user explicitly defers them.

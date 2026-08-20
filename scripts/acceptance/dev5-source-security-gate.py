@@ -176,6 +176,44 @@ operator_section = ui.split('<section id="operator-center"', 1)[1].split('</sect
 for forbidden in ("approveChange", "executeChange", "createChange", "kubectl", "helm upgrade"):
     assert forbidden not in operator_section, forbidden
 
+# Dev.5 trusted Kubernetes day-2 execution is exact-preview-bound and actively verified.
+for marker in (
+    'KUBERNETES_DAY2_RUNTIME_OPERATIONS',
+    'validate_kubernetes_day2_parameters',
+    '"kubernetes_day2_runtime": KUBERNETES_DAY2_RUNTIME_OPERATIONS',
+):
+    assert marker in operations, marker
+for marker in (
+    '@app.post("/v1/operation-jobs/{job_id}/execute")',
+    'job["executor"] != "kubernetes-broker"',
+    '"/v1/day2/preview"',
+    '"/v1/day2/execute"',
+    'verification.runtime_recorded',
+    'operation_job.runtime_completed',
+):
+    assert marker in cp_main, marker
+for marker in (
+    '@app.post("/v1/day2/preview")',
+    '@app.post("/v1/day2/execute")',
+    '_assert_day2_runtime_preconditions',
+    'node state changed after preview',
+    'workload state changed after preview',
+    'Helm release changed after preview',
+    '--dry-run=server',
+    '--hide-secret',
+):
+    assert marker in kube_broker, marker
+for operation in (
+    'cluster.node.cordon', 'cluster.node.uncordon', 'cluster.node.drain',
+    'cluster.workload.restart', 'cluster.workload.scale',
+    'cluster.addon.install', 'cluster.addon.upgrade', 'cluster.helm.apply',
+):
+    assert f'"{operation}"' in kube_broker, operation
+for forbidden in ('shell=True', 'os.system', 'kubectl exec', 'kubectl cp'):
+    assert forbidden not in kube_broker, forbidden
+assert 'mutation_gate") != "changeset-exact-hash-approval"' in kube_broker
+assert 'raw_credentials_returned' in kube_broker
+
 # Generic typed provider contracts retain their credential boundary and no arbitrary command generation.
 for forbidden in ("subprocess", "os.system", "shell=True", "curl | sh"):
     assert forbidden not in operations, forbidden

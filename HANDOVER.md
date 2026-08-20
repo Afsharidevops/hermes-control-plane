@@ -343,3 +343,5 @@ R2 fixes this by newline-terminating plan files and making the action-file `read
 R2 must now be overlaid on the same branch and tested with execution disabled. Expected first-run behavior is creation of `ai`, `combo-fast`, `combo-standard`, and `combo-strong`; a second startup must refresh `ai` but preserve existing tier combos. Then `router probe`, `bot check`, and the Telegram read-only target query must pass.
 
 - Dev.5 Hubble runtime slice: trusted Kubernetes Broker collector, pinned Hubble CLI, namespace authorization, typed redaction/aggregation, bounded history, SSE, and Hermes-native Network Live batch UI.
+
+- Dev.5 trusted Kubernetes day-2 runtime slice: exact live-preview-bound node cordon/uncordon/drain, workload restart/scale and pinned Helm-backed add-on/apply execution through Kubernetes Broker with drift rejection and persisted active verification.
