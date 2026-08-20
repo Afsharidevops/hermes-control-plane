@@ -1,5 +1,6 @@
 # Changelog
 
+- Dev.5 native diagnostics runtime slice: executable broker-owned read-only checks for node/pod/workload/OOM/metrics/storage/events, Cilium/Hubble/DNS/ingress/NetworkPolicy, RBAC/workload security, Argo CD and rollout health with target-scope enforcement and bounded typed evidence.
 - Dev.5 Hubble runtime slice: trusted Kubernetes Broker collector, pinned Hubble CLI, namespace authorization, typed redaction/aggregation, bounded history, SSE, and Hermes-native Network Live batch UI.
 
 ## 0.5.11-dev.5 (in progress)

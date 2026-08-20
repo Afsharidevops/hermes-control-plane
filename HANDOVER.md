@@ -8,7 +8,7 @@
 **Frozen dev.4 boundary:** `d4eb9b7ab2564301c09b8c0d36a2e9d53b843273`, tag `v0.5.11-dev.4`
 **Current development package:** `0.5.11-dev.5`
 **Draft PR:** `#2` — keep Draft
-**Status:** dev.5 scope closure is in progress as new commits on top of frozen dev.4. The first slice adds real read-only Radar MCP runtime integration and executable AUTO/RADAR/NATIVE selection. Do not amend, move, or recreate dev.4. Dev.5 must complete the remaining audit gaps, pass full validation and exact-SHA branch CI before `v0.5.11-dev.5` is created. Production image publication remains GitHub Actions -> Docker Hub.
+**Status:** dev.5 scope closure is in progress as new commits on top of frozen dev.4. Radar runtime and Cilium/Hubble Network Live slices are already committed/pushed with exact-SHA `validate` CI success; the current uncommitted slice adds executable Hermes-native diagnostics through the trusted Kubernetes Broker. Do not amend, move, or recreate dev.4. Dev.5 must complete the remaining audit gaps, pass full validation and exact-SHA branch CI before `v0.5.11-dev.5` is created. Production image publication remains GitHub Actions -> Docker Hub.
 
 Dev.4 adds the shared Web/Telegram/AI typed intent backend, fleet exact-target snapshots, advanced day-2 plans, VMware/OpenStack/AWS/Azure/GCP foundations, Redfish/IPMI/PXE and typed switch/network contracts, digest-pinned air-gap artifact mirroring, constrained generic operation jobs with signed exact-plan execution tickets and unified verification. It does **not** claim live provider/cloud/bare-metal/switch execution without separate disposable-target evidence.
 

@@ -2,7 +2,7 @@
 
 Hermes Control Plane is a self-hosted, AI-assisted DevOps control plane designed to run on a Docker/VM installation or Kubernetes while keeping privileged credentials and infrastructure execution outside the LLM trust boundary.
 
-> **0.5.11-dev.5 scope closure in progress:** dev.5 is forward-only from frozen `v0.5.11-dev.4` and closes runtime gaps found by the full roadmap audit. The first slice adds a real read-only Radar MCP runtime adapter with `AUTO`/`RADAR`/`NATIVE` provider modes, same-environment isolation, bounded native Kubernetes fallback, Hermes-side redaction, and no Radar write passthrough. Dev.5 is not yet release-complete; Hubble live traffic, executable diagnostics, broader operator UI, provider executors, air-gap runtime and active unified verification remain closure work.
+> **0.5.11-dev.5 scope closure in progress:** dev.5 is forward-only from frozen `v0.5.11-dev.4` and closes runtime gaps found by the full roadmap audit. Radar runtime integration and Cilium/Hubble Network Live are complete for their local/runtime-path slices, and this source adds executable Hermes-native Kubernetes diagnostics through the trusted broker. Dev.5 is not yet release-complete; broader operator UI, day-2/Cluster Factory executors, provider runtimes or explicit deferrals, air-gap runtime and active unified verification remain closure work.
 
 > **0.5.11-dev.4 Full Operations Center + next-deploy infrastructure:** the frozen dev.3 Cluster Factory now feeds a shared Web/Telegram/AI intent backend, exact-snapshot fleet planning, advanced typed day-2 operations, VMware/OpenStack/AWS/Azure/GCP provider foundations, Redfish/IPMI/PXE bare-metal plans, typed switch/network contracts, digest-pinned air-gap mirroring and unified verification. Every mutation remains ChangeSet/policy/approval/exact-hash/target-drift governed, and raw infrastructure credentials remain behind the Credential Service. Production images remain GitHub Actions -> Docker Hub.
 
@@ -192,4 +192,5 @@ The Control Plane API does not accept raw kubeconfig material. Kubernetes/Helm m
 
 For 9router, `hermesctl` also reconciles the routing objects expected by Router Gateway: `ai`, `combo-fast`, `combo-standard`, and `combo-strong`. The `ai` combo is refreshed from the current OpenCode free-model catalog; tier combos are created only when missing and are then operator-owned so dashboard customizations are preserved. OmniRoute keeps its native `auto/best-*` routing and does not require synthetic combos.
 
+- Dev.5 native diagnostics runtime: fixed read-only Kubernetes Broker collectors, target-scope enforcement, bounded typed findings, native security/network/GitOps/rollout checks, and Hermes-side sensitive-evidence rejection.
 - Dev.5 Hubble runtime slice: trusted Kubernetes Broker collector, pinned Hubble CLI, namespace authorization, typed redaction/aggregation, bounded history, SSE, and Hermes-native Network Live batch UI.

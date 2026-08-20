@@ -427,3 +427,101 @@ def test_hubble_rejects_unbounded_request():
     from hermes_kubernetes_broker import hubble
     with pytest.raises(hubble.HubbleError):
         hubble.collect(snapshot={"kind": "kubernetes", "scope": {}}, env={}, last=201)
+
+
+def test_dev5_native_diagnostics_are_scoped_read_only_and_redacted(monkeypatch):
+    calls = []
+
+    pod = {
+        "kind": "Pod",
+        "metadata": {"namespace": "apps", "name": "api-1"},
+        "spec": {
+            "containers": [{
+                "name": "api",
+                "securityContext": {"privileged": True, "capabilities": {"add": ["NET_ADMIN"]}},
+                "env": [{"name": "TOP_SECRET", "value": "TOPSECRET"}],
+            }],
+            "volumes": [{"name": "host", "hostPath": {"path": "/sensitive/host/path", "type": "Directory"}}],
+        },
+        "status": {
+            "phase": "Running",
+            "conditions": [{"type": "Ready", "status": "True"}],
+            "containerStatuses": [{"name": "api", "restartCount": 7, "lastState": {"terminated": {"reason": "OOMKilled"}}}],
+        },
+    }
+    service = {"kind": "Service", "metadata": {"namespace": "apps", "name": "public"}, "spec": {"type": "LoadBalancer"}}
+    event = {"kind": "Event", "metadata": {"namespace": "apps", "name": "warn"}, "type": "Warning", "reason": "BackOff", "count": 2, "message": "TOPSECRET", "involvedObject": {"kind": "Pod", "name": "api-1"}}
+
+    def fake_run_json(args, snapshot, timeout=None):
+        calls.append(list(args))
+        joined = " ".join(args)
+        if "--raw" in args:
+            return {"items": []}
+        if " pods " in f" {joined} ":
+            return {"items": [pod]}
+        if " services " in f" {joined} ":
+            return {"items": [service]}
+        if " events " in f" {joined} ":
+            return {"items": [event]}
+        return {"items": []}
+
+    monkeypatch.setattr(main, "_run_json", fake_run_json)
+    snapshot = {
+        "kind": "kubernetes",
+        "status": "configured",
+        "connection_mode": "agent",
+        "scope": {"namespace_allowlist": ["apps"], "cluster_read": False},
+    }
+    payload = main.DiagnosticsRunRequest(
+        target_snapshot=snapshot,
+        checks=[
+            "pods.health", "pods.oom", "events.correlation", "security.privileged",
+            "security.capabilities", "security.hostpath", "security.exposed-services",
+        ],
+    )
+    result = main.run_diagnostics(payload, authorization="Bearer test-token")
+
+    assert result["mutation_commands_executed"] is False
+    assert result["secret_data_requested"] is False
+    assert result["policy_scope"]["namespace_allowlist"] == ["apps"]
+    encoded = json.dumps(result, sort_keys=True)
+    assert "TOPSECRET" not in encoded
+    assert "/sensitive/host/path" not in encoded
+    assert any(x["id"] == "security.privileged" and x["status"] == "WARN" for x in result["checks"])
+    assert any(x["id"] == "pods.oom" and x["status"] == "WARN" for x in result["checks"])
+    assert all(call[1] == "get" for call in calls)
+    assert all("-n" in call and "apps" in call or "--raw" in call for call in calls)
+    flattened = "\n".join(" ".join(call) for call in calls)
+    for forbidden in (" apply ", " delete ", " patch ", " create ", " exec ", " logs "):
+        assert forbidden not in f" {flattened} "
+
+
+def test_dev5_diagnostics_reject_unknown_check(monkeypatch):
+    snapshot = {"kind": "kubernetes", "status": "configured", "connection_mode": "agent", "scope": {"namespace_allowlist": ["apps"]}}
+    payload = main.DiagnosticsRunRequest(target_snapshot=snapshot, checks=["not.a.real.check"])
+    with pytest.raises(Exception) as exc:
+        main.run_diagnostics(payload, authorization="Bearer test-token")
+    assert "unsupported diagnostic checks" in str(exc.value)
+
+
+def test_dev5_diagnostics_degrade_collector_rbac_failure_to_skip(monkeypatch):
+    def fake_run_json(args, snapshot, timeout=None):
+        if "services" in args:
+            raise main.HTTPException(422, {"message": "forbidden", "output": "sensitive server text"})
+        if "--raw" in args:
+            return {"items": []}
+        return {"items": []}
+
+    monkeypatch.setattr(main, "_run_json", fake_run_json)
+    snapshot = {
+        "kind": "kubernetes",
+        "status": "configured",
+        "connection_mode": "agent",
+        "scope": {"namespace_allowlist": ["apps"], "cluster_read": False},
+    }
+    payload = main.DiagnosticsRunRequest(target_snapshot=snapshot, checks=["security.exposed-services"])
+    result = main.run_diagnostics(payload, authorization="Bearer test-token")
+    finding = result["checks"][0]
+    assert finding["status"] == "SKIP"
+    assert finding["evidence"]["collector_error"] == "collector HTTP 422"
+    assert "sensitive server text" not in json.dumps(result)

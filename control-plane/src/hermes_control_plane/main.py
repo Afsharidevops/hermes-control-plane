@@ -73,6 +73,8 @@ from .models import (
     RadarIntelligenceQuery,
     HubbleFlowSummaryCreate,
     HubbleLiveQuery,
+    KubernetesDiagnosticsQuery,
+    KubernetesDiagnosticsBrokerResult,
     InfrastructureProviderCreate,
     InfrastructureProviderHealth,
     OperationsIntentPlanCreate,
@@ -93,6 +95,7 @@ BOT_SOURCE_CHANNELS = {"ui", "telegram", "hermes-bot", "api"}
 
 ADAPTER_CAPABILITIES: dict[str, dict[str, Any]] = {
     "kubernetes.discover": {"adapter": "kubernetes", "mode": "read", "default_risk": "READ", "reversible": False, "credential_class": "kubeconfig", "connection_modes": ["direct", "agent"], "approval": "none", "target_restrictions": ["namespace allowlist", "no Secret value reads"]},
+    "kubernetes.diagnostics": {"adapter": "kubernetes", "mode": "read", "default_risk": "READ", "reversible": False, "credential_class": "kubeconfig", "connection_modes": ["direct", "agent"], "approval": "none", "target_restrictions": ["fixed read-only collectors", "namespace/cluster scope", "no Secret/env/log bodies", "bounded typed findings"]},
     "kubernetes.apply": {"adapter": "kubernetes", "mode": "write", "default_risk": "HIGH", "reversible": True, "credential_class": "kubeconfig", "connection_modes": ["direct", "agent"], "approval": "policy", "target_restrictions": ["namespace/resource allowlists", "RBAC escalation denied by default"]},
     "helm.upgrade": {"adapter": "helm", "mode": "write", "default_risk": "HIGH", "reversible": True, "credential_class": "kubeconfig", "connection_modes": ["direct", "agent"], "approval": "policy", "target_restrictions": ["namespace allowlist"]},
     "docker.read": {"adapter": "docker", "mode": "read", "default_risk": "READ", "reversible": False, "credential_class": "docker-socket-local", "connection_modes": ["agent"], "approval": "none", "target_restrictions": ["socket broker/agent only"]},
@@ -3115,6 +3118,68 @@ async def stream_cluster_network_live(
             await asyncio.sleep(poll_seconds)
 
     return StreamingResponse(event_stream(), media_type="text/event-stream", headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
+
+
+DIAGNOSTIC_FORBIDDEN_EVIDENCE_KEYS = {
+    "authorization", "body", "env", "environment", "headers", "kubeconfig",
+    "password", "secret", "token", "url",
+}
+
+
+def _validate_diagnostic_evidence(value: Any, *, depth: int = 0) -> None:
+    if depth > 8:
+        raise HTTPException(status_code=502, detail="Kubernetes Broker diagnostic evidence is nested too deeply")
+    if isinstance(value, dict):
+        if len(value) > 128:
+            raise HTTPException(status_code=502, detail="Kubernetes Broker diagnostic evidence object is too large")
+        for key, child in value.items():
+            normalized = re.sub(r"[^a-z0-9]", "", str(key).lower())
+            if normalized in DIAGNOSTIC_FORBIDDEN_EVIDENCE_KEYS:
+                raise HTTPException(status_code=502, detail="Kubernetes Broker diagnostic evidence contains a forbidden sensitive field")
+            _validate_diagnostic_evidence(child, depth=depth + 1)
+    elif isinstance(value, list):
+        if len(value) > 100:
+            raise HTTPException(status_code=502, detail="Kubernetes Broker diagnostic evidence list is too large")
+        for child in value:
+            _validate_diagnostic_evidence(child, depth=depth + 1)
+    elif isinstance(value, str) and len(value.encode("utf-8", errors="replace")) > 4000:
+        raise HTTPException(status_code=502, detail="Kubernetes Broker diagnostic evidence string is too large")
+
+
+@app.post("/v1/clusters/{cluster_id}/diagnostics/run")
+async def run_cluster_diagnostics(cluster_id: str, payload: KubernetesDiagnosticsQuery, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_admin(authorization)
+    with closing(db.connect()) as conn:
+        cluster = _cluster_dict(_get_cluster(conn, cluster_id))
+        snapshot = _native_kubernetes_target(conn, cluster, payload.native_target_id)
+    raw = await kubernetes_broker.post(
+        "/v1/diagnostics/run",
+        {"target_snapshot": snapshot, "checks": payload.checks},
+    )
+    if len(json.dumps(raw, separators=(",", ":"), ensure_ascii=False).encode("utf-8")) > 512_000:
+        raise HTTPException(status_code=502, detail="Kubernetes Broker diagnostic response exceeds 512 KiB")
+    try:
+        result = KubernetesDiagnosticsBrokerResult.model_validate(raw)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail="Kubernetes Broker returned malformed diagnostic data") from exc
+    if set(result.summary) != {"PASS", "WARN", "FAIL", "SKIP"}:
+        raise HTTPException(status_code=502, detail="Kubernetes Broker diagnostic summary schema is invalid")
+    for finding in result.checks:
+        _validate_diagnostic_evidence(finding.evidence)
+    normalized = result.model_dump()
+    with closing(db.connect()) as conn:
+        db.audit(conn, "kubernetes.diagnostics.executed", "admin", "cluster", cluster_id, {
+            "target_id": payload.native_target_id,
+            "check_ids": [item["id"] for item in normalized["checks"]],
+            "overall_status": normalized["overall_status"],
+            "observed_at": normalized["observed_at"],
+        })
+        conn.commit()
+    return {
+        "cluster_id": cluster_id,
+        "native_target_id": payload.native_target_id,
+        **normalized,
+    }
 
 
 @app.post("/v1/clusters/{cluster_id}/intelligence/hubble", status_code=201)

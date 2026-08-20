@@ -10,7 +10,7 @@ Frozen parent boundary:
 
 Do not amend, reset, squash, force-push, move or recreate the frozen dev.4 tag.
 
-## Completed in the first dev.5 slice
+## Completed dev.5 runtime slices
 
 - real read-only Radar HTTP MCP client
 - MCP initialize/session handling
@@ -22,12 +22,13 @@ Do not amend, reset, squash, force-push, move or recreate the frozen dev.4 tag.
 - defense-in-depth Secret/env/token redaction
 - Hermes-native live intelligence controls
 - dev.5 source/security/static gates and release guards anchored to frozen dev.4
+- Cilium/Hubble live-network runtime through the trusted Kubernetes Broker, including namespace authorization, redaction/aggregation, bounded history, SSE and Hermes-native Network Live UI
+- executable Hermes-native Kubernetes diagnostics for core health, OOM/metrics/storage/events, Cilium/Hubble/DNS/ingress/NetworkPolicy, RBAC/workload security, Argo CD and rollout checks
+- diagnostics target-scope enforcement, fixed read-only collectors, bounded typed findings, no Secret/env/log reads, mutation attestation and Control Plane sensitive-evidence rejection
 
 ## Still release-blocking for dev.5 scope closure
 
-- Hubble Relay live-network collector/stream path
-- executable Hermes-native diagnostics
-- operator UI scope closure
+- operator UI scope closure beyond the Radar/Network Live/Diagnostics surfaces already added
 - day-2/add-on executor and active verification closure
 - Cluster Factory runtime/repeatability closure
 - provider/bare-metal/network executors or explicit user-approved deferral
@@ -36,5 +37,3 @@ Do not amend, reset, squash, force-push, move or recreate the frozen dev.4 tag.
 
 `v0.5.11-dev.5` must not be created until the full dev.5 closure scope is complete,
 local validation passes, and branch CI succeeds on the exact intended tag SHA.
-
-- Dev.5 Hubble runtime slice: trusted Kubernetes Broker collector, pinned Hubble CLI, namespace authorization, typed redaction/aggregation, bounded history, SSE, and Hermes-native Network Live batch UI.

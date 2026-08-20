@@ -403,6 +403,32 @@ class HubbleLiveQuery(StrictModel):
     since_seconds: int | None = Field(default=None, ge=1, le=3600)
 
 
+DiagnosticStatus = Literal["PASS", "WARN", "FAIL", "SKIP"]
+
+
+class KubernetesDiagnosticsQuery(StrictModel):
+    native_target_id: str = Field(min_length=1, max_length=160)
+    checks: list[str] = Field(default_factory=list, max_length=32)
+
+
+class DiagnosticFindingResult(StrictModel):
+    id: str = Field(min_length=1, max_length=160)
+    status: DiagnosticStatus
+    summary: str = Field(min_length=1, max_length=1000)
+    evidence: dict[str, Any] = Field(default_factory=dict)
+
+
+class KubernetesDiagnosticsBrokerResult(StrictModel):
+    provider: Literal["hermes-native-kubernetes-diagnostics"]
+    observed_at: int
+    overall_status: DiagnosticStatus
+    checks: list[DiagnosticFindingResult] = Field(max_length=32)
+    summary: dict[str, int]
+    secret_data_requested: Literal[False]
+    mutation_commands_executed: Literal[False]
+    policy_scope: dict[str, Any]
+
+
 class HubbleFlowSummaryCreate(StrictModel):
     window_start: int
     window_end: int

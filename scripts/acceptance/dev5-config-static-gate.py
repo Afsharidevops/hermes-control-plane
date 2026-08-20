@@ -62,6 +62,9 @@ assert "radar-mode" in ui
 assert "/intelligence/query" in ui
 assert "Collect Network Live" in ui
 assert "/network/live" in ui
+assert "Run Native Diagnostics" in ui
+assert "/diagnostics/run" in ui
+assert "native-diagnostics" in ui
 assert "<option>radar</option>" in ui
 
 for workflow_path in (".github/workflows/validate.yml", ".github/workflows/publish-images.yml"):
@@ -80,7 +83,9 @@ for script in ("apply.sh", "validate.sh", "push.sh"):
 assert (ROOT / "docs/DEV5-SCOPE-CLOSURE.md").is_file()
 assert (ROOT / "control-plane/tests/test_dev5_radar_runtime.py").is_file()
 assert (ROOT / "control-plane/tests/test_dev5_hubble_runtime.py").is_file()
+assert (ROOT / "control-plane/tests/test_dev5_diagnostics_runtime.py").is_file()
 assert (ROOT / "kubernetes-broker/src/hermes_kubernetes_broker/hubble.py").is_file()
+assert (ROOT / "kubernetes-broker/src/hermes_kubernetes_broker/diagnostics.py").is_file()
 
 # The source manifest is a complete checksum inventory of every managed file except itself.
 manifest_path = ROOT / "MANIFEST.sha256"

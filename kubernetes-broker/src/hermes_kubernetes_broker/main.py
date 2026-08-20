@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from . import hubble as hubble_provider
+from . import diagnostics as diagnostics_provider
 
 import yaml
 from fastapi import FastAPI, Header, HTTPException
@@ -71,6 +72,11 @@ class HubbleCollectRequest(StrictModel):
     target_snapshot: dict[str, Any]
     last: int = Field(default=50, ge=1, le=200)
     since_seconds: int | None = Field(default=None, ge=1, le=3600)
+
+
+class DiagnosticsRunRequest(StrictModel):
+    target_snapshot: dict[str, Any]
+    checks: list[str] = Field(default_factory=list, max_length=32)
 
 
 def canonical_json(value: Any) -> str:
@@ -986,6 +992,132 @@ def discover(payload: DiscoveryRequest, authorization: str | None = Header(defau
         nodes = _run_json(["kubectl", "get", "nodes", "-o", "json"], snapshot)
     toolchain = _kubectl_toolchain(snapshot)
     return {"version": version, "namespaces": namespaces, "nodes": nodes, "workloads": workloads, "policy_scope": scope, "secret_data_requested": False, "toolchain": toolchain}
+
+
+
+def _diagnostic_error(exc: Exception) -> str:
+    if isinstance(exc, HTTPException):
+        return f"collector HTTP {exc.status_code}"
+    return f"collector {type(exc).__name__}"
+
+
+def _diagnostic_scoped_list(snapshot: dict[str, Any], resource: str, *, cluster_scoped: bool = False, optional: bool = False) -> dict[str, Any]:
+    scope = _scope(snapshot)
+    if cluster_scoped:
+        if not bool(scope.get("cluster_read", False)):
+            return {"items": [], "error": "cluster_read target scope required"}
+        try:
+            data = _run_json(["kubectl", "get", resource, "-o", "json"], snapshot)
+            return {"items": list((data or {}).get("items") or [])}
+        except HTTPException as exc:
+            if optional:
+                return {"items": [], "error": _diagnostic_error(exc)}
+            raise
+
+    allow = sorted({str(x).lower() for x in (scope.get("namespace_allowlist") or []) if str(x).strip()})
+    deny = {str(x).lower() for x in (scope.get("namespace_denylist") or []) if str(x).strip()}
+    try:
+        if allow and "*" not in allow:
+            items: list[dict[str, Any]] = []
+            for namespace in allow:
+                _enforce_namespace(snapshot, _namespace(namespace))
+                data = _run_json(["kubectl", "get", resource, "-n", namespace, "-o", "json"], snapshot)
+                items.extend(x for x in ((data or {}).get("items") or []) if isinstance(x, dict))
+            return {"items": items}
+        data = _run_json(["kubectl", "get", resource, "-A", "-o", "json"], snapshot)
+        items = [x for x in ((data or {}).get("items") or []) if isinstance(x, dict)]
+        if deny:
+            items = [x for x in items if str(((x.get("metadata") or {}).get("namespace") or "")).lower() not in deny]
+        return {"items": items}
+    except HTTPException as exc:
+        return {"items": [], "error": _diagnostic_error(exc)}
+
+
+def _diagnostic_metrics(snapshot: dict[str, Any], *, nodes: bool = False) -> dict[str, Any]:
+    scope = _scope(snapshot)
+    try:
+        if nodes:
+            if not bool(scope.get("cluster_read", False)):
+                return {"items": [], "error": "cluster_read target scope required"}
+            data = _run_json(["kubectl", "get", "--raw", "/apis/metrics.k8s.io/v1beta1/nodes"], snapshot)
+            return {"items": list((data or {}).get("items") or [])}
+
+        allow = sorted({str(x).lower() for x in (scope.get("namespace_allowlist") or []) if str(x).strip()})
+        deny = {str(x).lower() for x in (scope.get("namespace_denylist") or []) if str(x).strip()}
+        if allow and "*" not in allow:
+            items: list[dict[str, Any]] = []
+            for namespace in allow:
+                _enforce_namespace(snapshot, _namespace(namespace))
+                path = f"/apis/metrics.k8s.io/v1beta1/namespaces/{namespace}/pods"
+                data = _run_json(["kubectl", "get", "--raw", path], snapshot)
+                items.extend(x for x in ((data or {}).get("items") or []) if isinstance(x, dict))
+            return {"items": items}
+        data = _run_json(["kubectl", "get", "--raw", "/apis/metrics.k8s.io/v1beta1/pods"], snapshot)
+        items = [x for x in ((data or {}).get("items") or []) if isinstance(x, dict)]
+        if deny:
+            items = [x for x in items if str(((x.get("metadata") or {}).get("namespace") or "")).lower() not in deny]
+        return {"items": items}
+    except HTTPException as exc:
+        return {"items": [], "error": _diagnostic_error(exc)}
+
+
+def _diagnostic_bundle(snapshot: dict[str, Any], checks: list[str]) -> dict[str, Any]:
+    requested = set(checks or diagnostics_provider.DEFAULT_CHECK_IDS)
+    unknown = sorted(requested - set(diagnostics_provider.CHECK_IDS))
+    if unknown:
+        raise HTTPException(422, f"unsupported diagnostic checks: {', '.join(unknown)}")
+
+    bundle: dict[str, Any] = {}
+    bundle["nodes"] = _diagnostic_scoped_list(snapshot, "nodes", cluster_scoped=True, optional=True)
+    bundle["pods"] = _diagnostic_scoped_list(snapshot, "pods")
+    bundle["workloads"] = _diagnostic_scoped_list(snapshot, "deployments,statefulsets,daemonsets")
+    bundle["services"] = _diagnostic_scoped_list(snapshot, "services")
+    bundle["ingresses"] = _diagnostic_scoped_list(snapshot, "ingresses.networking.k8s.io", optional=True)
+    bundle["networkpolicies"] = _diagnostic_scoped_list(snapshot, "networkpolicies.networking.k8s.io", optional=True)
+    bundle["events"] = _diagnostic_scoped_list(snapshot, "events")
+    bundle["pvcs"] = _diagnostic_scoped_list(snapshot, "persistentvolumeclaims")
+    bundle["roles"] = _diagnostic_scoped_list(snapshot, "roles.rbac.authorization.k8s.io", optional=True)
+    bundle["clusterroles"] = _diagnostic_scoped_list(snapshot, "clusterroles.rbac.authorization.k8s.io", cluster_scoped=True, optional=True)
+    validating = _diagnostic_scoped_list(snapshot, "validatingwebhookconfigurations.admissionregistration.k8s.io", cluster_scoped=True, optional=True)
+    mutating = _diagnostic_scoped_list(snapshot, "mutatingwebhookconfigurations.admissionregistration.k8s.io", cluster_scoped=True, optional=True)
+    bundle["webhooks"] = {
+        "items": [*(validating.get("items") or []), *(mutating.get("items") or [])],
+        "error": validating.get("error") or mutating.get("error"),
+    }
+    bundle["argocd_applications"] = _diagnostic_scoped_list(snapshot, "applications.argoproj.io", optional=True)
+    bundle["certificates"] = _diagnostic_scoped_list(snapshot, "certificates.cert-manager.io", optional=True)
+    bundle["velero_backups"] = _diagnostic_scoped_list(snapshot, "backups.velero.io", optional=True)
+    bundle["metrics_pods"] = _diagnostic_metrics(snapshot)
+    bundle["metrics_nodes"] = _diagnostic_metrics(snapshot, nodes=True)
+
+    if requested & {"network.hubble", "network.policy-drops"}:
+        try:
+            bundle["hubble"] = hubble_provider.collect(snapshot=snapshot, env=_env(snapshot), last=20, since_seconds=60)
+        except hubble_provider.HubbleError as exc:
+            bundle["hubble"] = {"error": f"HubbleError: {str(exc)[:400]}", "raw_flow_bodies_returned": False}
+    else:
+        bundle["hubble"] = {"summary": {}, "raw_flow_bodies_returned": False}
+    return bundle
+
+
+@app.post("/v1/diagnostics/run")
+def run_diagnostics(payload: DiagnosticsRunRequest, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_token(authorization)
+    snapshot = _target(payload.target_snapshot)
+    if snapshot.get("status") not in {None, "configured"}:
+        raise HTTPException(409, "Kubernetes target is disabled")
+    observed_at = int(time.time())
+    bundle = _diagnostic_bundle(snapshot, payload.checks)
+    try:
+        result = diagnostics_provider.evaluate(bundle=bundle, requested_checks=payload.checks, observed_at=observed_at)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    result["policy_scope"] = {
+        "namespace_allowlist": list((_scope(snapshot).get("namespace_allowlist") or [])),
+        "namespace_denylist": list((_scope(snapshot).get("namespace_denylist") or [])),
+        "cluster_read": bool(_scope(snapshot).get("cluster_read", False)),
+    }
+    return result
 
 
 @app.post("/v1/hubble/collect")

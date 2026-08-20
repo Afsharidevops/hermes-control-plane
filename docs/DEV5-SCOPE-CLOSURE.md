@@ -36,8 +36,8 @@ inventory topology. It is not presented as feature-equivalent to Radar.
 
 ## Remaining dev.5 closure
 
-This slice does not close the remaining roadmap by itself. Hubble live traffic,
-executable native diagnostics, broader operator UI, day-2/provider executors,
+Radar alone did not close the roadmap. The Hubble and diagnostics slices below close
+two more runtime gaps, while broader operator UI, day-2/provider executors,
 air-gap synchronization and active unified verification remain subsequent
 `0.5.11-dev.5` work unless explicitly deferred by the user.
 
@@ -59,3 +59,27 @@ Security properties:
 - No Hubble mutation path is introduced. Mutations remain normal Hermes ChangeSets.
 
 Evidence in this slice is mock/simulation + local runtime-path testing. It is **not** real-target Cilium/Hubble evidence; live disposable-cluster verification remains required before classifying the complete 0.5.11 Hubble area as real-target verified.
+## Slice 3 — executable Hermes-native diagnostics runtime
+
+This slice replaces the static native-diagnostic catalog boundary with executable,
+target-scoped read collectors in the trusted Kubernetes Broker. It does not add a
+`kubectl-aban-plugin` runtime dependency.
+
+Implemented diagnostic families:
+
+- node readiness/pressure, pod readiness/restarts/OOM, workload availability and rollout health
+- metrics.k8s.io CPU/memory top-consumer summaries, PVC health and Warning-event correlation
+- Cilium pod readiness, Hubble Relay reachability/policy-drop summary, CoreDNS visibility, Ingress and NetworkPolicy checks
+- dangerous RBAC rules, privileged containers, dangerous Linux capability additions, hostPath use, exposed Services, Ingress TLS and admission-webhook baseline checks
+- Argo CD Application sync/health plus compatibility checks for cert-manager Certificates and Velero Backups when those CRDs are visible
+
+Security/runtime properties:
+
+- only fixed `kubectl get`/metrics API collectors are constructed; there is no user-provided command, shell, `exec`, log or mutation passthrough
+- namespace allow/deny scope and `cluster_read` are enforced before collection
+- Secrets are never requested, event messages are not returned, workload environment values are not returned, and hostPath paths are not returned
+- Hubble diagnostics reuse the sanitized Hubble collector and attest `raw_flow_bodies_returned=false`
+- output is a bounded typed finding schema with `PASS`/`WARN`/`FAIL`/`SKIP`; the Control Plane rejects malformed results, mutation attestation changes, oversized results and sensitive evidence keys
+- every Control Plane diagnostics run is audited
+
+Evidence is local runtime-path/mock/simulation evidence, not real-target cluster evidence.

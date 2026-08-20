@@ -27,6 +27,7 @@ operations = text("control-plane/src/hermes_control_plane/operations.py")
 tickets = text("control-plane/src/hermes_control_plane/tickets.py")
 radar = text("control-plane/src/hermes_control_plane/radar.py")
 hubble = text("kubernetes-broker/src/hermes_kubernetes_broker/hubble.py")
+diagnostics = text("kubernetes-broker/src/hermes_kubernetes_broker/diagnostics.py")
 kube_broker = text("kubernetes-broker/src/hermes_kubernetes_broker/main.py")
 
 # Frozen dev.3/dev.4 contracts remain intact while dev.5 adds real runtime surfaces.
@@ -112,6 +113,40 @@ for forbidden in ('"url":', '"headers":', '"body":', 'shell=True', 'os.system'):
     assert forbidden not in hubble, forbidden
 assert 'raw_flow_bodies_returned": False' in hubble
 assert 'LIMIT 2000' in cp_main
+
+# Dev.5 native diagnostics are executable only through fixed read-only broker collectors.
+for marker in (
+    'class KubernetesDiagnosticsQuery',
+    'class KubernetesDiagnosticsBrokerResult',
+    '@app.post("/v1/clusters/{cluster_id}/diagnostics/run")',
+    'KubernetesDiagnosticsBrokerResult.model_validate',
+    'kubernetes.diagnostics.executed',
+    'DIAGNOSTIC_FORBIDDEN_EVIDENCE_KEYS',
+):
+    assert marker in models or marker in cp_main, marker
+for marker in (
+    '@app.post("/v1/diagnostics/run")',
+    '_diagnostic_scoped_list',
+    '_diagnostic_metrics',
+    'diagnostics_provider.evaluate',
+):
+    assert marker in kube_broker, marker
+for check_id in (
+    'nodes.health', 'pods.health', 'workloads.health', 'pods.oom', 'resources.cpu-memory',
+    'storage.health', 'events.correlation', 'network.cilium', 'network.hubble', 'network.dns',
+    'network.ingress', 'network.networkpolicy', 'security.rbac', 'security.privileged',
+    'security.capabilities', 'security.hostpath', 'security.exposed-services',
+    'security.ingress-tls', 'security.webhooks', 'gitops.argocd', 'rollout.health',
+):
+    assert f'"{check_id}"' in diagnostics, check_id
+assert '"secret_data_requested": False' in diagnostics
+assert '"mutation_commands_executed": False' in diagnostics
+assert 'raw_flow_bodies_returned' in diagnostics
+for forbidden in ('subprocess', 'os.system', 'shell=True', 'kubectl exec', 'kubectl logs', 'kubectl apply', 'kubectl delete', 'kubectl patch', 'kubectl create'):
+    assert forbidden not in diagnostics, forbidden
+assert '"kubectl", "get"' in kube_broker
+assert 'unsupported diagnostic checks' in kube_broker
+assert 'cluster_read target scope required' in kube_broker
 
 # Generic typed provider contracts retain their credential boundary and no arbitrary command generation.
 for forbidden in ("subprocess", "os.system", "shell=True", "curl | sh"):
