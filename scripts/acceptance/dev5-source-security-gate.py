@@ -212,7 +212,7 @@ for operation in (
     'cluster.node.cordon', 'cluster.node.uncordon', 'cluster.node.drain',
     'cluster.workload.restart', 'cluster.workload.scale',
     'cluster.addon.install', 'cluster.addon.upgrade', 'cluster.helm.apply',
-    'cluster.gitops.sync', 'cluster.cilium.upgrade', 'cluster.backup.velero', 'cluster.restore',
+    'cluster.gitops.sync', 'cluster.cilium.upgrade', 'cluster.backup.velero', 'cluster.backup.schedule', 'cluster.restore',
 ):
     assert f'"{operation}"' in kube_broker, operation
 for forbidden in ('shell=True', 'os.system', 'kubectl exec', 'kubectl cp'):
@@ -234,6 +234,10 @@ for marker in (
     'different approved specification',
     '--for=jsonpath={.status.phase}=Completed',
     'velero-backup-completed',
+    'schedules.velero.io',
+    'Velero Schedule state changed after preview',
+    'outside the bounded Hermes schedule contract',
+    'velero-schedule-ready',
     'restores.velero.io',
     'Velero restore source Backup changed after preview',
     'Velero Restore state changed after preview',

@@ -97,6 +97,7 @@ DAY2_OPERATIONS: dict[str, dict[str, Any]] = {
     "cluster.kubernetes.upgrade": {"kind": "KubernetesUpgradePlan", "stages": ["preflight", "backup", "control-plane", "workers", "addons", "verify"]},
     "cluster.cilium.upgrade": {"kind": "CiliumUpgradePlan", "stages": ["preflight", "backup", "upgrade", "cilium-verify", "hubble-verify"]},
     "cluster.backup.velero": {"kind": "VeleroBackupPlan", "stages": ["preflight", "create", "wait", "verify"]},
+    "cluster.backup.schedule": {"kind": "VeleroSchedulePlan", "stages": ["preflight", "render", "upsert", "verify"]},
     "cluster.etcd.snapshot": {"kind": "EtcdSnapshotPlan", "stages": ["preflight", "snapshot", "integrity-verify"]},
     "cluster.restore": {"kind": "RestorePlan", "stages": ["preflight", "restore", "workload-verify", "network-verify"]},
     "cluster.certificate.rotate": {"kind": "CertificateRotationPlan", "stages": ["preflight", "rotate", "component-restart", "verify"]},
@@ -128,12 +129,53 @@ KUBERNETES_DAY2_RUNTIME_OPERATIONS: dict[str, dict[str, Any]] = {
     "cluster.gitops.sync": {"executor": "kubernetes-broker", "verification": ["gitops-synced", "gitops-healthy"]},
     "cluster.cilium.upgrade": {"executor": "kubernetes-broker", "verification": ["helm-release-ready", "cilium-ready", "hubble-ready"]},
     "cluster.backup.velero": {"executor": "kubernetes-broker", "verification": ["velero-backup-completed"]},
+    "cluster.backup.schedule": {"executor": "kubernetes-broker", "verification": ["velero-schedule-ready"]},
     "cluster.restore": {"executor": "kubernetes-broker", "verification": ["velero-restore-source-bound", "velero-restore-completed"]},
 }
 
 
 def kubernetes_day2_runtime_capable(operation: str) -> bool:
     return operation in KUBERNETES_DAY2_RUNTIME_OPERATIONS
+
+
+def _validate_velero_schedule_cron(value: str) -> str:
+    cron = " ".join(str(value or "").split())
+    if not cron or len(cron) > 80:
+        raise ValueError("Velero schedule must be a bounded 5-field cron expression")
+    fields = cron.split(" ")
+    if len(fields) != 5:
+        raise ValueError("Velero schedule must use exactly 5 cron fields")
+    minute = fields[0]
+    if not minute.isdigit() or not 0 <= int(minute) <= 59:
+        raise ValueError("Velero schedule minute must be a fixed integer 0-59; schedules may run no more frequently than hourly")
+
+    def valid_field(expr: str, low: int, high: int) -> bool:
+        if not expr or len(expr) > 32:
+            return False
+        for item in expr.split(","):
+            if not item:
+                return False
+            base, sep, step_text = item.partition("/")
+            if sep:
+                if not step_text.isdigit() or not 1 <= int(step_text) <= (high - low + 1) or "/" in step_text:
+                    return False
+            if base == "*":
+                continue
+            if "-" in base:
+                first, dash, last = base.partition("-")
+                if not dash or "-" in last or not first.isdigit() or not last.isdigit():
+                    return False
+                start, end = int(first), int(last)
+                if start < low or end > high or start > end:
+                    return False
+            elif not base.isdigit() or not low <= int(base) <= high:
+                return False
+        return True
+
+    for expr, low, high in zip(fields[1:], (0, 1, 1, 0), (23, 31, 12, 7)):
+        if not valid_field(expr, low, high):
+            raise ValueError("Velero schedule contains an unsupported or out-of-range cron field")
+    return cron
 
 
 def validate_kubernetes_day2_parameters(operation: str, parameters: dict[str, Any]) -> None:
@@ -179,6 +221,30 @@ def validate_kubernetes_day2_parameters(operation: str, parameters: dict[str, An
         namespace = str(parameters.get("namespace") or "velero")
         if not namespace or len(namespace) > 253:
             raise ValueError("namespace is required for Velero backup")
+        included = parameters.get("included_namespaces", ["*"])
+        excluded = parameters.get("excluded_namespaces", [])
+        for key, value in (("included_namespaces", included), ("excluded_namespaces", excluded)):
+            if not isinstance(value, list) or len(value) > 64 or any(not isinstance(item, str) or not item or len(item) > 253 for item in value):
+                raise ValueError(f"{key} must be a list of at most 64 namespace names")
+        if not included:
+            raise ValueError("included_namespaces must contain at least one namespace or '*'")
+        if "*" in included and len(included) != 1:
+            raise ValueError("included_namespaces '*' must be used alone")
+        if "*" in excluded:
+            raise ValueError("excluded_namespaces cannot contain '*'")
+        if "snapshot_volumes" in parameters and not isinstance(parameters["snapshot_volumes"], bool):
+            raise ValueError("snapshot_volumes must be boolean when provided")
+        ttl_hours = parameters.get("ttl_hours", 72)
+        if not isinstance(ttl_hours, int) or isinstance(ttl_hours, bool) or ttl_hours < 1 or ttl_hours > 8760:
+            raise ValueError("ttl_hours must be an integer between 1 and 8760")
+    elif operation == "cluster.backup.schedule":
+        schedule_name = str(parameters.get("schedule_name") or "")
+        if not schedule_name or len(schedule_name) > 253:
+            raise ValueError("schedule_name is required for Velero schedule")
+        namespace = str(parameters.get("namespace") or "velero")
+        if not namespace or len(namespace) > 253:
+            raise ValueError("namespace is required for Velero schedule")
+        _validate_velero_schedule_cron(str(parameters.get("schedule") or ""))
         included = parameters.get("included_namespaces", ["*"])
         excluded = parameters.get("excluded_namespaces", [])
         for key, value in (("included_namespaces", included), ("excluded_namespaces", excluded)):

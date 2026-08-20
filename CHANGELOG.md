@@ -139,3 +139,5 @@
 - 0.5.11-dev.5: add bounded one-shot Velero Backup execution through the trusted Kubernetes Broker with exact state/spec binding and active completion verification.
 
 - dev.5 scope closure: add CRITICAL two-approval explicit-namespace Velero Restore runtime with exact source/restore drift binding, fixed non-destructive Restore CR execution, PV permission gating and active terminal verification.
+
+- dev.5 scope closure: add exact-preview-bound Velero Schedule create/update runtime with bounded hourly-or-slower cron, fixed Backup template fields, namespace authorization, unsupported-field rejection and active validation/spec verification.

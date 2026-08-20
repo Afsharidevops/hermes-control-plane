@@ -411,3 +411,98 @@ def test_velero_restore_existing_object_must_match_exact_approved_non_destructiv
     with pytest.raises(Exception) as exc:
         main._assert_velero_restore_reusable(dict(matching, phase="PartiallyFailed"), "hermes-restore", "hermes-test", ["apps"], False)
     assert "partial-failure" in str(exc.value)
+
+
+def test_velero_schedule_updates_fixed_cr_with_exact_state_binding_and_active_verification(monkeypatch):
+    calls = []
+    monkeypatch.setattr(main, "_kubectl_toolchain", lambda snapshot, refresh=False: {"binding_hash": "x"})
+
+    before_raw = {
+        "metadata": {"uid": "schedule-uid", "resourceVersion": "7"},
+        "spec": {
+            "schedule": "0 2 * * *",
+            "template": {"includedNamespaces": ["apps"], "snapshotVolumes": True, "ttl": "72h0m0s"},
+        },
+        "status": {"phase": "Enabled", "validationErrors": []},
+    }
+    after_raw = {
+        "metadata": {"uid": "schedule-uid", "resourceVersion": "8"},
+        "spec": {
+            "schedule": "30 3 * * *",
+            "template": {"includedNamespaces": ["apps"], "snapshotVolumes": True, "ttl": "168h0m0s"},
+        },
+        "status": {"phase": "Enabled", "validationErrors": [], "lastBackup": "2026-08-20T18:00:00Z"},
+    }
+    get_states = iter([before_raw, before_raw, after_raw])
+
+    def fake_run(args, snapshot, stdin=None, timeout=None, allowed_codes=None):
+        calls.append((args, stdin))
+        if args[:3] == ["kubectl", "get", "schedules.velero.io"]:
+            return {"returncode": 0, "output": __import__("json").dumps(next(get_states)), "duration": 0.01}
+        return {"returncode": 0, "output": "schedule.velero.io/hermes-daily", "duration": 0.01}
+
+    monkeypatch.setattr(main, "_run", fake_run)
+    before = {
+        "exists": True,
+        "schedule_name": "hermes-daily",
+        "namespace": "velero",
+        "uid": "schedule-uid",
+        "resource_version": "7",
+        "deletion_timestamp": None,
+        "schedule": "0 2 * * *",
+        "included_namespaces": ["apps"],
+        "excluded_namespaces": [],
+        "snapshot_volumes": True,
+        "ttl": "72h0m0s",
+        "phase": "Enabled",
+        "validation_error_count": 0,
+        "last_backup_present": False,
+        "unsupported_spec_fields": [],
+        "unsupported_template_fields": [],
+    }
+    preview = {"preconditions": {"velero_schedule_state_hash": main.sha256_hex(before)}}
+    params = {
+        "native_target_id": "tgt_test",
+        "schedule_name": "hermes-daily",
+        "namespace": "velero",
+        "schedule": "30 3 * * *",
+        "included_namespaces": ["apps"],
+        "snapshot_volumes": True,
+        "ttl_hours": 168,
+    }
+    typed = _typed_with_namespaces("cluster.backup.schedule", params, preview, ["velero", "apps"])
+    result = main._execute_day2(_changeset(typed), {"executor": "kubernetes-broker"})
+
+    patch_calls = [entry for entry in calls if entry[0][:3] == ["kubectl", "patch", "schedules.velero.io"]]
+    assert len(patch_calls) == 1
+    patch = patch_calls[0][0][patch_calls[0][0].index("-p") + 1]
+    assert '"schedule":"30 3 * * *"' in patch
+    assert '"ttl":"168h0m0s"' in patch
+    assert "hooks" not in patch
+    assert "storageLocation" not in patch
+    assert result["result"]["action"] == "updated"
+    check = {item["id"]: item for item in result["verification"]["checks"]}["velero-schedule-ready"]
+    assert check["status"] == "PASS"
+    assert check["evidence"]["last_backup_present"] is True
+    assert result["verification"]["evidence"]["arbitrary_shell"] is False
+
+
+def test_velero_schedule_rejects_frequent_cron_and_existing_unbounded_fields(monkeypatch):
+    with pytest.raises(Exception) as exc:
+        main._day2_velero_schedule({
+            "schedule_name": "too-often",
+            "schedule": "*/5 * * * *",
+            "included_namespaces": ["apps"],
+        })
+    assert "no more frequently than hourly" in str(exc.value)
+
+    monkeypatch.setattr(main, "_run", lambda *args, **kwargs: {
+        "returncode": 0,
+        "output": '{"metadata":{"uid":"x","resourceVersion":"1"},"spec":{"schedule":"0 2 * * *","template":{"includedNamespaces":["apps"],"snapshotVolumes":true,"ttl":"72h0m0s","hooks":{"resources":[]}}},"status":{"phase":"Enabled","validationErrors":[]}}',
+        "duration": 0.01,
+    })
+    state = main._velero_schedule_state({"scope": {}}, "hermes-daily", "velero")
+    assert state["unsupported_template_fields"] == ["hooks"]
+    with pytest.raises(Exception) as exc:
+        main._assert_velero_schedule_manageable(state, "hermes-daily")
+    assert "outside the bounded Hermes schedule contract" in str(exc.value)

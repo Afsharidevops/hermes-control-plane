@@ -106,6 +106,7 @@ day2_tests = (ROOT / "kubernetes-broker/tests/test_day2_runtime.py").read_text()
 assert "cluster.gitops.sync" in day2_tests
 assert "cluster.cilium.upgrade" in day2_tests
 assert "cluster.backup.velero" in day2_tests
+assert "cluster.backup.schedule" in day2_tests
 assert "cluster.restore" in day2_tests
 assert 'required_approvals"] == 2' in day2_tests
 assert (ROOT / "control-plane/src/hermes_control_plane/operator_center.py").is_file()

@@ -1155,6 +1155,7 @@ KUBERNETES_DAY2_OPERATIONS = {
     "cluster.gitops.sync",
     "cluster.cilium.upgrade",
     "cluster.backup.velero",
+    "cluster.backup.schedule",
     "cluster.restore",
 }
 
@@ -1269,6 +1270,157 @@ def _day2_velero(parameters: dict[str, Any]) -> tuple[str, str, list[str], list[
     if not isinstance(ttl_hours, int) or isinstance(ttl_hours, bool) or ttl_hours < 1 or ttl_hours > 8760:
         raise HTTPException(422, "ttl_hours must be an integer between 1 and 8760")
     return backup_name, namespace, [str(x) for x in included], [str(x) for x in excluded], snapshot_volumes, ttl_hours
+
+
+def _validate_velero_schedule_cron(value: str) -> str:
+    cron = " ".join(str(value or "").split())
+    if not cron or len(cron) > 80:
+        raise HTTPException(422, "Velero schedule must be a bounded 5-field cron expression")
+    fields = cron.split(" ")
+    if len(fields) != 5:
+        raise HTTPException(422, "Velero schedule must use exactly 5 cron fields")
+    minute = fields[0]
+    if not minute.isdigit() or not 0 <= int(minute) <= 59:
+        raise HTTPException(422, "Velero schedule minute must be a fixed integer 0-59; schedules may run no more frequently than hourly")
+
+    def valid_field(expr: str, low: int, high: int) -> bool:
+        if not expr or len(expr) > 32:
+            return False
+        for item in expr.split(","):
+            if not item:
+                return False
+            base, sep, step_text = item.partition("/")
+            if sep:
+                if not step_text.isdigit() or not 1 <= int(step_text) <= (high - low + 1) or "/" in step_text:
+                    return False
+            if base == "*":
+                continue
+            if "-" in base:
+                first, dash, last = base.partition("-")
+                if not dash or "-" in last or not first.isdigit() or not last.isdigit():
+                    return False
+                start, end = int(first), int(last)
+                if start < low or end > high or start > end:
+                    return False
+            elif not base.isdigit() or not low <= int(base) <= high:
+                return False
+        return True
+
+    for expr, low, high in zip(fields[1:], (0, 1, 1, 0), (23, 31, 12, 7)):
+        if not valid_field(expr, low, high):
+            raise HTTPException(422, "Velero schedule contains an unsupported or out-of-range cron field")
+    return cron
+
+
+def _day2_velero_schedule(parameters: dict[str, Any]) -> tuple[str, str, str, list[str], list[str], bool, int]:
+    schedule_name = str(parameters.get("schedule_name") or "")
+    namespace = _namespace(str(parameters.get("namespace") or "velero"))
+    if not NAME_RE.fullmatch(schedule_name):
+        raise HTTPException(422, "invalid Velero Schedule name")
+    schedule = _validate_velero_schedule_cron(str(parameters.get("schedule") or ""))
+    included = parameters.get("included_namespaces", ["*"])
+    excluded = parameters.get("excluded_namespaces", [])
+    if not isinstance(included, list) or not included or len(included) > 64:
+        raise HTTPException(422, "included_namespaces must contain 1-64 namespace names or '*'")
+    if not isinstance(excluded, list) or len(excluded) > 64:
+        raise HTTPException(422, "excluded_namespaces must contain at most 64 namespace names")
+    if "*" in included and included != ["*"]:
+        raise HTTPException(422, "included_namespaces '*' must be used alone")
+    if "*" in excluded:
+        raise HTTPException(422, "excluded_namespaces cannot contain '*'")
+    for value in [*included, *excluded]:
+        if value != "*" and not NAME_RE.fullmatch(str(value)):
+            raise HTTPException(422, "invalid namespace in Velero schedule scope")
+    snapshot_volumes = parameters.get("snapshot_volumes", True)
+    if not isinstance(snapshot_volumes, bool):
+        raise HTTPException(422, "snapshot_volumes must be boolean")
+    ttl_hours = parameters.get("ttl_hours", 72)
+    if not isinstance(ttl_hours, int) or isinstance(ttl_hours, bool) or ttl_hours < 1 or ttl_hours > 8760:
+        raise HTTPException(422, "ttl_hours must be an integer between 1 and 8760")
+    return schedule_name, namespace, schedule, [str(x) for x in included], [str(x) for x in excluded], snapshot_volumes, ttl_hours
+
+
+def _velero_schedule_manifest(schedule_name: str, namespace: str, schedule: str, included: list[str], excluded: list[str], snapshot_volumes: bool, ttl_hours: int) -> dict[str, Any]:
+    template: dict[str, Any] = {
+        "includedNamespaces": included,
+        "snapshotVolumes": snapshot_volumes,
+        "ttl": f"{ttl_hours}h0m0s",
+    }
+    if excluded:
+        template["excludedNamespaces"] = excluded
+    return {
+        "apiVersion": "velero.io/v1",
+        "kind": "Schedule",
+        "metadata": {"name": schedule_name, "namespace": namespace},
+        "spec": {"schedule": schedule, "template": template},
+    }
+
+
+def _velero_schedule_patch(schedule: str, included: list[str], excluded: list[str], snapshot_volumes: bool, ttl_hours: int) -> str:
+    template: dict[str, Any] = {
+        "includedNamespaces": included,
+        "excludedNamespaces": excluded if excluded else None,
+        "snapshotVolumes": snapshot_volumes,
+        "ttl": f"{ttl_hours}h0m0s",
+    }
+    return json.dumps({"spec": {"schedule": schedule, "template": template}}, sort_keys=True, separators=(",", ":"))
+
+
+def _velero_schedule_state(snapshot: dict[str, Any], schedule_name: str, namespace: str) -> dict[str, Any]:
+    result = _run(["kubectl", "get", "schedules.velero.io", schedule_name, "-n", namespace, "-o", "json", "--ignore-not-found"], snapshot)
+    output = str(result.get("output") or "").strip()
+    if not output:
+        return {"exists": False, "schedule_name": schedule_name, "namespace": namespace}
+    try:
+        data = json.loads(output)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(502, "Velero Schedule state returned invalid JSON") from exc
+    metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+    spec = data.get("spec") if isinstance(data.get("spec"), dict) else {}
+    template = spec.get("template") if isinstance(spec.get("template"), dict) else {}
+    status = data.get("status") if isinstance(data.get("status"), dict) else {}
+    supported_spec = {"schedule", "template"}
+    supported_template = {"includedNamespaces", "excludedNamespaces", "snapshotVolumes", "ttl"}
+    validation_errors = status.get("validationErrors") if isinstance(status.get("validationErrors"), list) else []
+    return {
+        "exists": True,
+        "schedule_name": schedule_name,
+        "namespace": namespace,
+        "uid": metadata.get("uid"),
+        "resource_version": metadata.get("resourceVersion"),
+        "deletion_timestamp": metadata.get("deletionTimestamp"),
+        "schedule": spec.get("schedule"),
+        "included_namespaces": list(template.get("includedNamespaces") or []),
+        "excluded_namespaces": list(template.get("excludedNamespaces") or []),
+        "snapshot_volumes": template.get("snapshotVolumes"),
+        "ttl": template.get("ttl"),
+        "phase": status.get("phase"),
+        "validation_error_count": len(validation_errors),
+        "last_backup_present": bool(status.get("lastBackup")),
+        "unsupported_spec_fields": sorted(str(key) for key in spec if key not in supported_spec)[:32],
+        "unsupported_template_fields": sorted(str(key) for key in template if key not in supported_template)[:32],
+    }
+
+
+def _velero_schedule_state_matches_desired(state: dict[str, Any], schedule: str, included: list[str], excluded: list[str], snapshot_volumes: bool, ttl_hours: int) -> bool:
+    return (
+        str(state.get("schedule") or "") == schedule
+        and list(state.get("included_namespaces") or []) == included
+        and list(state.get("excluded_namespaces") or []) == excluded
+        and state.get("snapshot_volumes") is snapshot_volumes
+        and str(state.get("ttl") or "") == f"{ttl_hours}h0m0s"
+    )
+
+
+def _assert_velero_schedule_manageable(state: dict[str, Any], schedule_name: str) -> None:
+    if not state.get("exists"):
+        return
+    if state.get("deletion_timestamp"):
+        raise HTTPException(409, f"Velero Schedule {schedule_name} is being deleted")
+    if str(state.get("phase") or "") == "FailedValidation" or int(state.get("validation_error_count") or 0) > 0:
+        raise HTTPException(409, f"Velero Schedule {schedule_name} has validation failures")
+    if state.get("unsupported_spec_fields") or state.get("unsupported_template_fields"):
+        raise HTTPException(409, f"Velero Schedule {schedule_name} contains fields outside the bounded Hermes schedule contract")
 
 
 def _velero_manifest(backup_name: str, namespace: str, included: list[str], excluded: list[str], snapshot_volumes: bool, ttl_hours: int) -> dict[str, Any]:
@@ -1642,6 +1794,27 @@ def _day2_preview(snapshot: dict[str, Any], operation: str, parameters: dict[str
             "dry_run": dry_run,
             "secret_output_suppressed": True,
         }
+    if operation == "cluster.backup.schedule":
+        schedule_name, namespace, schedule, included, excluded, snapshot_volumes, ttl_hours = _day2_velero_schedule(parameters)
+        _enforce_velero_scope(snapshot, namespace, included, excluded)
+        before = _velero_schedule_state(snapshot, schedule_name, namespace)
+        _assert_velero_schedule_manageable(before, schedule_name)
+        dry_run = None
+        if not before.get("exists"):
+            manifest = _velero_schedule_manifest(schedule_name, namespace, schedule, included, excluded, snapshot_volumes, ttl_hours)
+            dry_run = _run(["kubectl", "create", "-f", "-", "--dry-run=server", "-o", "name"], snapshot, stdin=json.dumps(manifest, sort_keys=True, separators=(",", ":")))
+        elif not _velero_schedule_state_matches_desired(before, schedule, included, excluded, snapshot_volumes, ttl_hours):
+            patch = _velero_schedule_patch(schedule, included, excluded, snapshot_volumes, ttl_hours)
+            dry_run = _run(["kubectl", "patch", "schedules.velero.io", schedule_name, "-n", namespace, "--type=merge", "-p", patch, "--dry-run=server", "-o", "name"], snapshot)
+        return {
+            "kind": "kubernetes-day2-velero-schedule-preview",
+            "operation": operation,
+            "before": before,
+            "desired": {"schedule_name": schedule_name, "namespace": namespace, "schedule": schedule, "included_namespaces": included, "excluded_namespaces": excluded, "snapshot_volumes": snapshot_volumes, "ttl_hours": ttl_hours},
+            "preconditions": {"velero_schedule_state_hash": sha256_hex(before)},
+            "dry_run": dry_run,
+            "secret_output_suppressed": True,
+        }
     if operation == "cluster.restore":
         restore_name, backup_name, namespace, included, restore_pvs = _day2_velero_restore(parameters)
         _enforce_velero_restore_scope(snapshot, namespace, included, restore_pvs)
@@ -1734,6 +1907,15 @@ def _assert_day2_runtime_preconditions(snapshot: dict[str, Any], typed: dict[str
         expected = str(preconditions.get("velero_backup_state_hash") or "")
         if not expected or not hmac.compare_digest(sha256_hex(current), expected):
             raise HTTPException(409, "Velero Backup state changed after preview; create and approve a new ChangeSet")
+        return
+    if operation == "cluster.backup.schedule":
+        schedule_name, namespace, _, included, excluded, _, _ = _day2_velero_schedule(parameters)
+        _enforce_velero_scope(snapshot, namespace, included, excluded)
+        current = _velero_schedule_state(snapshot, schedule_name, namespace)
+        expected = str(preconditions.get("velero_schedule_state_hash") or "")
+        if not expected or not hmac.compare_digest(sha256_hex(current), expected):
+            raise HTTPException(409, "Velero Schedule state changed after preview; create and approve a new ChangeSet")
+        _assert_velero_schedule_manageable(current, schedule_name)
         return
     if operation == "cluster.restore":
         restore_name, backup_name, namespace, included, restore_pvs = _day2_velero_restore(parameters)
@@ -1845,6 +2027,34 @@ def _execute_day2(changeset_plan: dict[str, Any], preconditions: dict[str, Any])
         )
         checks.append(_verification_check("velero-backup-completed", completed, f"Velero Backup {backup_name} phase is {live.get('phase') or 'Unknown'}", {"backup_name": backup_name, "namespace": namespace, "phase": live.get("phase"), "warnings": int(live.get("warnings") or 0), "errors": int(live.get("errors") or 0), "volume_snapshots_attempted": snapshots_attempted, "volume_snapshots_completed": snapshots_completed}))
         result["backup"] = live
+    elif operation == "cluster.backup.schedule":
+        schedule_name, namespace, schedule, included, excluded, snapshot_volumes, ttl_hours = _day2_velero_schedule(parameters)
+        _enforce_velero_scope(snapshot, namespace, included, excluded)
+        before = _velero_schedule_state(snapshot, schedule_name, namespace)
+        _assert_velero_schedule_manageable(before, schedule_name)
+        if not before.get("exists"):
+            manifest = _velero_schedule_manifest(schedule_name, namespace, schedule, included, excluded, snapshot_volumes, ttl_hours)
+            result["command"] = _run(["kubectl", "create", "-f", "-", "-o", "name"], snapshot, stdin=json.dumps(manifest, sort_keys=True, separators=(",", ":")))
+            result["action"] = "created"
+        elif _velero_schedule_state_matches_desired(before, schedule, included, excluded, snapshot_volumes, ttl_hours):
+            result["command"] = {"returncode": 0, "output": "existing schedule reused", "duration": 0.0}
+            result["action"] = "unchanged"
+        else:
+            patch = _velero_schedule_patch(schedule, included, excluded, snapshot_volumes, ttl_hours)
+            result["command"] = _run(["kubectl", "patch", "schedules.velero.io", schedule_name, "-n", namespace, "--type=merge", "-p", patch, "-o", "name"], snapshot)
+            result["action"] = "updated"
+        live = _velero_schedule_state(snapshot, schedule_name, namespace)
+        ready = (
+            live.get("exists") is True
+            and not live.get("deletion_timestamp")
+            and str(live.get("phase") or "") != "FailedValidation"
+            and int(live.get("validation_error_count") or 0) == 0
+            and not live.get("unsupported_spec_fields")
+            and not live.get("unsupported_template_fields")
+            and _velero_schedule_state_matches_desired(live, schedule, included, excluded, snapshot_volumes, ttl_hours)
+        )
+        checks.append(_verification_check("velero-schedule-ready", ready, f"Velero Schedule {schedule_name} is configured for the approved recurring backup", {"schedule_name": schedule_name, "namespace": namespace, "schedule": schedule, "phase": live.get("phase"), "validation_error_count": int(live.get("validation_error_count") or 0), "last_backup_present": bool(live.get("last_backup_present")), "action": result["action"]}))
+        result["schedule"] = live
     elif operation == "cluster.restore":
         restore_name, backup_name, namespace, included, restore_pvs = _day2_velero_restore(parameters)
         _enforce_velero_restore_scope(snapshot, namespace, included, restore_pvs)
