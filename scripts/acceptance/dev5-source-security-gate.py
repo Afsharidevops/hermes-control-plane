@@ -211,12 +211,24 @@ for operation in (
     'cluster.node.cordon', 'cluster.node.uncordon', 'cluster.node.drain',
     'cluster.workload.restart', 'cluster.workload.scale',
     'cluster.addon.install', 'cluster.addon.upgrade', 'cluster.helm.apply',
+    'cluster.gitops.sync', 'cluster.cilium.upgrade',
 ):
     assert f'"{operation}"' in kube_broker, operation
 for forbidden in ('shell=True', 'os.system', 'kubectl exec', 'kubectl cp'):
     assert forbidden not in kube_broker, forbidden
 assert 'mutation_gate") != "changeset-exact-hash-approval"' in kube_broker
 assert 'raw_credentials_returned' in kube_broker
+for marker in (
+    'applications.argoproj.io',
+    'GitOps sync requires a full 40- or 64-character commit digest',
+    'Argo CD Application state changed after preview',
+    '--for=jsonpath={.status.sync.status}=Synced',
+    'Cilium upgrade must target release cilium in kube-system with a Cilium chart',
+    'hubble_provider.collect',
+    'cilium-ready',
+    'hubble-ready',
+):
+    assert marker in kube_broker, marker
 
 # Dev.5 active unified verification executes real read probes and never upgrades missing provider evidence to success.
 for marker in (

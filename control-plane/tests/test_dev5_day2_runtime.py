@@ -31,7 +31,7 @@ def client(tmp_path: Path):
         yield c
 
 
-def _cluster_and_target(client: TestClient) -> tuple[dict, dict]:
+def _cluster_and_target(client: TestClient, namespaces: list[str] | None = None) -> tuple[dict, dict]:
     env = client.post("/v1/environments", headers=ADMIN, json={"name": "Day2 Runtime", "risk_level": "HIGH"}).json()
     ssh = client.post(
         "/v1/internal/credential-refs/sync",
@@ -69,7 +69,7 @@ def _cluster_and_target(client: TestClient) -> tuple[dict, dict]:
     target = client.post(
         "/v1/targets",
         headers=ADMIN,
-        json={"name": "day2-k8s", "kind": "kubernetes", "environment_id": env["id"], "credential_ref": kube["id"], "connection_mode": "direct", "scope": {"namespace_allowlist": ["apps"], "cluster_read": True}},
+        json={"name": "day2-k8s", "kind": "kubernetes", "environment_id": env["id"], "credential_ref": kube["id"], "connection_mode": "direct", "scope": {"namespace_allowlist": namespaces or ["apps"], "cluster_read": True}},
     ).json()
     return cluster, target
 
@@ -170,3 +170,90 @@ def test_day2_runtime_rejects_missing_native_target_and_non_runtime_operation(cl
     )
     assert provider_only.status_code == 201, provider_only.text
     assert provider_only.json()["operation_job"]["executor"] == "cluster-provider-worker"
+
+
+def test_gitops_sync_is_runtime_bound_to_exact_revision_and_active_verification(client: TestClient, monkeypatch):
+    cluster, target = _cluster_and_target(client)
+    revision = "a" * 40
+    seen = []
+
+    async def fake_post(path: str, payload: dict) -> dict:
+        seen.append((path, payload))
+        if path == "/v1/day2/preview":
+            return {
+                "kind": "kubernetes-day2-gitops-preview",
+                "operation": "cluster.gitops.sync",
+                "before": {"application": "api", "namespace": "apps", "resource_version": "7", "sync_status": "OutOfSync"},
+                "desired": {"application": "api", "namespace": "apps", "revision": revision, "prune": True},
+                "preconditions": {"gitops_state_hash": "c" * 64},
+                "secret_output_suppressed": True,
+            }
+        assert path == "/v1/day2/execute"
+        return {
+            "schema_version": 1,
+            "operation": "cluster.gitops.sync",
+            "typed_plan_hash": payload["ticket"]["plan"]["parameters"]["typed_plan"]["plan_hash"],
+            "target_snapshot_hash": payload["ticket"]["plan"]["parameters"]["typed_plan"]["targets"][1]["snapshot_hash"],
+            "result": {"application": {"application": "api", "namespace": "apps", "observed_revision": revision, "sync_status": "Synced", "health_status": "Healthy"}},
+            "verification": {
+                "observed_at": 1787163000,
+                "checks": [
+                    {"id": "gitops-synced", "status": "PASS", "summary": "application synced to exact revision", "evidence": {"application": "api", "revision": revision}},
+                    {"id": "gitops-healthy", "status": "PASS", "summary": "application healthy", "evidence": {"application": "api", "health_status": "Healthy"}},
+                ],
+                "evidence": {"source": "kubernetes-broker-active-verification", "arbitrary_shell": False, "raw_credentials_returned": False},
+            },
+        }
+
+    monkeypatch.setattr(kubernetes_broker, "post", fake_post)
+    planned = client.post(
+        "/v1/operations-center/intents/plan",
+        headers=BOT,
+        json={"requested_by": "hermes-bot:gitops", "source_channel": "hermes-bot", "domain": "day2", "operation": "cluster.gitops.sync", "target_id": cluster["id"], "parameters": {"native_target_id": target["id"], "application": "api", "namespace": "apps", "revision": revision, "prune": True}},
+    )
+    assert planned.status_code == 201, planned.text
+    body = planned.json()
+    assert body["operation_job"]["executor"] == "kubernetes-broker"
+    assert body["operation_plan"]["plan"]["runtime_preview"]["preconditions"]["gitops_state_hash"] == "c" * 64
+    _approve(client, body["changeset"])
+    auth = client.post(f"/v1/operation-jobs/{body['operation_job']['id']}/authorize", headers=BOT).json()
+    executed = client.post(
+        f"/v1/operation-jobs/{body['operation_job']['id']}/execute",
+        headers=BOT,
+        json={"execution_ticket": auth["execution_ticket"], "signature": auth["signature"], "actor": "hermes-bot:gitops"},
+    )
+    assert executed.status_code == 200, executed.text
+    assert executed.json()["verification"]["status"] == "PASS"
+    assert [x[0] for x in seen] == ["/v1/day2/preview", "/v1/day2/execute"]
+
+
+def test_cilium_upgrade_is_trusted_kubernetes_runtime_and_wrong_gitops_revision_is_rejected(client: TestClient, monkeypatch):
+    cluster, target = _cluster_and_target(client, ["kube-system"])
+
+    async def fake_post(path: str, payload: dict) -> dict:
+        assert path == "/v1/day2/preview"
+        return {
+            "kind": "kubernetes-day2-helm-preview",
+            "operation": "cluster.cilium.upgrade",
+            "before": {"exists": True, "release": "cilium", "namespace": "kube-system", "revision": 4, "status": "deployed"},
+            "desired": {"release": "cilium", "chart": "cilium/cilium", "namespace": "kube-system", "version": "1.19.4"},
+            "preconditions": {"release_snapshot_hash": "d" * 64},
+            "secret_output_suppressed": True,
+        }
+
+    monkeypatch.setattr(kubernetes_broker, "post", fake_post)
+    planned = client.post(
+        "/v1/operations-center/intents/plan",
+        headers=BOT,
+        json={"requested_by": "hermes-bot:cilium", "source_channel": "hermes-bot", "domain": "day2", "operation": "cluster.cilium.upgrade", "target_id": cluster["id"], "parameters": {"native_target_id": target["id"], "release": "cilium", "chart": "cilium/cilium", "namespace": "kube-system", "version": "1.19.4"}},
+    )
+    assert planned.status_code == 201, planned.text
+    assert planned.json()["operation_job"]["executor"] == "kubernetes-broker"
+
+    bad = client.post(
+        "/v1/operations-center/intents/plan",
+        headers=BOT,
+        json={"requested_by": "hermes-bot:gitops", "source_channel": "hermes-bot", "domain": "day2", "operation": "cluster.gitops.sync", "target_id": cluster["id"], "parameters": {"native_target_id": target["id"], "application": "api", "namespace": "kube-system", "revision": "HEAD"}},
+    )
+    assert bad.status_code == 422
+    assert "commit digest" in bad.text

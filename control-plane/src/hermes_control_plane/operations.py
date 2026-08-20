@@ -124,6 +124,8 @@ KUBERNETES_DAY2_RUNTIME_OPERATIONS: dict[str, dict[str, Any]] = {
     "cluster.addon.install": {"executor": "kubernetes-broker", "verification": ["helm-release-ready"]},
     "cluster.addon.upgrade": {"executor": "kubernetes-broker", "verification": ["helm-release-ready"]},
     "cluster.helm.apply": {"executor": "kubernetes-broker", "verification": ["helm-release-ready"]},
+    "cluster.gitops.sync": {"executor": "kubernetes-broker", "verification": ["gitops-synced", "gitops-healthy"]},
+    "cluster.cilium.upgrade": {"executor": "kubernetes-broker", "verification": ["helm-release-ready", "cilium-ready", "hubble-ready"]},
 }
 
 
@@ -158,12 +160,28 @@ def validate_kubernetes_day2_parameters(operation: str, parameters: dict[str, An
             replicas = parameters.get("replicas")
             if not isinstance(replicas, int) or isinstance(replicas, bool) or replicas < 0 or replicas > 10000:
                 raise ValueError("replicas must be an integer between 0 and 10000")
+    elif operation == "cluster.gitops.sync":
+        for key in ("application", "namespace", "revision"):
+            if not str(parameters.get(key) or ""):
+                raise ValueError(f"{key} is required for GitOps sync")
+        revision = str(parameters.get("revision") or "")
+        if len(revision) not in {40, 64} or any(ch not in "0123456789abcdefABCDEF" for ch in revision):
+            raise ValueError("GitOps sync requires a full 40- or 64-character commit digest")
+        if "prune" in parameters and not isinstance(parameters["prune"], bool):
+            raise ValueError("prune must be boolean when provided")
     else:
         for key in ("release", "chart", "namespace", "version"):
             if not str(parameters.get(key) or ""):
                 raise ValueError(f"{key} is required for Helm-backed day-2 operations")
         if str(parameters.get("version")) in {"latest", "*"}:
             raise ValueError("Helm-backed day-2 operations require an explicit pinned version")
+        if operation == "cluster.cilium.upgrade":
+            if str(parameters.get("release")) != "cilium":
+                raise ValueError("Cilium upgrade requires release=cilium")
+            if str(parameters.get("namespace")) != "kube-system":
+                raise ValueError("Cilium upgrade requires namespace=kube-system")
+            if "cilium" not in str(parameters.get("chart") or "").lower():
+                raise ValueError("Cilium upgrade requires a Cilium Helm chart reference")
         values_yaml = parameters.get("values_yaml")
         if values_yaml is not None and not isinstance(values_yaml, str):
             raise ValueError("values_yaml must be a string when provided")

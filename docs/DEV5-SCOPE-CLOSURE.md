@@ -149,7 +149,7 @@ Governance and drift properties:
 - successful broker execution must return typed active verification checks; Hermes persists them and marks the operation plan VERIFIED only on PASS
 - broker failure, sensitive evidence, malformed verification or failed verification prevents a successful ChangeSet result
 
-This slice intentionally leaves `cluster.worker.add/remove/replace`, GitOps sync, Kubernetes/Cilium upgrade, etcd snapshot, restore/DR, certificate rotation, maintenance provider steps, decommission, infrastructure scale and template clone on their explicit provider-worker contracts. Those operations remain release-blocking until a real executor exists or the user explicitly defers them.
+This slice intentionally left `cluster.worker.add/remove/replace`, GitOps sync, Kubernetes/Cilium upgrade, etcd snapshot, restore/DR, certificate rotation, maintenance provider steps, decommission, infrastructure scale and template clone on their explicit provider-worker contracts at that point; Slice 8 closes the trusted Argo CD sync and Cilium-upgrade subset. Those operations remain release-blocking until a real executor exists or the user explicitly defers them.
 
 ## Slice 6 — Active unified cluster verification
 
@@ -211,3 +211,18 @@ OS/Python package repository metadata mirroring, and authenticated repository
 credential delivery remain release-blocking runtime work. Plans using unsupported
 protocol pairs are retained for compatibility but receive executor
 `artifact-mirror-contract` and cannot enter the trusted runtime execution path.
+
+
+## Slice 8 — Trusted GitOps sync + Cilium lifecycle runtime
+
+This slice extends the exact-preview-bound Kubernetes day-2 executor with two additional deterministic operations that do not require cloud/BMC credentials.
+
+### Argo CD GitOps sync
+
+`cluster.gitops.sync` now requires a same-environment Kubernetes target, an authorized Application namespace, an exact Argo CD `Application` name, and a full 40- or 64-character commit digest. Planning reads bounded Application state, validates the fixed merge patch with server-side dry-run, and binds the resulting Application state hash into the approved typed plan. Execution re-reads that state, rejects drift, applies only the fixed `Application.operation.sync` patch, waits for `status.sync.status=Synced`, and actively verifies both exact observed commit digest and Application health. No `argocd` CLI or arbitrary Kubernetes patch body is accepted from the caller.
+
+### Cilium upgrade
+
+`cluster.cilium.upgrade` now executes through the existing pinned Helm runtime only when the approved parameters target release `cilium`, namespace `kube-system`, a Cilium chart reference, and an explicit pinned version. The Helm release snapshot is exact-preview-bound before approval. After execution Hermes actively verifies Helm deployment state, Cilium agent Pod readiness, and sanitized Hubble Relay reachability through the trusted broker.
+
+This remains partial day-2/Cluster Factory closure. Worker lifecycle, Kubernetes version upgrades, etcd snapshot/restore, certificate rotation, provider maintenance/decommission, infrastructure scale, disaster recovery and template cloning still require real trusted provider/provisioner executors or explicit user-approved deferral. Broader Flux/non-Argo GitOps execution also remains open.

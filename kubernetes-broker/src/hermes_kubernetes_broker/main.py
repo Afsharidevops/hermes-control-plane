@@ -1152,6 +1152,8 @@ KUBERNETES_DAY2_OPERATIONS = {
     "cluster.addon.install",
     "cluster.addon.upgrade",
     "cluster.helm.apply",
+    "cluster.gitops.sync",
+    "cluster.cilium.upgrade",
 }
 
 
@@ -1224,6 +1226,58 @@ def _day2_helm(parameters: dict[str, Any]) -> tuple[str, str, str, str, str | No
     if values_yaml is not None and not isinstance(values_yaml, str):
         raise HTTPException(422, "values_yaml must be a string")
     return release, chart, namespace, version, values_yaml
+
+
+def _day2_argocd(parameters: dict[str, Any]) -> tuple[str, str, str, bool]:
+    application = str(parameters.get("application") or "")
+    namespace = _namespace(str(parameters.get("namespace") or "default"))
+    revision = str(parameters.get("revision") or "")
+    prune = parameters.get("prune", False)
+    if not NAME_RE.fullmatch(application):
+        raise HTTPException(422, "invalid Argo CD Application name")
+    if len(revision) not in {40, 64} or any(ch not in "0123456789abcdefABCDEF" for ch in revision):
+        raise HTTPException(422, "GitOps sync requires a full 40- or 64-character commit digest")
+    if not isinstance(prune, bool):
+        raise HTTPException(422, "prune must be boolean")
+    return application, namespace, revision, prune
+
+
+def _day2_argocd_state(snapshot: dict[str, Any], application: str, namespace: str) -> dict[str, Any]:
+    data = _run_json(["kubectl", "get", "applications.argoproj.io", application, "-n", namespace, "-o", "json"], snapshot)
+    metadata = data.get("metadata") or {}
+    spec = data.get("spec") or {}
+    source = spec.get("source") if isinstance(spec.get("source"), dict) else {}
+    status = data.get("status") or {}
+    sync = status.get("sync") if isinstance(status.get("sync"), dict) else {}
+    health = status.get("health") if isinstance(status.get("health"), dict) else {}
+    return {
+        "application": application,
+        "namespace": namespace,
+        "uid": metadata.get("uid"),
+        "resource_version": metadata.get("resourceVersion"),
+        "desired_revision": source.get("targetRevision"),
+        "observed_revision": sync.get("revision"),
+        "sync_status": sync.get("status"),
+        "health_status": health.get("status"),
+    }
+
+
+def _argocd_sync_patch(revision: str, prune: bool) -> str:
+    return json.dumps({"operation": {"sync": {"revision": revision, "prune": prune}}}, sort_keys=True, separators=(",", ":"))
+
+
+def _cilium_ready(snapshot: dict[str, Any], namespace: str) -> tuple[bool, dict[str, Any]]:
+    data = _run_json(["kubectl", "get", "pods", "-n", namespace, "-l", "k8s-app=cilium", "-o", "json"], snapshot)
+    items = data.get("items") if isinstance(data.get("items"), list) else []
+    unhealthy: list[str] = []
+    for pod in items:
+        metadata = pod.get("metadata") or {}
+        status = pod.get("status") or {}
+        conditions = status.get("conditions") if isinstance(status.get("conditions"), list) else []
+        ready = any(str(c.get("type")) == "Ready" and str(c.get("status")) == "True" for c in conditions if isinstance(c, dict))
+        if str(status.get("phase") or "") != "Running" or not ready:
+            unhealthy.append(str(metadata.get("name") or "unknown"))
+    return bool(items) and not unhealthy, {"visible_cilium_pods": len(items), "unhealthy_cilium_pods": unhealthy[:20]}
 
 
 def _node_unschedulable(snapshot: dict[str, Any], node: str) -> bool:
@@ -1301,7 +1355,25 @@ def _day2_preview(snapshot: dict[str, Any], operation: str, parameters: dict[str
             "preconditions": {"workload_state_hash": sha256_hex(before)},
             "secret_output_suppressed": True,
         }
+    if operation == "cluster.gitops.sync":
+        application, namespace, revision, prune = _day2_argocd(parameters)
+        _enforce_namespace(snapshot, namespace)
+        before = _day2_argocd_state(snapshot, application, namespace)
+        patch = _argocd_sync_patch(revision, prune)
+        dry_run = _run(["kubectl", "patch", "applications.argoproj.io", application, "-n", namespace, "--type=merge", "-p", patch, "--dry-run=server", "-o", "name"], snapshot)
+        return {
+            "kind": "kubernetes-day2-gitops-preview",
+            "operation": operation,
+            "before": before,
+            "desired": {"application": application, "namespace": namespace, "revision": revision, "prune": prune},
+            "preconditions": {"gitops_state_hash": sha256_hex(before)},
+            "dry_run": dry_run,
+            "secret_output_suppressed": True,
+        }
     release, chart, namespace, version, values_yaml = _day2_helm(parameters)
+    if operation == "cluster.cilium.upgrade":
+        if release != "cilium" or namespace != "kube-system" or "cilium" not in chart.lower():
+            raise HTTPException(422, "Cilium upgrade must target release cilium in kube-system with a Cilium chart")
     _enforce_namespace(snapshot, namespace)
     before = _helm_release_snapshot(snapshot, release, namespace)
     args = ["helm", "upgrade", release, chart, "--install", "--namespace", namespace, "--create-namespace", "--version", version, "--wait", "--timeout", "5m"]
@@ -1353,6 +1425,14 @@ def _assert_day2_runtime_preconditions(snapshot: dict[str, Any], typed: dict[str
         expected = str(preconditions.get("workload_state_hash") or "")
         if not expected or not hmac.compare_digest(sha256_hex(current), expected):
             raise HTTPException(409, "workload state changed after preview; create and approve a new ChangeSet")
+        return
+    if operation == "cluster.gitops.sync":
+        application, namespace, _, _ = _day2_argocd(parameters)
+        _enforce_namespace(snapshot, namespace)
+        current = _day2_argocd_state(snapshot, application, namespace)
+        expected = str(preconditions.get("gitops_state_hash") or "")
+        if not expected or not hmac.compare_digest(sha256_hex(current), expected):
+            raise HTTPException(409, "Argo CD Application state changed after preview; create and approve a new ChangeSet")
         return
     release, _, namespace, _, _ = _day2_helm(parameters)
     _enforce_namespace(snapshot, namespace)
@@ -1415,9 +1495,23 @@ def _execute_day2(changeset_plan: dict[str, Any], preconditions: dict[str, Any])
         result["rollout"] = rollout
         checks.append(_verification_check("replicas-converged", desired == replicas and ready == replicas, f"{kind}/{name} replicas converged", {"desired": desired, "ready": ready, "requested": replicas}))
         checks.append(_verification_check("rollout-complete", True, f"{kind}/{name} rollout completed", {"kind": kind, "name": name, "namespace": namespace}))
+    elif operation == "cluster.gitops.sync":
+        application, namespace, revision, prune = _day2_argocd(parameters)
+        _enforce_namespace(snapshot, namespace)
+        patch = _argocd_sync_patch(revision, prune)
+        result["command"] = _run(["kubectl", "patch", "applications.argoproj.io", application, "-n", namespace, "--type=merge", "-p", patch, "-o", "name"], snapshot)
+        result["sync_wait"] = _run(["kubectl", "wait", "applications.argoproj.io", application, "-n", namespace, "--for=jsonpath={.status.sync.status}=Synced", "--timeout=5m"], snapshot, timeout=max(COMMAND_TIMEOUT, 360))
+        live = _day2_argocd_state(snapshot, application, namespace)
+        synced = str(live.get("sync_status") or "") == "Synced" and str(live.get("observed_revision") or "") == revision
+        healthy = str(live.get("health_status") or "") in {"Healthy", "Progressing"}
+        checks.append(_verification_check("gitops-synced", synced, f"Argo CD Application {application} is synced to the approved revision", {"application": application, "namespace": namespace, "revision": revision, "sync_status": live.get("sync_status")}))
+        checks.append(_verification_check("gitops-healthy", healthy, f"Argo CD Application {application} health is {live.get('health_status') or 'Unknown'}", {"application": application, "namespace": namespace, "health_status": live.get("health_status")}))
+        result["application"] = live
     else:
         release, chart, namespace, version, values_yaml = _day2_helm(parameters)
         _enforce_namespace(snapshot, namespace)
+        if operation == "cluster.cilium.upgrade" and (release != "cilium" or namespace != "kube-system" or "cilium" not in chart.lower()):
+            raise HTTPException(422, "Cilium upgrade must target release cilium in kube-system with a Cilium chart")
         args = ["helm", "upgrade", release, chart, "--install", "--namespace", namespace, "--create-namespace", "--version", version, "--wait", "--timeout", "5m"]
         values_path: Path | None = None
         try:
@@ -1434,6 +1528,18 @@ def _execute_day2(changeset_plan: dict[str, Any], preconditions: dict[str, Any])
         ready = status_name in {"deployed", "superseded"}
         checks.append(_verification_check("helm-release-ready", ready, f"Helm release {release} status is {status_name or 'unknown'}", {"release": release, "namespace": namespace, "version": version, "status": status_name}))
         result["release"] = {"release": release, "namespace": namespace, "chart": chart, "version": version, "status": status_name}
+        if operation == "cluster.cilium.upgrade":
+            cilium_ok, cilium_evidence = _cilium_ready(snapshot, namespace)
+            checks.append(_verification_check("cilium-ready", cilium_ok, "Cilium agent pods are Ready after the approved Helm upgrade", cilium_evidence))
+            try:
+                hubble = hubble_provider.collect(snapshot=snapshot, env=_env(snapshot), last=20, since_seconds=60)
+                hubble_summary = hubble.get("summary") if isinstance(hubble.get("summary"), dict) else {}
+                hubble_ok = hubble.get("raw_flow_bodies_returned") is False
+                hubble_evidence = {"event_count": int(hubble_summary.get("event_count") or 0), "verdict_counts": dict(hubble_summary.get("verdict_counts") or {}), "raw_flow_bodies_returned": False}
+            except hubble_provider.HubbleError as exc:
+                hubble_ok = False
+                hubble_evidence = {"collector_error": str(exc)[:400], "raw_flow_bodies_returned": False}
+            checks.append(_verification_check("hubble-ready", hubble_ok, "Hubble Relay is reachable through the trusted broker after the Cilium upgrade", hubble_evidence))
 
     observed_at = int(time.time())
     return {

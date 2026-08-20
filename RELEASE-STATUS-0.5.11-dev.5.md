@@ -31,10 +31,12 @@ Do not amend, reset, squash, force-push, move or recreate the frozen dev.4 tag.
 - day-2 runtime planning now binds a broker-produced read-only live preview/precondition into the exact typed plan before approval, rejects live-state drift at execution, and persists active typed verification automatically
 - active unified cluster verification engine that executes live Kubernetes Broker probes, persists typed PASS/WARN/FAIL/SKIP results, optionally checks configured Radar health, and explicitly SKIPs unsupported provider/host/etcd/agent probes rather than inventing evidence
 - ChangeSet-governed artifact blob synchronization runtime for controlled `file://` or allowlisted `https://` sources into the local mirror root, with byte/time bounds, redirect/root/symlink rejection, atomic writes, idempotent retries and independent source/destination SHA-256 verification
+- trusted Argo CD GitOps sync runtime bound to a full approved commit digest, with Application state-drift rejection, fixed server-side patching, sync wait and active sync/health verification
+- trusted pinned Cilium Helm upgrade runtime with exact release-state preconditions plus active Helm, Cilium-agent and sanitized Hubble verification
 
 ## Still release-blocking for dev.5 scope closure
 
-- remaining day-2/provider operations not covered by the trusted Kubernetes runtime (worker lifecycle, GitOps sync, Kubernetes/Cilium upgrades, etcd snapshot, restore/DR, certificate rotation, decommission)
+- remaining day-2/provider operations not covered by the trusted Kubernetes runtime (worker lifecycle, Kubernetes upgrades, etcd snapshot, restore/DR, certificate rotation, decommission; broader non-Argo GitOps remains open)
 - Cluster Factory runtime/repeatability closure
 - provider/bare-metal/network executors or explicit user-approved deferral
 - remaining air-gap protocol closure: OCI registry-to-registry copy, Helm OCI publication, package-repository metadata sync and authenticated repository credential delivery

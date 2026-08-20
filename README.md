@@ -198,3 +198,6 @@ For 9router, `hermesctl` also reconciles the routing objects expected by Router 
 - Dev.5 Hubble runtime slice: trusted Kubernetes Broker collector, pinned Hubble CLI, namespace authorization, typed redaction/aggregation, bounded history, SSE, and Hermes-native Network Live batch UI.
 
 - trusted Kubernetes day-2 runtime for cordon/uncordon/drain, workload restart/scale and pinned Helm-backed operations with exact live-preview preconditions and active verification
+
+### 0.5.11-dev.5 day-2 extension
+Hermes now also supports ChangeSet-governed exact-commit Argo CD sync and pinned Cilium Helm upgrades through the trusted Kubernetes Broker, with precondition-drift rejection and active verification. Broader provider/provisioner lifecycle remains in progress.

@@ -345,3 +345,7 @@ R2 must now be overlaid on the same branch and tested with execution disabled. E
 - Dev.5 Hubble runtime slice: trusted Kubernetes Broker collector, pinned Hubble CLI, namespace authorization, typed redaction/aggregation, bounded history, SSE, and Hermes-native Network Live batch UI.
 
 - Dev.5 trusted Kubernetes day-2 runtime slice: exact live-preview-bound node cordon/uncordon/drain, workload restart/scale and pinned Helm-backed add-on/apply execution through Kubernetes Broker with drift rejection and persisted active verification.
+
+
+## 0.5.11-dev.5 GitOps/Cilium runtime slice
+Exact-commit Argo CD Application sync and pinned Cilium Helm upgrade are executable through the trusted Kubernetes Broker with exact preview binding, drift rejection and active verification. Remaining worker/Kubernetes-upgrade/etcd/restore/provider lifecycle is still release-blocking.

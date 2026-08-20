@@ -102,6 +102,9 @@ assert "HERMES_ARTIFACT_HTTPS_HOST_ALLOWLIST" in services["control-plane"]["envi
 assert values["controlPlane"]["artifactMirror"]["maxBytes"] == 536870912
 assert values["controlPlane"]["artifactMirror"]["timeoutSeconds"] == 60
 assert (ROOT / "kubernetes-broker/tests/test_day2_runtime.py").is_file()
+day2_tests = (ROOT / "kubernetes-broker/tests/test_day2_runtime.py").read_text() + (ROOT / "control-plane/tests/test_dev5_day2_runtime.py").read_text()
+assert "cluster.gitops.sync" in day2_tests
+assert "cluster.cilium.upgrade" in day2_tests
 assert (ROOT / "control-plane/src/hermes_control_plane/operator_center.py").is_file()
 assert (ROOT / "kubernetes-broker/src/hermes_kubernetes_broker/hubble.py").is_file()
 assert (ROOT / "kubernetes-broker/src/hermes_kubernetes_broker/diagnostics.py").is_file()

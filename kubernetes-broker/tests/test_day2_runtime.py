@@ -105,3 +105,89 @@ def test_day2_rejects_tampered_typed_plan_and_unpinned_helm():
     with pytest.raises(Exception) as exc:
         main._day2_helm({"release": "cilium", "chart": "cilium/cilium", "namespace": "kube-system", "version": "latest"})
     assert "pinned" in str(exc.value).lower()
+
+
+def _typed_with_namespaces(operation: str, parameters: dict, runtime_preview: dict, namespaces: list[str]) -> dict:
+    typed = _typed(operation, parameters, runtime_preview)
+    typed["targets"][1]["scope"]["namespace_allowlist"] = namespaces
+    unhashed = dict(typed)
+    unhashed.pop("plan_hash", None)
+    typed["plan_hash"] = main.sha256_hex(unhashed)
+    return typed
+
+
+def test_gitops_sync_uses_fixed_argocd_patch_and_exact_revision_verification(monkeypatch):
+    calls = []
+    revision = "a" * 40
+    monkeypatch.setattr(main, "_kubectl_toolchain", lambda snapshot, refresh=False: {"binding_hash": "x"})
+    states = iter([
+        {"metadata": {"uid": "app-uid", "resourceVersion": "7"}, "spec": {"source": {"targetRevision": revision}}, "status": {"sync": {"revision": "b" * 40, "status": "OutOfSync"}, "health": {"status": "Healthy"}}},
+        {"metadata": {"uid": "app-uid", "resourceVersion": "8"}, "spec": {"source": {"targetRevision": revision}}, "status": {"sync": {"revision": revision, "status": "Synced"}, "health": {"status": "Healthy"}}},
+    ])
+
+    def fake_run(args, snapshot, stdin=None, timeout=None, allowed_codes=None):
+        calls.append(args)
+        return {"returncode": 0, "output": "application.argoproj.io/api", "duration": 0.01}
+
+    def fake_json(args, snapshot, stdin=None, timeout=None, allowed_codes=None):
+        calls.append(args)
+        return next(states)
+
+    monkeypatch.setattr(main, "_run", fake_run)
+    monkeypatch.setattr(main, "_run_json", fake_json)
+    before = {"application": "api", "namespace": "apps", "uid": "app-uid", "resource_version": "7", "desired_revision": revision, "observed_revision": "b" * 40, "sync_status": "OutOfSync", "health_status": "Healthy"}
+    preview = {"preconditions": {"gitops_state_hash": main.sha256_hex(before)}}
+    typed = _typed_with_namespaces("cluster.gitops.sync", {"native_target_id": "tgt_test", "application": "api", "namespace": "apps", "revision": revision, "prune": True}, preview, ["apps"])
+    result = main._execute_day2(_changeset(typed), {"executor": "kubernetes-broker"})
+    patch_calls = [args for args in calls if args[:3] == ["kubectl", "patch", "applications.argoproj.io"]]
+    assert len(patch_calls) == 1
+    assert '"revision":"' + revision + '"' in patch_calls[0][patch_calls[0].index("-p") + 1]
+    assert ["kubectl", "wait", "applications.argoproj.io", "api", "-n", "apps", "--for=jsonpath={.status.sync.status}=Synced", "--timeout=5m"] in calls
+    checks = {item["id"]: item for item in result["verification"]["checks"]}
+    assert checks["gitops-synced"]["status"] == "PASS"
+    assert checks["gitops-healthy"]["status"] == "PASS"
+
+
+def test_cilium_upgrade_is_pinned_and_actively_verifies_cilium_and_hubble(monkeypatch):
+    calls = []
+    monkeypatch.setattr(main, "_kubectl_toolchain", lambda snapshot, refresh=False: {"binding_hash": "x"})
+    before = {"exists": True, "release": "cilium", "namespace": "kube-system", "revision": 4, "status": {"info": {"status": "deployed"}}}
+
+    def fake_run(args, snapshot, stdin=None, timeout=None, allowed_codes=None):
+        calls.append(args)
+        if args[:2] == ["helm", "list"]:
+            return {"returncode": 0, "output": '[{"revision":"4"}]', "duration": 0.01}
+        if args[:2] == ["helm", "status"]:
+            return {"returncode": 0, "output": '{"info":{"status":"deployed"}}', "duration": 0.01}
+        return {"returncode": 0, "output": "ok", "duration": 0.01}
+
+    json_states = iter([
+        {"info": {"status": "deployed"}},
+        {"items": [{"metadata": {"name": "cilium-abc"}, "status": {"phase": "Running", "conditions": [{"type": "Ready", "status": "True"}]}}]},
+    ])
+
+    def fake_json(args, snapshot, stdin=None, timeout=None, allowed_codes=None):
+        calls.append(args)
+        return next(json_states)
+
+    monkeypatch.setattr(main, "_run", fake_run)
+    monkeypatch.setattr(main, "_run_json", fake_json)
+    monkeypatch.setattr(main.hubble_provider, "collect", lambda **kwargs: {"summary": {"event_count": 3, "verdict_counts": {"FORWARDED": 3}}, "raw_flow_bodies_returned": False})
+    preview = {"preconditions": {"release_snapshot_hash": main._helm_snapshot_hash(before)}}
+    params = {"native_target_id": "tgt_test", "release": "cilium", "chart": "cilium/cilium", "namespace": "kube-system", "version": "1.19.4"}
+    typed = _typed_with_namespaces("cluster.cilium.upgrade", params, preview, ["kube-system"])
+    result = main._execute_day2(_changeset(typed), {"executor": "kubernetes-broker"})
+    assert ["helm", "upgrade", "cilium", "cilium/cilium", "--install", "--namespace", "kube-system", "--create-namespace", "--version", "1.19.4", "--wait", "--timeout", "5m"] in calls
+    checks = {item["id"]: item for item in result["verification"]["checks"]}
+    assert checks["helm-release-ready"]["status"] == "PASS"
+    assert checks["cilium-ready"]["status"] == "PASS"
+    assert checks["hubble-ready"]["status"] == "PASS"
+
+
+def test_gitops_and_cilium_reject_unpinned_or_wrong_targets():
+    with pytest.raises(Exception) as exc:
+        main._day2_argocd({"application": "api", "namespace": "apps", "revision": "HEAD"})
+    assert "commit digest" in str(exc.value).lower()
+    with pytest.raises(Exception) as exc:
+        main._day2_preview({"kind": "kubernetes", "status": "configured", "connection_mode": "agent", "scope": {"namespace_allowlist": ["kube-system"], "cluster_read": True}}, "cluster.cilium.upgrade", {"release": "not-cilium", "chart": "cilium/cilium", "namespace": "kube-system", "version": "1.19.4"})
+    assert "cilium upgrade" in str(exc.value).lower()

@@ -44,7 +44,7 @@ GROUPS: list[dict[str, Any]] = [
             _surface("kubernetes.logs", "Logs", "PARTIAL", "provider-dependent", "Dedicated workload-log runtime is not yet exposed through the Hermes read adapter."),
             _surface("kubernetes.timeline", "Timeline", "PARTIAL", "audit/events/provider-dependent", "Hermes audit and warning-event correlation are available; full change timeline remains partial."),
             _surface("kubernetes.helm", "Helm", "PARTIAL", "governed Kubernetes Broker", "Helm mutation runtime exists behind ChangeSets; dedicated read/history UI remains partial."),
-            _surface("kubernetes.gitops", "GitOps", "PARTIAL", "Argo CD diagnostics + typed GitOps plans", "Argo CD health is executable; broader Argo/Flux runtime remains partial."),
+            _surface("kubernetes.gitops", "GitOps", "PARTIAL", "Argo CD diagnostics + governed sync runtime", "Argo CD Application sync to an exact commit digest is executable; broader Argo/Flux runtime remains partial."),
             _surface("kubernetes.cost", "Cost", "CONTRACT_ONLY", "OpenCost add-on contract", "OpenCost is modeled but dedicated cost runtime/UI data is not complete."),
             _surface("kubernetes.tls", "TLS", "LIVE", "native diagnostics", "Ingress TLS and cert-manager compatibility findings.", action="diagnostics"),
             _surface("kubernetes.security", "Security", "LIVE", "native diagnostics", "Privileged/capability/hostPath/exposure/webhook baseline checks.", action="diagnostics"),
@@ -85,7 +85,7 @@ GROUPS: list[dict[str, Any]] = [
         "surfaces": [
             _surface("operations.diagnostics", "Diagnostics", "LIVE", "native diagnostics + active unified verification", "Executable read-only diagnostic engine plus persisted active cluster verification.", action="diagnostics"),
             _surface("operations.deployments", "Deployments", "PARTIAL", "ChangeSets + operation jobs", "Governed plans/jobs are visible; broader executor closure remains."),
-            _surface("operations.upgrades", "Upgrades", "PARTIAL", "UpgradePlan + day-2 contracts", "Upgrade planning exists; repeatable execution/verification remains."),
+            _surface("operations.upgrades", "Upgrades", "PARTIAL", "UpgradePlan + trusted Cilium upgrade runtime", "Pinned Cilium Helm upgrade with active Cilium/Hubble verification is executable; Kubernetes/provider upgrades remain partial."),
             _surface("operations.backups", "Backups", "PARTIAL", "BackupPlan + verification models", "Backup planning exists; active backup/restore execution remains."),
             _surface("operations.recovery", "Recovery", "CONTRACT_ONLY", "restore/DR operation contracts", "Recovery UI/contract exists; active runtime remains release-blocking."),
             _surface("operations.maintenance", "Maintenance", "CONTRACT_ONLY", "day-2 operation contracts", "Maintenance UI/contract exists; executor runtime remains release-blocking."),

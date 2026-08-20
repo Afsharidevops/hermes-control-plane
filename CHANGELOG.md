@@ -134,3 +134,5 @@
 - added runtime-selectable 9router/OmniRoute gateway
 - added Docker Compose and initial Helm deployment
 - introduced isolated `hermes-control-plane-*` Docker image naming
+
+- 0.5.11-dev.5: add exact-commit Argo CD GitOps sync and pinned Cilium upgrade execution through the trusted Kubernetes Broker with drift-bound previews and active verification.
