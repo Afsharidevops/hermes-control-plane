@@ -29,6 +29,7 @@ artifact_mirror = text("control-plane/src/hermes_control_plane/artifact_mirror.p
 operator_center = text("control-plane/src/hermes_control_plane/operator_center.py")
 ui = text("control-plane/src/hermes_control_plane/static/index.html")
 tickets = text("control-plane/src/hermes_control_plane/tickets.py")
+risk = text("control-plane/src/hermes_control_plane/risk.py")
 radar = text("control-plane/src/hermes_control_plane/radar.py")
 hubble = text("kubernetes-broker/src/hermes_kubernetes_broker/hubble.py")
 diagnostics = text("kubernetes-broker/src/hermes_kubernetes_broker/diagnostics.py")
@@ -211,13 +212,14 @@ for operation in (
     'cluster.node.cordon', 'cluster.node.uncordon', 'cluster.node.drain',
     'cluster.workload.restart', 'cluster.workload.scale',
     'cluster.addon.install', 'cluster.addon.upgrade', 'cluster.helm.apply',
-    'cluster.gitops.sync', 'cluster.cilium.upgrade', 'cluster.backup.velero',
+    'cluster.gitops.sync', 'cluster.cilium.upgrade', 'cluster.backup.velero', 'cluster.restore',
 ):
     assert f'"{operation}"' in kube_broker, operation
 for forbidden in ('shell=True', 'os.system', 'kubectl exec', 'kubectl cp'):
     assert forbidden not in kube_broker, forbidden
 assert 'mutation_gate") != "changeset-exact-hash-approval"' in kube_broker
 assert 'raw_credentials_returned' in kube_broker
+assert '"restore"' in risk and '"disaster-recovery"' in risk
 for marker in (
     'applications.argoproj.io',
     'GitOps sync requires a full 40- or 64-character commit digest',
@@ -232,6 +234,12 @@ for marker in (
     'different approved specification',
     '--for=jsonpath={.status.phase}=Completed',
     'velero-backup-completed',
+    'restores.velero.io',
+    'Velero restore source Backup changed after preview',
+    'Velero Restore state changed after preview',
+    'existingResourcePolicy',
+    'velero-restore-source-bound',
+    'velero-restore-completed',
 ):
     assert marker in kube_broker, marker
 

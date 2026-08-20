@@ -128,6 +128,7 @@ KUBERNETES_DAY2_RUNTIME_OPERATIONS: dict[str, dict[str, Any]] = {
     "cluster.gitops.sync": {"executor": "kubernetes-broker", "verification": ["gitops-synced", "gitops-healthy"]},
     "cluster.cilium.upgrade": {"executor": "kubernetes-broker", "verification": ["helm-release-ready", "cilium-ready", "hubble-ready"]},
     "cluster.backup.velero": {"executor": "kubernetes-broker", "verification": ["velero-backup-completed"]},
+    "cluster.restore": {"executor": "kubernetes-broker", "verification": ["velero-restore-source-bound", "velero-restore-completed"]},
 }
 
 
@@ -194,6 +195,23 @@ def validate_kubernetes_day2_parameters(operation: str, parameters: dict[str, An
         ttl_hours = parameters.get("ttl_hours", 72)
         if not isinstance(ttl_hours, int) or isinstance(ttl_hours, bool) or ttl_hours < 1 or ttl_hours > 8760:
             raise ValueError("ttl_hours must be an integer between 1 and 8760")
+    elif operation == "cluster.restore":
+        for key in ("restore_name", "backup_name"):
+            value = str(parameters.get(key) or "")
+            if not value or len(value) > 253:
+                raise ValueError(f"{key} is required for Velero restore")
+        namespace = str(parameters.get("namespace") or "velero")
+        if not namespace or len(namespace) > 253:
+            raise ValueError("namespace is required for Velero restore")
+        included = parameters.get("included_namespaces")
+        if not isinstance(included, list) or not included or len(included) > 32:
+            raise ValueError("included_namespaces must contain 1-32 explicit namespaces for Velero restore")
+        if any(not isinstance(item, str) or not item or len(item) > 253 or item == "*" for item in included):
+            raise ValueError("Velero restore requires explicit namespace names; '*' is not allowed")
+        if len(set(included)) != len(included):
+            raise ValueError("included_namespaces must not contain duplicates")
+        if "restore_pvs" in parameters and not isinstance(parameters["restore_pvs"], bool):
+            raise ValueError("restore_pvs must be boolean when provided")
     else:
         for key in ("release", "chart", "namespace", "version"):
             if not str(parameters.get(key) or ""):

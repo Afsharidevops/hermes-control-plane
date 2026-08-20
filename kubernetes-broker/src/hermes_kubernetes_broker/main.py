@@ -1155,6 +1155,7 @@ KUBERNETES_DAY2_OPERATIONS = {
     "cluster.gitops.sync",
     "cluster.cilium.upgrade",
     "cluster.backup.velero",
+    "cluster.restore",
 }
 
 
@@ -1364,6 +1365,137 @@ def _enforce_velero_scope(snapshot: dict[str, Any], velero_namespace: str, inclu
         _enforce_namespace(snapshot, namespace)
 
 
+def _day2_velero_restore(parameters: dict[str, Any]) -> tuple[str, str, str, list[str], bool]:
+    restore_name = str(parameters.get("restore_name") or "")
+    backup_name = str(parameters.get("backup_name") or "")
+    namespace = _namespace(str(parameters.get("namespace") or "velero"))
+    if not NAME_RE.fullmatch(restore_name):
+        raise HTTPException(422, "invalid Velero Restore name")
+    if not NAME_RE.fullmatch(backup_name):
+        raise HTTPException(422, "invalid Velero Backup name for restore")
+    included = parameters.get("included_namespaces")
+    if not isinstance(included, list) or not included or len(included) > 32:
+        raise HTTPException(422, "included_namespaces must contain 1-32 explicit namespaces for Velero restore")
+    normalized: list[str] = []
+    for value in included:
+        if not isinstance(value, str) or value == "*" or not NAME_RE.fullmatch(value):
+            raise HTTPException(422, "Velero restore requires explicit DNS-safe namespace names; '*' is not allowed")
+        normalized.append(value)
+    if len(set(normalized)) != len(normalized):
+        raise HTTPException(422, "included_namespaces must not contain duplicates")
+    restore_pvs = parameters.get("restore_pvs", False)
+    if not isinstance(restore_pvs, bool):
+        raise HTTPException(422, "restore_pvs must be boolean")
+    return restore_name, backup_name, namespace, normalized, restore_pvs
+
+
+def _velero_restore_manifest(restore_name: str, backup_name: str, namespace: str, included: list[str], restore_pvs: bool) -> dict[str, Any]:
+    spec: dict[str, Any] = {
+        "backupName": backup_name,
+        "includedNamespaces": included,
+        "restorePVs": restore_pvs,
+        "preserveNodePorts": False,
+        "existingResourcePolicy": "none",
+    }
+    if not restore_pvs:
+        spec["includeClusterResources"] = False
+    return {
+        "apiVersion": "velero.io/v1",
+        "kind": "Restore",
+        "metadata": {"name": restore_name, "namespace": namespace},
+        "spec": spec,
+    }
+
+
+def _velero_restore_state(snapshot: dict[str, Any], restore_name: str, namespace: str) -> dict[str, Any]:
+    result = _run(["kubectl", "get", "restores.velero.io", restore_name, "-n", namespace, "-o", "json", "--ignore-not-found"], snapshot)
+    output = str(result.get("output") or "").strip()
+    if not output:
+        return {"exists": False, "restore_name": restore_name, "namespace": namespace}
+    try:
+        data = json.loads(output)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(502, "Velero Restore state returned invalid JSON") from exc
+    metadata = data.get("metadata") or {}
+    spec = data.get("spec") or {}
+    status = data.get("status") or {}
+    validation_errors = status.get("validationErrors") if isinstance(status.get("validationErrors"), list) else []
+    return {
+        "exists": True,
+        "restore_name": restore_name,
+        "namespace": namespace,
+        "uid": metadata.get("uid"),
+        "resource_version": metadata.get("resourceVersion"),
+        "deletion_timestamp": metadata.get("deletionTimestamp"),
+        "backup_name": spec.get("backupName"),
+        "included_namespaces": list(spec.get("includedNamespaces") or []),
+        "restore_pvs": spec.get("restorePVs"),
+        "include_cluster_resources": spec.get("includeClusterResources"),
+        "preserve_node_ports": spec.get("preserveNodePorts"),
+        "existing_resource_policy": spec.get("existingResourcePolicy"),
+        "phase": status.get("phase"),
+        "warnings": int(status.get("warnings") or 0),
+        "errors": int(status.get("errors") or 0),
+        "validation_error_count": len(validation_errors),
+        "item_operations_attempted": int(status.get("restoreItemOperationsAttempted") or 0),
+        "item_operations_completed": int(status.get("restoreItemOperationsCompleted") or 0),
+        "item_operations_failed": int(status.get("restoreItemOperationsFailed") or 0),
+        "failure_reason_present": bool(status.get("failureReason")),
+    }
+
+
+def _velero_restore_state_matches_desired(state: dict[str, Any], backup_name: str, included: list[str], restore_pvs: bool) -> bool:
+    cluster_resources_ok = state.get("include_cluster_resources") in ({None, False} if restore_pvs else {False})
+    return (
+        str(state.get("backup_name") or "") == backup_name
+        and list(state.get("included_namespaces") or []) == included
+        and state.get("restore_pvs") is restore_pvs
+        and state.get("preserve_node_ports") is False
+        and str(state.get("existing_resource_policy") or "none") == "none"
+        and cluster_resources_ok
+    )
+
+
+def _assert_velero_restore_reusable(state: dict[str, Any], restore_name: str, backup_name: str, included: list[str], restore_pvs: bool) -> None:
+    if not state.get("exists"):
+        return
+    if state.get("deletion_timestamp"):
+        raise HTTPException(409, f"Velero Restore {restore_name} is being deleted")
+    phase = str(state.get("phase") or "")
+    if phase in {"Failed", "FailedValidation", "PartiallyFailed", "WaitingForPluginOperationsPartiallyFailed"}:
+        raise HTTPException(409, f"Velero Restore {restore_name} already exists in terminal or partial-failure phase {phase}")
+    if not _velero_restore_state_matches_desired(state, backup_name, included, restore_pvs):
+        raise HTTPException(409, f"Velero Restore {restore_name} already exists with a different approved specification")
+
+
+def _assert_velero_backup_restore_source(state: dict[str, Any], backup_name: str, included: list[str]) -> None:
+    if not state.get("exists"):
+        raise HTTPException(409, f"Velero Backup {backup_name} does not exist")
+    if state.get("deletion_timestamp"):
+        raise HTTPException(409, f"Velero Backup {backup_name} is being deleted")
+    if str(state.get("phase") or "") != "Completed" or int(state.get("errors") or 0) != 0:
+        raise HTTPException(409, f"Velero Backup {backup_name} must be Completed with zero errors before restore")
+    source_included = [str(x) for x in (state.get("included_namespaces") or [])]
+    source_excluded = [str(x) for x in (state.get("excluded_namespaces") or [])]
+    if any(any(ch in value for ch in "?[") for value in [*source_included, *source_excluded]):
+        raise HTTPException(409, "Velero restore source uses namespace glob patterns that Hermes does not safely authorize")
+    if source_included and "*" not in source_included:
+        missing = [namespace for namespace in included if namespace not in source_included]
+        if missing:
+            raise HTTPException(409, f"Velero Backup {backup_name} does not contain every approved restore namespace")
+    blocked = [namespace for namespace in included if namespace in source_excluded]
+    if blocked:
+        raise HTTPException(409, f"Velero Backup {backup_name} excludes an approved restore namespace")
+
+
+def _enforce_velero_restore_scope(snapshot: dict[str, Any], velero_namespace: str, included: list[str], restore_pvs: bool) -> None:
+    _enforce_namespace(snapshot, velero_namespace)
+    for namespace in included:
+        _enforce_namespace(snapshot, namespace)
+    if restore_pvs and not bool(_scope(snapshot).get("allow_cluster_scoped", False)):
+        raise HTTPException(403, "Velero PV restore requires allow_cluster_scoped target scope")
+
+
 def _day2_argocd_state(snapshot: dict[str, Any], application: str, namespace: str) -> dict[str, Any]:
     data = _run_json(["kubectl", "get", "applications.argoproj.io", application, "-n", namespace, "-o", "json"], snapshot)
     metadata = data.get("metadata") or {}
@@ -1510,6 +1642,27 @@ def _day2_preview(snapshot: dict[str, Any], operation: str, parameters: dict[str
             "dry_run": dry_run,
             "secret_output_suppressed": True,
         }
+    if operation == "cluster.restore":
+        restore_name, backup_name, namespace, included, restore_pvs = _day2_velero_restore(parameters)
+        _enforce_velero_restore_scope(snapshot, namespace, included, restore_pvs)
+        source = _velero_backup_state(snapshot, backup_name, namespace)
+        _assert_velero_backup_restore_source(source, backup_name, included)
+        before = _velero_restore_state(snapshot, restore_name, namespace)
+        _assert_velero_restore_reusable(before, restore_name, backup_name, included, restore_pvs)
+        manifest = _velero_restore_manifest(restore_name, backup_name, namespace, included, restore_pvs)
+        dry_run = None
+        if not before.get("exists"):
+            dry_run = _run(["kubectl", "create", "-f", "-", "--dry-run=server", "-o", "name"], snapshot, stdin=json.dumps(manifest, sort_keys=True, separators=(",", ":")))
+        return {
+            "kind": "kubernetes-day2-velero-restore-preview",
+            "operation": operation,
+            "source_backup": source,
+            "before": before,
+            "desired": {"restore_name": restore_name, "backup_name": backup_name, "namespace": namespace, "included_namespaces": included, "restore_pvs": restore_pvs, "existing_resource_policy": "none", "preserve_node_ports": False},
+            "preconditions": {"velero_restore_source_hash": sha256_hex(source), "velero_restore_state_hash": sha256_hex(before)},
+            "dry_run": dry_run,
+            "secret_output_suppressed": True,
+        }
     release, chart, namespace, version, values_yaml = _day2_helm(parameters)
     if operation == "cluster.cilium.upgrade":
         if release != "cilium" or namespace != "kube-system" or "cilium" not in chart.lower():
@@ -1581,6 +1734,20 @@ def _assert_day2_runtime_preconditions(snapshot: dict[str, Any], typed: dict[str
         expected = str(preconditions.get("velero_backup_state_hash") or "")
         if not expected or not hmac.compare_digest(sha256_hex(current), expected):
             raise HTTPException(409, "Velero Backup state changed after preview; create and approve a new ChangeSet")
+        return
+    if operation == "cluster.restore":
+        restore_name, backup_name, namespace, included, restore_pvs = _day2_velero_restore(parameters)
+        _enforce_velero_restore_scope(snapshot, namespace, included, restore_pvs)
+        source = _velero_backup_state(snapshot, backup_name, namespace)
+        current = _velero_restore_state(snapshot, restore_name, namespace)
+        expected_source = str(preconditions.get("velero_restore_source_hash") or "")
+        expected_restore = str(preconditions.get("velero_restore_state_hash") or "")
+        if not expected_source or not hmac.compare_digest(sha256_hex(source), expected_source):
+            raise HTTPException(409, "Velero restore source Backup changed after preview; create and approve a new ChangeSet")
+        if not expected_restore or not hmac.compare_digest(sha256_hex(current), expected_restore):
+            raise HTTPException(409, "Velero Restore state changed after preview; create and approve a new ChangeSet")
+        _assert_velero_backup_restore_source(source, backup_name, included)
+        _assert_velero_restore_reusable(current, restore_name, backup_name, included, restore_pvs)
         return
     release, _, namespace, _, _ = _day2_helm(parameters)
     _enforce_namespace(snapshot, namespace)
@@ -1678,6 +1845,42 @@ def _execute_day2(changeset_plan: dict[str, Any], preconditions: dict[str, Any])
         )
         checks.append(_verification_check("velero-backup-completed", completed, f"Velero Backup {backup_name} phase is {live.get('phase') or 'Unknown'}", {"backup_name": backup_name, "namespace": namespace, "phase": live.get("phase"), "warnings": int(live.get("warnings") or 0), "errors": int(live.get("errors") or 0), "volume_snapshots_attempted": snapshots_attempted, "volume_snapshots_completed": snapshots_completed}))
         result["backup"] = live
+    elif operation == "cluster.restore":
+        restore_name, backup_name, namespace, included, restore_pvs = _day2_velero_restore(parameters)
+        _enforce_velero_restore_scope(snapshot, namespace, included, restore_pvs)
+        source = _velero_backup_state(snapshot, backup_name, namespace)
+        before = _velero_restore_state(snapshot, restore_name, namespace)
+        _assert_velero_backup_restore_source(source, backup_name, included)
+        _assert_velero_restore_reusable(before, restore_name, backup_name, included, restore_pvs)
+        manifest = _velero_restore_manifest(restore_name, backup_name, namespace, included, restore_pvs)
+        if before.get("exists"):
+            result["command"] = {"returncode": 0, "output": "existing restore reused", "duration": 0.0}
+        else:
+            result["command"] = _run(["kubectl", "create", "-f", "-", "-o", "name"], snapshot, stdin=json.dumps(manifest, sort_keys=True, separators=(",", ":")))
+        result["restore_wait"] = _run(["kubectl", "wait", "restores.velero.io", restore_name, "-n", namespace, "--for=jsonpath={.status.phase}=Completed", "--timeout=30m"], snapshot, timeout=max(COMMAND_TIMEOUT, 1860))
+        live = _velero_restore_state(snapshot, restore_name, namespace)
+        source_bound = (
+            str(source.get("phase") or "") == "Completed"
+            and int(source.get("errors") or 0) == 0
+            and not source.get("deletion_timestamp")
+        )
+        item_attempted = int(live.get("item_operations_attempted") or 0)
+        item_completed = int(live.get("item_operations_completed") or 0)
+        item_failed = int(live.get("item_operations_failed") or 0)
+        completed = (
+            str(live.get("phase") or "") == "Completed"
+            and int(live.get("errors") or 0) == 0
+            and int(live.get("validation_error_count") or 0) == 0
+            and item_failed == 0
+            and item_completed >= item_attempted
+            and not live.get("failure_reason_present")
+            and not live.get("deletion_timestamp")
+            and _velero_restore_state_matches_desired(live, backup_name, included, restore_pvs)
+        )
+        checks.append(_verification_check("velero-restore-source-bound", source_bound, f"Velero Restore {restore_name} source Backup {backup_name} remains eligible", {"restore_name": restore_name, "backup_name": backup_name, "backup_phase": source.get("phase"), "backup_errors": int(source.get("errors") or 0)}))
+        checks.append(_verification_check("velero-restore-completed", completed, f"Velero Restore {restore_name} phase is {live.get('phase') or 'Unknown'}", {"restore_name": restore_name, "backup_name": backup_name, "namespace": namespace, "included_namespaces": included, "restore_pvs": restore_pvs, "phase": live.get("phase"), "warnings": int(live.get("warnings") or 0), "errors": int(live.get("errors") or 0), "validation_error_count": int(live.get("validation_error_count") or 0), "item_operations_attempted": item_attempted, "item_operations_completed": item_completed, "item_operations_failed": item_failed, "failure_reason_present": bool(live.get("failure_reason_present"))}))
+        result["source_backup"] = {"backup_name": backup_name, "namespace": namespace, "uid": source.get("uid"), "resource_version": source.get("resource_version"), "phase": source.get("phase"), "errors": int(source.get("errors") or 0)}
+        result["restore"] = live
     else:
         release, chart, namespace, version, values_yaml = _day2_helm(parameters)
         _enforce_namespace(snapshot, namespace)

@@ -34,10 +34,11 @@ Do not amend, reset, squash, force-push, move or recreate the frozen dev.4 tag.
 - trusted Argo CD GitOps sync runtime bound to a full approved commit digest, with Application state-drift rejection, fixed server-side patching, sync wait and active sync/health verification
 - trusted pinned Cilium Helm upgrade runtime with exact release-state preconditions plus active Helm, Cilium-agent and sanitized Hubble verification
 - trusted one-shot Velero Backup runtime with exact backup-state preconditions, fixed CR creation, namespace-scope enforcement and active completion/error/snapshot-count verification
+- trusted bounded Velero Restore runtime for explicit namespaces with CRITICAL two-person approval, exact source-Backup/Restore-state preconditions, fixed non-destructive CR creation and active completion/error/plugin-operation verification
 
 ## Still release-blocking for dev.5 scope closure
 
-- remaining day-2/provider operations not covered by the trusted Kubernetes runtime (worker lifecycle, Kubernetes upgrades, etcd snapshot, restore/DR, certificate rotation, decommission; Velero schedules/restores and broader non-Argo GitOps remain open)
+- remaining day-2/provider operations not covered by the trusted Kubernetes runtime (worker lifecycle, Kubernetes upgrades, direct etcd snapshot/restore, full-cluster/provider DR, certificate rotation, decommission; Velero schedules and broader non-Argo GitOps remain open)
 - Cluster Factory runtime/repeatability closure
 - provider/bare-metal/network executors or explicit user-approved deferral
 - remaining air-gap protocol closure: OCI registry-to-registry copy, Helm OCI publication, package-repository metadata sync and authenticated repository credential delivery

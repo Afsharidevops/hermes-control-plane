@@ -276,3 +276,138 @@ def test_velero_existing_backup_must_match_approved_spec_and_not_be_failed():
     with pytest.raises(Exception) as exc:
         main._assert_velero_reusable(failed, "hermes-test", ["apps"], [], True, 72)
     assert "terminal phase" in str(exc.value)
+
+
+def test_velero_restore_uses_fixed_non_destructive_cr_and_active_completion_verification(monkeypatch):
+    calls = []
+    manifests = []
+    monkeypatch.setattr(main, "_kubectl_toolchain", lambda snapshot, refresh=False: {"binding_hash": "x"})
+
+    source = {
+        "exists": True,
+        "backup_name": "hermes-test",
+        "namespace": "velero",
+        "uid": "backup-uid",
+        "resource_version": "9",
+        "deletion_timestamp": None,
+        "included_namespaces": ["apps"],
+        "excluded_namespaces": [],
+        "snapshot_volumes": True,
+        "ttl": "72h0m0s",
+        "phase": "Completed",
+        "warnings": 0,
+        "errors": 0,
+        "volume_snapshots_attempted": 2,
+        "volume_snapshots_completed": 2,
+    }
+    before = {"exists": False, "restore_name": "hermes-restore", "namespace": "velero"}
+    restore_gets = 0
+
+    def backup_json():
+        return '{"metadata":{"uid":"backup-uid","resourceVersion":"9"},"spec":{"includedNamespaces":["apps"],"snapshotVolumes":true,"ttl":"72h0m0s"},"status":{"phase":"Completed","warnings":0,"errors":0,"volumeSnapshotsAttempted":2,"volumeSnapshotsCompleted":2}}'
+
+    def restore_json():
+        return '{"metadata":{"uid":"restore-uid","resourceVersion":"4"},"spec":{"backupName":"hermes-test","includedNamespaces":["apps"],"restorePVs":false,"includeClusterResources":false,"preserveNodePorts":false,"existingResourcePolicy":"none"},"status":{"phase":"Completed","warnings":0,"errors":0,"validationErrors":[],"restoreItemOperationsAttempted":3,"restoreItemOperationsCompleted":3,"restoreItemOperationsFailed":0}}'
+
+    def fake_run(args, snapshot, stdin=None, timeout=None, allowed_codes=None):
+        nonlocal restore_gets
+        calls.append(args)
+        if args[:3] == ["kubectl", "get", "backups.velero.io"]:
+            return {"returncode": 0, "output": backup_json(), "duration": 0.01}
+        if args[:3] == ["kubectl", "get", "restores.velero.io"]:
+            restore_gets += 1
+            return {"returncode": 0, "output": "" if restore_gets < 3 else restore_json(), "duration": 0.01}
+        if args[:4] == ["kubectl", "create", "-f", "-"]:
+            manifests.append(stdin)
+            return {"returncode": 0, "output": "restore.velero.io/hermes-restore", "duration": 0.01}
+        if args[:3] == ["kubectl", "wait", "restores.velero.io"]:
+            return {"returncode": 0, "output": "restore.velero.io/hermes-restore condition met", "duration": 0.01}
+        return {"returncode": 0, "output": "ok", "duration": 0.01}
+
+    monkeypatch.setattr(main, "_run", fake_run)
+    preview = {
+        "preconditions": {
+            "velero_restore_source_hash": main.sha256_hex(source),
+            "velero_restore_state_hash": main.sha256_hex(before),
+        }
+    }
+    params = {
+        "native_target_id": "tgt_test",
+        "restore_name": "hermes-restore",
+        "backup_name": "hermes-test",
+        "namespace": "velero",
+        "included_namespaces": ["apps"],
+        "restore_pvs": False,
+    }
+    typed = _typed_with_namespaces("cluster.restore", params, preview, ["velero", "apps"])
+    result = main._execute_day2(_changeset(typed), {"executor": "kubernetes-broker"})
+
+    assert len(manifests) == 1
+    manifest = manifests[0]
+    assert '"apiVersion":"velero.io/v1"' in manifest
+    assert '"kind":"Restore"' in manifest
+    assert '"name":"hermes-restore"' in manifest
+    assert '"backupName":"hermes-test"' in manifest
+    assert '"includedNamespaces":["apps"]' in manifest
+    assert '"restorePVs":false' in manifest
+    assert '"includeClusterResources":false' in manifest
+    assert '"existingResourcePolicy":"none"' in manifest
+    assert '"preserveNodePorts":false' in manifest
+    for forbidden in ('"hooks"', '"resourceModifier"', '"namespaceMapping"', '"scheduleName"'):
+        assert forbidden not in manifest
+    assert "credential" not in manifest.lower()
+    assert ["kubectl", "wait", "restores.velero.io", "hermes-restore", "-n", "velero", "--for=jsonpath={.status.phase}=Completed", "--timeout=30m"] in calls
+    checks = {item["id"]: item for item in result["verification"]["checks"]}
+    assert checks["velero-restore-source-bound"]["status"] == "PASS"
+    assert checks["velero-restore-completed"]["status"] == "PASS"
+    assert checks["velero-restore-completed"]["evidence"]["item_operations_failed"] == 0
+    assert result["verification"]["evidence"]["arbitrary_shell"] is False
+    assert result["verification"]["evidence"]["raw_credentials_returned"] is False
+
+
+def test_velero_restore_requires_completed_source_explicit_scope_and_cluster_permission_for_pvs():
+    source = {
+        "exists": True,
+        "backup_name": "hermes-test",
+        "namespace": "velero",
+        "included_namespaces": ["apps"],
+        "excluded_namespaces": [],
+        "phase": "PartiallyFailed",
+        "errors": 1,
+    }
+    with pytest.raises(Exception) as exc:
+        main._assert_velero_backup_restore_source(source, "hermes-test", ["apps"])
+    assert "completed with zero errors" in str(exc.value).lower()
+
+    with pytest.raises(Exception) as exc:
+        main._day2_velero_restore({"restore_name": "hermes-restore", "backup_name": "hermes-test", "included_namespaces": ["*"]})
+    assert "explicit" in str(exc.value).lower()
+
+    snapshot = {"scope": {"namespace_allowlist": ["velero", "apps"], "cluster_read": True, "allow_cluster_scoped": False}}
+    with pytest.raises(Exception) as exc:
+        main._enforce_velero_restore_scope(snapshot, "velero", ["apps"], True)
+    assert "allow_cluster_scoped" in str(exc.value)
+
+
+def test_velero_restore_existing_object_must_match_exact_approved_non_destructive_spec():
+    matching = {
+        "exists": True,
+        "restore_name": "hermes-restore",
+        "namespace": "velero",
+        "backup_name": "hermes-test",
+        "included_namespaces": ["apps"],
+        "restore_pvs": False,
+        "include_cluster_resources": False,
+        "preserve_node_ports": False,
+        "existing_resource_policy": "none",
+        "phase": "Completed",
+    }
+    main._assert_velero_restore_reusable(matching, "hermes-restore", "hermes-test", ["apps"], False)
+
+    with pytest.raises(Exception) as exc:
+        main._assert_velero_restore_reusable(dict(matching, existing_resource_policy="update"), "hermes-restore", "hermes-test", ["apps"], False)
+    assert "different approved specification" in str(exc.value)
+
+    with pytest.raises(Exception) as exc:
+        main._assert_velero_restore_reusable(dict(matching, phase="PartiallyFailed"), "hermes-restore", "hermes-test", ["apps"], False)
+    assert "partial-failure" in str(exc.value)

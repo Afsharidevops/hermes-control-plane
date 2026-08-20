@@ -137,3 +137,5 @@
 
 - 0.5.11-dev.5: add exact-commit Argo CD GitOps sync and pinned Cilium upgrade execution through the trusted Kubernetes Broker with drift-bound previews and active verification.
 - 0.5.11-dev.5: add bounded one-shot Velero Backup execution through the trusted Kubernetes Broker with exact state/spec binding and active completion verification.
+
+- dev.5 scope closure: add CRITICAL two-approval explicit-namespace Velero Restore runtime with exact source/restore drift binding, fixed non-destructive Restore CR execution, PV permission gating and active terminal verification.
