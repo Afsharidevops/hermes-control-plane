@@ -1,5 +1,6 @@
 # Changelog
 
+- Dev.5 Operator Center UI slice: typed full-scope operator navigation for Kubernetes, Cluster Factory, infrastructure, operations and governance, with live data where available and explicit PARTIAL/CONTRACT_ONLY runtime states where executors are not yet complete.
 - Dev.5 native diagnostics runtime slice: executable broker-owned read-only checks for node/pod/workload/OOM/metrics/storage/events, Cilium/Hubble/DNS/ingress/NetworkPolicy, RBAC/workload security, Argo CD and rollout health with target-scope enforcement and bounded typed evidence.
 - Dev.5 Hubble runtime slice: trusted Kubernetes Broker collector, pinned Hubble CLI, namespace authorization, typed redaction/aggregation, bounded history, SSE, and Hermes-native Network Live batch UI.
 

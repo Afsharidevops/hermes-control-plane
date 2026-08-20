@@ -25,6 +25,7 @@ from . import kubernetes as kubernetes_broker
 from . import preflight as host_preflight
 from . import cluster_factory
 from . import operations
+from . import operator_center
 from . import radar as radar_provider
 from .providers import PROVIDERS, provider_descriptor
 from .tickets import issue_ticket, verify_ticket
@@ -768,7 +769,7 @@ def system() -> dict[str, Any]:
         "version": VERSION,
         "stage": "development",
         "runtime": os.getenv("HERMES_RUNTIME", "docker"),
-        "capabilities": ["integration-registry", "target-registry", "application-registry", "adapter-capability-contract", "credential-references", "server-registry", "ssh-preflight", "provider-lifecycle-contract", "bootstrap-jobs", "cluster-factory", "cluster-blueprints", "cluster-profiles", "node-roles", "provisioning-runs", "addon-plans", "upgrade-plans", "backup-plans", "kubespray-production-path", "k3s-edge-path", "rke2-hardened-path", "cilium-hubble", "radar-kubernetes-intelligence", "native-diagnostics", "operations-center", "shared-intent-backend", "fleet-registry", "fleet-exact-target-snapshots", "advanced-day2-plans", "bare-metal-provider-contracts", "switch-network-provider-contracts", "vmware-provider-foundation", "openstack-provider-foundation", "aws-provider-foundation", "azure-provider-foundation", "gcp-provider-foundation", "airgap-artifact-mirror", "unified-verification", "generic-operation-jobs", "target-drift-rejection", "changeset-planning", "risk-engine", "approval-binding", "audit", "agent-enrollment", "agent-signed-task-envelope", "kubernetes-discovery", "kubernetes-server-dry-run", "kubernetes-guarded-delete", "kubernetes-rollback", "kubernetes-rollout-verification", "helm-server-dry-run", "helm-rollback", "signed-execution-tickets"],
+        "capabilities": ["integration-registry", "target-registry", "application-registry", "adapter-capability-contract", "credential-references", "server-registry", "ssh-preflight", "provider-lifecycle-contract", "bootstrap-jobs", "cluster-factory", "cluster-blueprints", "cluster-profiles", "node-roles", "provisioning-runs", "addon-plans", "upgrade-plans", "backup-plans", "kubespray-production-path", "k3s-edge-path", "rke2-hardened-path", "cilium-hubble", "radar-kubernetes-intelligence", "native-diagnostics", "operator-center-ui", "operations-center", "shared-intent-backend", "fleet-registry", "fleet-exact-target-snapshots", "advanced-day2-plans", "bare-metal-provider-contracts", "switch-network-provider-contracts", "vmware-provider-foundation", "openstack-provider-foundation", "aws-provider-foundation", "azure-provider-foundation", "gcp-provider-foundation", "airgap-artifact-mirror", "unified-verification", "generic-operation-jobs", "target-drift-rejection", "changeset-planning", "risk-engine", "approval-binding", "audit", "agent-enrollment", "agent-signed-task-envelope", "kubernetes-discovery", "kubernetes-server-dry-run", "kubernetes-guarded-delete", "kubernetes-rollback", "kubernetes-rollout-verification", "helm-server-dry-run", "helm-rollback", "signed-execution-tickets"],
         "execution_enabled": os.getenv("HERMES_EXECUTION_ENABLED", "false").lower() == "true",
         "policy_generation": policy_generation,
         "mutation_control": {
@@ -3481,6 +3482,11 @@ def _verify_operation_job_ticket(conn, job: Any, ticket: dict[str, Any], signatu
     if preconditions != expected:
         raise HTTPException(status_code=409, detail="execution ticket operation preconditions mismatch")
     return authorization
+
+
+@app.get("/v1/operator-center/contracts")
+def operator_center_contracts() -> dict[str, Any]:
+    return operator_center.contracts()
 
 
 @app.get("/v1/operations-center/contracts")

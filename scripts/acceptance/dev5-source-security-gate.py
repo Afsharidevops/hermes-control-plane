@@ -24,6 +24,8 @@ models = text("control-plane/src/hermes_control_plane/models.py")
 factory = text("control-plane/src/hermes_control_plane/cluster_factory.py")
 providers = text("control-plane/src/hermes_control_plane/providers.py")
 operations = text("control-plane/src/hermes_control_plane/operations.py")
+operator_center = text("control-plane/src/hermes_control_plane/operator_center.py")
+ui = text("control-plane/src/hermes_control_plane/static/index.html")
 tickets = text("control-plane/src/hermes_control_plane/tickets.py")
 radar = text("control-plane/src/hermes_control_plane/radar.py")
 hubble = text("kubernetes-broker/src/hermes_kubernetes_broker/hubble.py")
@@ -147,6 +149,32 @@ for forbidden in ('subprocess', 'os.system', 'shell=True', 'kubectl exec', 'kube
 assert '"kubectl", "get"' in kube_broker
 assert 'unsupported diagnostic checks' in kube_broker
 assert 'cluster_read target scope required' in kube_broker
+
+# Dev.5 Operator Center closes UI navigation without upgrading unfinished runtime providers.
+assert '@app.get("/v1/operator-center/contracts")' in cp_main
+assert '"operator-center-ui"' in cp_main
+assert '"ui_state": UI_STATE' in operator_center
+assert '"runtime_state_is_separate_from_ui_state": True' in operator_center
+assert '"credential_material_rendered": False' in operator_center
+assert '"mutation_ui": "observe-plan-inspect-only"' in operator_center
+for surface_id in (
+    "kubernetes.network-live", "kubernetes.security", "kubernetes.rbac",
+    "cluster-factory.bare-metal", "infrastructure.vmware", "infrastructure.openstack",
+    "infrastructure.aws", "infrastructure.azure", "infrastructure.gcp",
+    "governance.artifact-mirror",
+):
+    assert f'"{surface_id}"' in operator_center, surface_id
+for contract_only in (
+    "cluster-factory.bare-metal", "infrastructure.vmware", "infrastructure.openstack",
+    "infrastructure.aws", "infrastructure.azure", "infrastructure.gcp",
+    "governance.artifact-mirror",
+):
+    fragment = operator_center.split(f'"{contract_only}"', 1)[1].split("),", 1)[0]
+    assert '"CONTRACT_ONLY"' in fragment, contract_only
+assert 'Operator Center' in ui and '/v1/operator-center/contracts' in ui
+operator_section = ui.split('<section id="operator-center"', 1)[1].split('</section>', 1)[0]
+for forbidden in ("approveChange", "executeChange", "createChange", "kubectl", "helm upgrade"):
+    assert forbidden not in operator_section, forbidden
 
 # Generic typed provider contracts retain their credential boundary and no arbitrary command generation.
 for forbidden in ("subprocess", "os.system", "shell=True", "curl | sh"):

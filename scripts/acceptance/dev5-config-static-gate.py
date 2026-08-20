@@ -66,6 +66,10 @@ assert "Run Native Diagnostics" in ui
 assert "/diagnostics/run" in ui
 assert "native-diagnostics" in ui
 assert "<option>radar</option>" in ui
+assert "Operator Center" in ui
+assert "/v1/operator-center/contracts" in ui
+assert "refreshOperatorCenter" in ui
+assert "runtime/provider state" in ui
 
 for workflow_path in (".github/workflows/validate.yml", ".github/workflows/publish-images.yml"):
     load_yaml(workflow_path)
@@ -84,6 +88,8 @@ assert (ROOT / "docs/DEV5-SCOPE-CLOSURE.md").is_file()
 assert (ROOT / "control-plane/tests/test_dev5_radar_runtime.py").is_file()
 assert (ROOT / "control-plane/tests/test_dev5_hubble_runtime.py").is_file()
 assert (ROOT / "control-plane/tests/test_dev5_diagnostics_runtime.py").is_file()
+assert (ROOT / "control-plane/tests/test_dev5_operator_ui.py").is_file()
+assert (ROOT / "control-plane/src/hermes_control_plane/operator_center.py").is_file()
 assert (ROOT / "kubernetes-broker/src/hermes_kubernetes_broker/hubble.py").is_file()
 assert (ROOT / "kubernetes-broker/src/hermes_kubernetes_broker/diagnostics.py").is_file()
 

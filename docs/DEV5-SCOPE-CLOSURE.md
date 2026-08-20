@@ -83,3 +83,43 @@ Security/runtime properties:
 - every Control Plane diagnostics run is audited
 
 Evidence is local runtime-path/mock/simulation evidence, not real-target cluster evidence.
+
+
+## Slice 4 — Hermes-native Operator Center UI scope closure
+
+This slice closes the promised operator-navigation surface without conflating UI
+coverage with backend runtime completion. A typed `/v1/operator-center/contracts`
+map now covers every original Kubernetes, Cluster Factory, infrastructure,
+operations and governance page and reports `ui_state` separately from
+`runtime_state`.
+
+Implemented UI surfaces include:
+
+- Kubernetes Overview, Issues, Applications, Topology, Network Live, Resources,
+  Workloads, Nodes, Storage, Ingress, Metrics, Logs, Timeline, Helm, GitOps, Cost,
+  TLS, Security, RBAC and Audit
+- Cluster Factory Clusters, Servers, Provision, Templates, Bare Metal and Images / Artifacts
+- Infrastructure Kubernetes, VMware, OpenStack, AWS, Azure, GCP, Docker, Swarm and SSH
+- Operations Diagnostics, Deployments, Upgrades, Backups, Recovery and Maintenance
+- Changes, Approvals, Credentials, Agents, Integrations, Artifact Mirror, Audit,
+  AI Routing and Settings
+
+The UI renders live data where current Hermes runtime exists and reports
+`PARTIAL`, `OPTIONAL_PROVIDER` or `CONTRACT_ONLY` for surfaces whose runtime is
+not complete. In particular VMware/OpenStack/AWS/Azure/GCP, bare-metal and
+artifact-mirror executor status is not upgraded by the presence of a page.
+
+Security/governance properties:
+
+- the Operator Center is observability/plan-inspection only; it does not add
+  approval, execution, arbitrary kubectl/Helm or provider command controls
+- credential material is never rendered; credential pages use metadata-only refs
+- live Network and Diagnostics actions reuse the already-authorized Hubble and
+  native diagnostics paths
+- UI state and runtime state are explicitly separate so contract-only adapters
+  cannot be mistaken for real-target integration evidence
+
+Remaining dev.5 release blockers are runtime/executor work: day-2/add-on active
+execution and verification, Cluster Factory repeatability, provider/bare-metal/
+network executors or explicit deferral, air-gap synchronization/integrity runtime,
+and the active unified verification engine.
