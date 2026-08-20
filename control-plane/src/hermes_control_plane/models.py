@@ -397,6 +397,12 @@ class RadarIntelligenceQuery(StrictModel):
     native_target_id: str | None = Field(default=None, max_length=160)
 
 
+class HubbleLiveQuery(StrictModel):
+    native_target_id: str = Field(min_length=1, max_length=160)
+    last: int = Field(default=50, ge=1, le=200)
+    since_seconds: int | None = Field(default=None, ge=1, le=3600)
+
+
 class HubbleFlowSummaryCreate(StrictModel):
     window_start: int
     window_end: int

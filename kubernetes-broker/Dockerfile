@@ -6,6 +6,7 @@ ARG KUBECTL_V1_35=v1.35.6
 ARG KUBECTL_V1_36=v1.36.2
 ARG KUBECTL_BOOTSTRAP_MINOR=1.34
 ARG HELM_VERSION=v4.2.2
+ARG HUBBLE_VERSION=v1.19.4
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PYTHONPATH=/app/src HOME=/tmp/hermes HELM_CACHE_HOME=/tmp/hermes/helm/cache HELM_CONFIG_HOME=/tmp/hermes/helm/config HELM_DATA_HOME=/tmp/hermes/helm/data HERMES_KUBECTL_ROOT=/opt/hermes/kubectl HERMES_KUBECTL_BOOTSTRAP=/usr/local/bin/kubectl HERMES_KUBECTL_SELECTION_MODE=exact-preferred HERMES_DYNAMIC_KUBECTL_ENABLED=true
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl tar gzip \
  && rm -rf /var/lib/apt/lists/* \
@@ -20,7 +21,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
  && tar -xzf /tmp/helm.tgz -C /tmp \
  && mv "/tmp/linux-${TARGETARCH}/helm" /usr/local/bin/helm \
  && chmod 0755 /usr/local/bin/helm \
- && rm -rf /tmp/helm.tgz "/tmp/linux-${TARGETARCH}"
+ && rm -rf /tmp/helm.tgz "/tmp/linux-${TARGETARCH}" \
+ && curl -fsSLo "/tmp/hubble-linux-${TARGETARCH}.tar.gz" "https://github.com/cilium/hubble/releases/download/${HUBBLE_VERSION}/hubble-linux-${TARGETARCH}.tar.gz" \
+ && curl -fsSLo "/tmp/hubble-linux-${TARGETARCH}.tar.gz.sha256sum" "https://github.com/cilium/hubble/releases/download/${HUBBLE_VERSION}/hubble-linux-${TARGETARCH}.tar.gz.sha256sum" \
+ && (cd /tmp && sha256sum -c "hubble-linux-${TARGETARCH}.tar.gz.sha256sum") \
+ && tar -xzf "/tmp/hubble-linux-${TARGETARCH}.tar.gz" -C /usr/local/bin hubble \
+ && chmod 0755 /usr/local/bin/hubble \
+ && rm -f "/tmp/hubble-linux-${TARGETARCH}.tar.gz" "/tmp/hubble-linux-${TARGETARCH}.tar.gz.sha256sum"
 RUN groupadd --gid 10023 hermes && useradd --uid 10023 --gid 10023 --create-home hermes
 WORKDIR /app
 COPY requirements.txt .

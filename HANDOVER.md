@@ -341,3 +341,5 @@ Root cause: R1 wrote tiny combo action files without a trailing newline, then pa
 R2 fixes this by newline-terminating plan files and making the action-file `read` explicitly EOF-tolerant while preserving fail-closed validation for invalid actions. It also removes handover trailing whitespace so `git diff --check` passes.
 
 R2 must now be overlaid on the same branch and tested with execution disabled. Expected first-run behavior is creation of `ai`, `combo-fast`, `combo-standard`, and `combo-strong`; a second startup must refresh `ai` but preserve existing tier combos. Then `router probe`, `bot check`, and the Telegram read-only target query must pass.
+
+- Dev.5 Hubble runtime slice: trusted Kubernetes Broker collector, pinned Hubble CLI, namespace authorization, typed redaction/aggregation, bounded history, SSE, and Hermes-native Network Live batch UI.

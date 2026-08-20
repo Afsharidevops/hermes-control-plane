@@ -1,5 +1,7 @@
 # Changelog
 
+- Dev.5 Hubble runtime slice: trusted Kubernetes Broker collector, pinned Hubble CLI, namespace authorization, typed redaction/aggregation, bounded history, SSE, and Hermes-native Network Live batch UI.
+
 ## 0.5.11-dev.5 (in progress)
 
 - begin scope-closure work on top of frozen `v0.5.11-dev.4` without rewriting frozen history

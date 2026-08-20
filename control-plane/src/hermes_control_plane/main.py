@@ -72,6 +72,7 @@ from .models import (
     RadarSnapshotCreate,
     RadarIntelligenceQuery,
     HubbleFlowSummaryCreate,
+    HubbleLiveQuery,
     InfrastructureProviderCreate,
     InfrastructureProviderHealth,
     OperationsIntentPlanCreate,
@@ -3000,6 +3001,120 @@ def record_radar_snapshot(cluster_id: str, payload: RadarSnapshotCreate, authori
         db.audit(conn, "radar.snapshot_recorded", "admin", "cluster", cluster_id, {"snapshot_id": snapshot_id, "health_score": payload.health_score})
         conn.commit()
     return {"id": snapshot_id, "cluster_id": cluster_id, "provider": "radar", "summary": summary, "contract": cluster_factory.RADAR_CONTRACT}
+
+
+def _persist_hubble_batch(conn, cluster_id: str, batch: dict[str, Any]) -> tuple[list[dict[str, Any]], int]:
+    observed_at = int(batch.get("observed_at") or time.time())
+    events = batch.get("events") if isinstance(batch.get("events"), list) else []
+    inserted: list[dict[str, Any]] = []
+    now = int(time.time())
+    allowed_event_keys = {"time", "verdict", "source", "destination", "protocol", "destination_port", "http", "drop_reason", "traffic_direction", "is_reply", "fingerprint"}
+    allowed_endpoint_keys = {"namespace", "workload"}
+    allowed_http_keys = {"method", "status_class"}
+    for event in events[:200]:
+        if not isinstance(event, dict) or set(event) - allowed_event_keys:
+            continue
+        fingerprint = str(event.get("fingerprint") or "")
+        if not re.fullmatch(r"[0-9a-f]{64}", fingerprint):
+            continue
+        source = event.get("source")
+        destination = event.get("destination")
+        http = event.get("http")
+        if not isinstance(source, dict) or set(source) - allowed_endpoint_keys:
+            continue
+        if not isinstance(destination, dict) or set(destination) - allowed_endpoint_keys:
+            continue
+        if http is not None and (not isinstance(http, dict) or set(http) - allowed_http_keys):
+            continue
+        # Re-serialize only the exact sanitized schema accepted from the broker.
+        normalized = {key: event.get(key) for key in allowed_event_keys}
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO hubble_flow_events (cluster_id,observed_at,fingerprint,event_json,created_at) VALUES (?,?,?,?,?)",
+            (cluster_id, observed_at, fingerprint, json.dumps(normalized, sort_keys=True), now),
+        )
+        if cur.rowcount:
+            inserted.append(normalized)
+    conn.execute(
+        "DELETE FROM hubble_flow_events WHERE cluster_id=? AND id NOT IN (SELECT id FROM hubble_flow_events WHERE cluster_id=? ORDER BY observed_at DESC,id DESC LIMIT 2000)",
+        (cluster_id, cluster_id),
+    )
+    summary = batch.get("summary") if isinstance(batch.get("summary"), dict) else {}
+    if summary:
+        conn.execute(
+            "INSERT INTO kubernetes_intelligence_snapshots (cluster_id,provider,observed_at,summary_json,created_at) VALUES (?,?,?,?,?)",
+            (cluster_id, "hubble", observed_at, json.dumps(summary, sort_keys=True), now),
+        )
+    return inserted, observed_at
+
+
+async def _collect_hubble_live(cluster: dict[str, Any], payload: HubbleLiveQuery) -> dict[str, Any]:
+    with closing(db.connect()) as conn:
+        snapshot = _native_kubernetes_target(conn, cluster, payload.native_target_id)
+    result = await kubernetes_broker.post(
+        "/v1/hubble/collect",
+        {"target_snapshot": snapshot, "last": payload.last, "since_seconds": payload.since_seconds},
+    )
+    if result.get("raw_flow_bodies_returned") is not False:
+        raise HTTPException(status_code=502, detail="Kubernetes Broker did not attest sanitized Hubble output")
+    return result
+
+
+@app.post("/v1/clusters/{cluster_id}/network/live")
+async def collect_cluster_network_live(cluster_id: str, payload: HubbleLiveQuery, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_admin(authorization)
+    with closing(db.connect()) as conn:
+        cluster = _cluster_dict(_get_cluster(conn, cluster_id))
+    batch = await _collect_hubble_live(cluster, payload)
+    with closing(db.connect()) as conn:
+        inserted, observed_at = _persist_hubble_batch(conn, cluster_id, batch)
+        db.audit(conn, "hubble.live_collected", "admin", "cluster", cluster_id, {"target_id": payload.native_target_id, "received": len(batch.get("events") or []), "inserted": len(inserted), "observed_at": observed_at})
+        conn.commit()
+    return {"cluster_id": cluster_id, "provider": "cilium-hubble", "observed_at": observed_at, "events": inserted, "summary": batch.get("summary") or {}, "history_limit": 2000, "raw_flow_bodies_returned": False}
+
+
+@app.get("/v1/clusters/{cluster_id}/network/history")
+def get_cluster_network_history(cluster_id: str, limit: int = Query(default=100, ge=1, le=500), authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_admin(authorization)
+    with closing(db.connect()) as conn:
+        _get_cluster(conn, cluster_id)
+        rows = conn.execute("SELECT id,observed_at,event_json FROM hubble_flow_events WHERE cluster_id=? ORDER BY observed_at DESC,id DESC LIMIT ?", (cluster_id, limit)).fetchall()
+    return {"cluster_id": cluster_id, "provider": "cilium-hubble", "events": [{"id": row["id"], "observed_at": row["observed_at"], **json.loads(row["event_json"])} for row in rows], "bounded": True, "max_stored_per_cluster": 2000}
+
+
+@app.get("/v1/clusters/{cluster_id}/network/live/stream")
+async def stream_cluster_network_live(
+    cluster_id: str,
+    request: Request,
+    native_target_id: str = Query(min_length=1, max_length=160),
+    last: int = Query(default=25, ge=1, le=100),
+    since_seconds: int | None = Query(default=30, ge=1, le=3600),
+    poll_seconds: float = Query(default=2.0, ge=1.0, le=30.0),
+    authorization: str | None = Header(default=None),
+):
+    _require_admin(authorization)
+    with closing(db.connect()) as conn:
+        cluster = _cluster_dict(_get_cluster(conn, cluster_id))
+        _native_kubernetes_target(conn, cluster, native_target_id)
+
+    async def event_stream():
+        while True:
+            if await request.is_disconnected():
+                return
+            try:
+                payload = HubbleLiveQuery(native_target_id=native_target_id, last=last, since_seconds=since_seconds)
+                batch = await _collect_hubble_live(cluster, payload)
+                with closing(db.connect()) as conn:
+                    inserted, observed_at = _persist_hubble_batch(conn, cluster_id, batch)
+                    conn.commit()
+                for event in inserted:
+                    yield f"event: hubble-flow\ndata: {json.dumps({'cluster_id': cluster_id, 'observed_at': observed_at, 'flow': event}, sort_keys=True)}\n\n"
+                if not inserted:
+                    yield ": heartbeat\n\n"
+            except HTTPException as exc:
+                yield f"event: hubble-error\ndata: {json.dumps({'status': exc.status_code, 'detail': exc.detail}, sort_keys=True)}\n\n"
+            await asyncio.sleep(poll_seconds)
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream", headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
 
 
 @app.post("/v1/clusters/{cluster_id}/intelligence/hubble", status_code=201)

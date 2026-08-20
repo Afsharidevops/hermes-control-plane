@@ -36,3 +36,5 @@ Do not amend, reset, squash, force-push, move or recreate the frozen dev.4 tag.
 
 `v0.5.11-dev.5` must not be created until the full dev.5 closure scope is complete,
 local validation passes, and branch CI succeeds on the exact intended tag SHA.
+
+- Dev.5 Hubble runtime slice: trusted Kubernetes Broker collector, pinned Hubble CLI, namespace authorization, typed redaction/aggregation, bounded history, SSE, and Hermes-native Network Live batch UI.

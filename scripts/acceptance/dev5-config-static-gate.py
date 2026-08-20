@@ -36,16 +36,16 @@ assert set(contexts) == {"control-plane", "credential-service", "router-gateway"
 for context in contexts:
     assert (ROOT / context / "Dockerfile").is_file(), context
 
-# Dev.4 persistence remains; this first dev.5 slice needs no schema migration.
+# Dev.4 persistence remains; dev.5 adds bounded sanitized Hubble flow history.
 db = (ROOT / "control-plane/src/hermes_control_plane/db.py").read_text()
 for table in (
     "cluster_blueprints", "cluster_profiles", "clusters", "node_roles", "provisioning_runs",
     "addon_plans", "upgrade_plans", "backup_plans", "kubernetes_intelligence_snapshots",
     "infrastructure_providers", "fleet_target_snapshots", "operation_plans", "operation_jobs",
-    "artifact_mirror_items", "verification_results",
+    "artifact_mirror_items", "verification_results", "hubble_flow_events",
 ):
     assert f"CREATE TABLE IF NOT EXISTS {table}" in db, table
-assert "PRAGMA user_version = 8" in db
+assert "PRAGMA user_version = 9" in db
 
 main = (ROOT / "control-plane/src/hermes_control_plane/main.py").read_text()
 models = (ROOT / "control-plane/src/hermes_control_plane/models.py").read_text()
@@ -60,6 +60,8 @@ assert "0.5.11-dev.5" in ui
 assert "Query live intelligence" in ui
 assert "radar-mode" in ui
 assert "/intelligence/query" in ui
+assert "Collect Network Live" in ui
+assert "/network/live" in ui
 assert "<option>radar</option>" in ui
 
 for workflow_path in (".github/workflows/validate.yml", ".github/workflows/publish-images.yml"):
@@ -77,6 +79,8 @@ for script in ("apply.sh", "validate.sh", "push.sh"):
 
 assert (ROOT / "docs/DEV5-SCOPE-CLOSURE.md").is_file()
 assert (ROOT / "control-plane/tests/test_dev5_radar_runtime.py").is_file()
+assert (ROOT / "control-plane/tests/test_dev5_hubble_runtime.py").is_file()
+assert (ROOT / "kubernetes-broker/src/hermes_kubernetes_broker/hubble.py").is_file()
 
 # The source manifest is a complete checksum inventory of every managed file except itself.
 manifest_path = ROOT / "MANIFEST.sha256"

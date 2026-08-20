@@ -40,3 +40,22 @@ This slice does not close the remaining roadmap by itself. Hubble live traffic,
 executable native diagnostics, broader operator UI, day-2/provider executors,
 air-gap synchronization and active unified verification remain subsequent
 `0.5.11-dev.5` work unless explicitly deferred by the user.
+
+## Slice 2 — Cilium/Hubble live-network runtime
+
+This follow-on dev.5 slice moves Hubble from stored-summary contracts to a real bounded runtime path:
+
+`Cilium/Hubble -> Hubble Relay -> pinned Hubble CLI in Kubernetes Broker -> namespace authorization -> typed redaction/aggregation -> Control Plane bounded history/SSE -> Hermes-native Network Live UI`
+
+Security properties:
+
+- Hubble Relay access runs in the trusted Kubernetes Broker so kubeconfig material does not enter UI/AI-facing components.
+- The broker executes a fixed `hubble observe --port-forward --output jsonpb` command with bounded `last`/`since_seconds` parameters; no arbitrary CLI arguments or shell execution are accepted.
+- Raw L7 URLs, request/response headers, bodies, IP addresses and arbitrary protobuf bodies are discarded before broker output.
+- Target namespace allow/deny scope is enforced on sanitized flow events before they leave the broker.
+- The Control Plane rejects any batch that does not attest `raw_flow_bodies_returned=false`.
+- Per-cluster flow history is deduplicated by sanitized-event fingerprint and bounded to 2,000 events.
+- Network Live has a typed batch endpoint plus an authenticated SSE endpoint; browser UI receives only sanitized batches.
+- No Hubble mutation path is introduced. Mutations remain normal Hermes ChangeSets.
+
+Evidence in this slice is mock/simulation + local runtime-path testing. It is **not** real-target Cilium/Hubble evidence; live disposable-cluster verification remains required before classifying the complete 0.5.11 Hubble area as real-target verified.

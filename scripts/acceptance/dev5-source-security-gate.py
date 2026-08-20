@@ -26,6 +26,8 @@ providers = text("control-plane/src/hermes_control_plane/providers.py")
 operations = text("control-plane/src/hermes_control_plane/operations.py")
 tickets = text("control-plane/src/hermes_control_plane/tickets.py")
 radar = text("control-plane/src/hermes_control_plane/radar.py")
+hubble = text("kubernetes-broker/src/hermes_kubernetes_broker/hubble.py")
+kube_broker = text("kubernetes-broker/src/hermes_kubernetes_broker/main.py")
 
 # Frozen dev.3/dev.4 contracts remain intact while dev.5 adds real runtime surfaces.
 for marker in (
@@ -89,6 +91,27 @@ assert '"tools/call"' in radar
 # Native fallback remains behind the existing constrained Kubernetes Broker.
 assert 'kubernetes_broker.post("/v1/discover"' in cp_main
 assert '"secret_data_requested": False' in text("kubernetes-broker/src/hermes_kubernetes_broker/main.py")
+
+# Dev.5 Hubble runtime is broker-owned, bounded, scoped, redacted and never returns raw L7 bodies.
+for marker in (
+    'class HubbleLiveQuery',
+    '@app.post("/v1/clusters/{cluster_id}/network/live")',
+    '@app.get("/v1/clusters/{cluster_id}/network/history")',
+    '@app.get("/v1/clusters/{cluster_id}/network/live/stream")',
+    'kubernetes_broker.post(',
+    '"/v1/hubble/collect"',
+    'raw_flow_bodies_returned',
+):
+    assert marker in models or marker in cp_main, marker
+assert '@app.post("/v1/hubble/collect")' in kube_broker
+assert 'subprocess.run(args' in hubble
+assert '"--port-forward"' in hubble and '"jsonpb"' in hubble
+assert 'MAX_EVENTS = 200' in hubble
+assert 'namespace_allowlist' in hubble and 'namespace_denylist' in hubble
+for forbidden in ('"url":', '"headers":', '"body":', 'shell=True', 'os.system'):
+    assert forbidden not in hubble, forbidden
+assert 'raw_flow_bodies_returned": False' in hubble
+assert 'LIMIT 2000' in cp_main
 
 # Generic typed provider contracts retain their credential boundary and no arbitrary command generation.
 for forbidden in ("subprocess", "os.system", "shell=True", "curl | sh"):

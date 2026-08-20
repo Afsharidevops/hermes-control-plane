@@ -376,6 +376,19 @@ def init_db() -> None:
                 created_at INTEGER NOT NULL,
                 FOREIGN KEY(cluster_id) REFERENCES clusters(id)
             );
+
+            CREATE TABLE IF NOT EXISTS hubble_flow_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cluster_id TEXT NOT NULL,
+                observed_at INTEGER NOT NULL,
+                fingerprint TEXT NOT NULL,
+                event_json TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                UNIQUE(cluster_id, fingerprint),
+                FOREIGN KEY(cluster_id) REFERENCES clusters(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_hubble_flow_events_cluster_time
+                ON hubble_flow_events(cluster_id, observed_at DESC, id DESC);
             """
         )
 
@@ -605,7 +618,7 @@ def init_db() -> None:
         if "addon_versions_json" not in blueprint_cols:
             conn.execute("ALTER TABLE cluster_blueprints ADD COLUMN addon_versions_json TEXT NOT NULL DEFAULT '{}'")
 
-        conn.execute("PRAGMA user_version = 8")
+        conn.execute("PRAGMA user_version = 9")
         conn.commit()
 
 

@@ -373,3 +373,57 @@ def test_execution_rejects_toolchain_binding_drift(monkeypatch):
     with pytest.raises(Exception) as exc:
         main.execute(req, authorization="Bearer test-token")
     assert "kubectl toolchain changed after preview" in str(exc.value)
+
+
+def test_hubble_sanitizes_raw_l7_and_aggregates(monkeypatch):
+    from hermes_kubernetes_broker import hubble
+
+    class Proc:
+        returncode = 0
+        stderr = ""
+        stdout = "\n".join([
+            json.dumps({"flow": {
+                "time": "2026-08-20T10:00:00Z",
+                "verdict": "FORWARDED",
+                "source": {"namespace": "apps", "pod_name": "api-1", "workloads": [{"kind": "Deployment", "name": "api"}]},
+                "destination": {"namespace": "apps", "pod_name": "db-1", "workloads": [{"kind": "StatefulSet", "name": "db"}]},
+                "l4": {"TCP": {"destination_port": 5432}},
+                "l7": {"http": {"method": "POST", "code": 201, "url": "https://secret.internal/token", "headers": [{"key": "authorization", "value": "Bearer nope"}]}}
+            }}),
+            json.dumps({"flow": {
+                "time": "2026-08-20T10:00:01Z",
+                "verdict": "DROPPED",
+                "drop_reason_desc": "POLICY_DENIED",
+                "source": {"namespace": "other", "pod_name": "x"},
+                "destination": {"namespace": "apps", "pod_name": "api-1"},
+                "l4": {"TCP": {"destination_port": 443}}
+            }}),
+        ])
+
+    seen = {}
+    def fake_run(args, **kwargs):
+        seen["args"] = args
+        seen["env"] = kwargs.get("env")
+        return Proc()
+
+    monkeypatch.setattr(hubble.subprocess, "run", fake_run)
+    result = hubble.collect(
+        snapshot={"kind": "kubernetes", "scope": {"namespace_allowlist": ["apps"]}},
+        env={"KUBECONFIG": "/credentials/kubeconfigs/cred.yaml"},
+        last=20,
+        since_seconds=30,
+    )
+    assert seen["args"] == ["hubble", "observe", "--port-forward", "--output", "jsonpb", "--last", "20", "--since", "30s"]
+    assert len(result["events"]) == 1
+    encoded = json.dumps(result)
+    assert "secret.internal" not in encoded
+    assert "Bearer nope" not in encoded
+    assert result["events"][0]["http"] == {"method": "POST", "status_class": "2xx"}
+    assert result["summary"]["verdict_counts"] == {"FORWARDED": 1}
+    assert result["raw_flow_bodies_returned"] is False
+
+
+def test_hubble_rejects_unbounded_request():
+    from hermes_kubernetes_broker import hubble
+    with pytest.raises(hubble.HubbleError):
+        hubble.collect(snapshot={"kind": "kubernetes", "scope": {}}, env={}, last=201)

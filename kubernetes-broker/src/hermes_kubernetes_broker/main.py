@@ -13,11 +13,13 @@ import threading
 from pathlib import Path
 from typing import Any, Literal
 
+from . import hubble as hubble_provider
+
 import yaml
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 
-VERSION = "0.5.11-dev.1"
+VERSION = "0.5.11-dev.5"
 CREDENTIAL_ROOT = Path(os.getenv("HERMES_KUBECONFIG_ROOT", "/credentials/kubeconfigs"))
 TOKEN = os.getenv("HERMES_KUBERNETES_BROKER_TOKEN", "")
 EXECUTION_KEY = os.getenv("HERMES_EXECUTION_HMAC_KEY", "")
@@ -63,6 +65,12 @@ class DiscoveryRequest(StrictModel):
 class ExecuteRequest(StrictModel):
     ticket: dict[str, Any]
     signature: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class HubbleCollectRequest(StrictModel):
+    target_snapshot: dict[str, Any]
+    last: int = Field(default=50, ge=1, le=200)
+    since_seconds: int | None = Field(default=None, ge=1, le=3600)
 
 
 def canonical_json(value: Any) -> str:
@@ -942,6 +950,7 @@ def health() -> dict[str, Any]:
         "dynamic_kubectl": DYNAMIC_KUBECTL_ENABLED,
         "kubectl_minors": [f"1.{x}" for x in sorted(_kubectl_inventory())] if DYNAMIC_KUBECTL_ENABLED else [],
         "helm": subprocess.run(["helm", "version", "--short"], capture_output=True, text=True).returncode == 0,
+        "hubble": shutil.which("hubble") is not None,
     }
 
 
@@ -977,6 +986,23 @@ def discover(payload: DiscoveryRequest, authorization: str | None = Header(defau
         nodes = _run_json(["kubectl", "get", "nodes", "-o", "json"], snapshot)
     toolchain = _kubectl_toolchain(snapshot)
     return {"version": version, "namespaces": namespaces, "nodes": nodes, "workloads": workloads, "policy_scope": scope, "secret_data_requested": False, "toolchain": toolchain}
+
+
+@app.post("/v1/hubble/collect")
+def collect_hubble(payload: HubbleCollectRequest, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_token(authorization)
+    snapshot = _target(payload.target_snapshot)
+    if snapshot.get("status") not in {None, "configured"}:
+        raise HTTPException(409, "Kubernetes target is disabled")
+    try:
+        return hubble_provider.collect(
+            snapshot=snapshot,
+            env=_env(snapshot),
+            last=payload.last,
+            since_seconds=payload.since_seconds,
+        )
+    except hubble_provider.HubbleError as exc:
+        raise HTTPException(502, str(exc)) from exc
 
 
 @app.post("/v1/preview")
