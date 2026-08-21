@@ -440,15 +440,17 @@ def artifact_mirror_runtime_capable(plan: dict[str, Any]) -> bool:
     artifact = plan.get("artifact") if isinstance(plan.get("artifact"), dict) else {}
     source_scheme = urlparse(str(artifact.get("source") or "")).scheme.lower()
     destination_scheme = urlparse(str(artifact.get("destination") or "")).scheme.lower()
-    blob_runtime = source_scheme in {"file", "https"} and destination_scheme == "file"
+    git_release_runtime = artifact.get("kind") == "git-release" and source_scheme == "https" and destination_scheme == "file"
+    blob_runtime = source_scheme in {"file", "https"} and destination_scheme == "file" and not git_release_runtime
     oci_runtime = artifact.get("kind") in {"oci-image", "helm-chart"} and source_scheme == "oci" and destination_scheme == "oci"
-    return plan.get("operation") == "artifact.mirror.apply" and (blob_runtime or oci_runtime)
+    return plan.get("operation") == "artifact.mirror.apply" and (blob_runtime or oci_runtime or git_release_runtime)
 
 
 def artifact_mirror_plan(*, artifact_snapshot: dict[str, Any], parameters: dict[str, Any]) -> dict[str, Any]:
     validate_artifact_mirror_parameters(parameters)
     source_scheme = urlparse(str(artifact_snapshot["source"])).scheme.lower()
     destination_scheme = urlparse(str(artifact_snapshot["destination"])).scheme.lower()
+    git_release_runtime = artifact_snapshot.get("kind") == "git-release" and source_scheme == "https" and destination_scheme == "file"
     runtime_capable = (
         (source_scheme in {"file", "https"} and destination_scheme == "file")
         or (artifact_snapshot.get("kind") in {"oci-image", "helm-chart"} and source_scheme == "oci" and destination_scheme == "oci")
@@ -465,10 +467,12 @@ def artifact_mirror_plan(*, artifact_snapshot: dict[str, Any], parameters: dict[
             "destination": artifact_snapshot["destination"],
             "version": artifact_snapshot["version"],
             "digest": artifact_snapshot["digest"],
+            "labels": ({key: artifact_snapshot.get("labels", {}).get(key) for key in ("git_ref", "git_commit") if artifact_snapshot.get("labels", {}).get(key) is not None} if artifact_snapshot.get("kind") == "git-release" else {}),
         },
         "parameters": {"verify_destination": True, "replace_existing": bool(parameters.get("replace_existing", False))},
         "runtime": {
             "state": "RUNTIME_CAPABLE" if runtime_capable else "CONTRACT_ONLY",
+            "mode": "git-release-exact-tag-archive" if git_release_runtime else ("oci-registry" if source_scheme == "oci" else "digest-pinned-blob"),
             "executor": "artifact-mirror-worker" if runtime_capable else "artifact-mirror-contract",
             "source_scheme": source_scheme,
             "destination_scheme": destination_scheme,

@@ -326,3 +326,12 @@ The provisioning plan copies only bounded resolver output: artifact ID, componen
 Before a provider job can be authorized, Hermes re-resolves the current blueprint manifest and requires the same exact `READY` manifest hash. Mirror verification or dependency drift after approval therefore fails closed rather than silently changing the artifact supply. Existing online blueprints with no artifact dependency binding remain backward-compatible.
 
 This closes the resolver-to-provisioning-plan consumption boundary only. `provisioner_rewrite_applied` remains false: trusted Kubespray/K3s/RKE2 provider workers still need to consume these bounded references and deterministically rewrite/install from offline mirrors. apt/yum/dnf and Python repository metadata synchronization, broader Ansible/Git catalogs, generalized authenticated repository delivery, and broader signature/provenance policy remain open.
+
+
+## Current continuation — bounded exact-tag Git release archive mirror
+
+`git-release` artifacts now have a bounded candidate runtime for allowlisted public HTTPS Git repositories. The ChangeSet-bound artifact plan carries only the exact immutable tag reference (`refs/tags/...`) and exact commit object ID needed by the worker. The worker disables credential helpers/prompts and all non-HTTPS Git protocols, disables HTTP redirects, uses fixed Git command vectors only, resolves the source tag before fetch, performs a depth-one exact-ref fetch, rejects repositories containing `.gitmodules`, and produces a canonical tar archive with `git archive`.
+
+The canonical archive SHA-256 must equal the artifact's pinned digest before atomic publication. The destination is independently rehashed, an already-correct destination is idempotent, mismatched existing output is fail-closed unless the exact approved plan included replacement, network calls have a fixed two-attempt bound, and no raw Git stderr or credential material is returned.
+
+This slice does **not** claim full Git repository mirroring, arbitrary ref/history preservation, submodule synchronization, or signed tag/commit provenance verification. It is a deterministic release-source prerequisite that can later supply a pinned Kubespray source archive; actual trusted Kubespray worker extraction/rewrite/install and apt/yum/dnf/Python/Ansible repository closure remain open. This continuation is not a completed dev.5 slice until it has its own forward-only commit, push, and exact-SHA `validate` success.

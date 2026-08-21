@@ -97,12 +97,14 @@ assert (ROOT / "control-plane/src/hermes_control_plane/verification.py").is_file
 assert (ROOT / "control-plane/tests/test_dev5_artifact_mirror_runtime.py").is_file()
 assert (ROOT / "control-plane/src/hermes_control_plane/artifact_mirror.py").is_file()
 assert (ROOT / "control-plane/tests/test_dev5_blueprint_artifact_resolver.py").is_file()
+assert (ROOT / "control-plane/tests/test_dev5_git_release_mirror_runtime.py").is_file()
 cluster_factory = (ROOT / "control-plane/src/hermes_control_plane/cluster_factory.py").read_text()
 assert "resolve_blueprint_artifact_manifest" in cluster_factory
 assert "credential_material_in_manifest" in cluster_factory
 assert "provisioner_rewrite_applied" in cluster_factory
 assert '"artifact_dependencies_json"' in db
 assert "oci_registry_mirror" in (ROOT / "control-plane/tests/test_dev5_artifact_mirror_runtime.py").read_text()
+assert "git_release" in (ROOT / "control-plane/tests/test_dev5_git_release_mirror_runtime.py").read_text()
 assert services["control-plane"]["environment"]["HERMES_ARTIFACT_SOURCE_ROOT"] == "/data/artifact-source"
 assert services["control-plane"]["environment"]["HERMES_ARTIFACT_MIRROR_ROOT"] == "/data/artifact-mirror"
 assert "HERMES_ARTIFACT_HTTPS_HOST_ALLOWLIST" in services["control-plane"]["environment"]

@@ -28,6 +28,8 @@ _HELM_MANIFEST_MEDIA_TYPE = "application/vnd.oci.image.manifest.v1+json"
 _HELM_CONFIG_MEDIA_TYPE = "application/vnd.cncf.helm.config.v1+json"
 _HELM_CHART_LAYER_MEDIA_TYPE = "application/vnd.cncf.helm.chart.content.v1.tar+gzip"
 _HELM_PROVENANCE_LAYER_MEDIA_TYPE = "application/vnd.cncf.helm.chart.provenance.v1.prov"
+_GIT_COMMIT_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+_GIT_TAG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,159}$")
 
 
 def _oci_registry_allowlisted(host: str, *, destination: bool) -> bool:
@@ -159,6 +161,212 @@ def _validate_helm_manifest(raw_manifest: bytes) -> dict[str, Any]:
         "chart_layer_media_type": _HELM_CHART_LAYER_MEDIA_TYPE,
         "provenance_layer_present": _HELM_PROVENANCE_LAYER_MEDIA_TYPE in media_types,
     }
+
+
+def _git_binary() -> str:
+    binary = os.getenv("HERMES_GIT_BINARY", "git").strip()
+    if not binary or "/" in binary or binary != "git":
+        raise ArtifactMirrorError("HERMES_GIT_BINARY must be the pinned command name git")
+    return binary
+
+
+def _git_env() -> dict[str, str]:
+    return {
+        **os.environ,
+        "LC_ALL": "C",
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_ASKPASS": "/bin/false",
+        "SSH_ASKPASS": "/bin/false",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CONFIG_SYSTEM": "/dev/null",
+    }
+
+
+def _run_git(args: list[str], *, timeout: int | None = None, allowed_returncodes: set[int] | None = None) -> subprocess.CompletedProcess[bytes]:
+    command = [
+        _git_binary(),
+        "-c", "credential.helper=",
+        "-c", "http.followRedirects=false",
+        "-c", "http.sslVerify=true",
+        "-c", "protocol.file.allow=never",
+        "-c", "protocol.ssh.allow=never",
+        "-c", "protocol.git.allow=never",
+        "-c", "protocol.ext.allow=never",
+        "-c", "protocol.http.allow=never",
+        "-c", "protocol.https.allow=always",
+        *args,
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout or _timeout_seconds(),
+            check=False,
+            env=_git_env(),
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise ArtifactMirrorError("Git release mirror operation timed out") from exc
+    except OSError as exc:
+        raise ArtifactMirrorError(f"Git release runtime failed to start: {type(exc).__name__}") from exc
+    allowed = {0} if allowed_returncodes is None else allowed_returncodes
+    if completed.returncode not in allowed:
+        raise ArtifactMirrorError(f"Git release operation failed with exit code {completed.returncode}")
+    return completed
+
+
+def _run_git_network(args: list[str], *, timeout: int | None = None) -> subprocess.CompletedProcess[bytes]:
+    last_error: ArtifactMirrorError | None = None
+    for attempt in range(1, 3):
+        try:
+            return _run_git(args, timeout=timeout)
+        except ArtifactMirrorError as exc:
+            last_error = exc
+            if attempt == 2:
+                raise
+    raise last_error or ArtifactMirrorError("Git release network operation failed")
+
+
+def _git_release_binding(artifact: dict[str, Any]) -> tuple[str, str]:
+    labels = artifact.get("labels") if isinstance(artifact.get("labels"), dict) else {}
+    unknown = sorted(set(labels) - {"git_ref", "git_commit"})
+    if unknown:
+        raise ArtifactMirrorError(f"git-release labels contain unsupported keys: {', '.join(unknown)}")
+    git_ref = str(labels.get("git_ref") or "")
+    git_commit = str(labels.get("git_commit") or "").lower()
+    if not git_ref.startswith("refs/tags/"):
+        raise ArtifactMirrorError("git-release git_ref must be an immutable refs/tags/... reference")
+    tag_name = git_ref[len("refs/tags/"):]
+    if (
+        not _GIT_TAG_RE.fullmatch(tag_name)
+        or ".." in tag_name
+        or "//" in tag_name
+        or "@{" in tag_name
+        or tag_name.endswith((".", "/", ".lock"))
+        or tag_name.startswith(".")
+    ):
+        raise ArtifactMirrorError("git-release git_ref contains an unsafe tag name")
+    if not _GIT_COMMIT_RE.fullmatch(git_commit):
+        raise ArtifactMirrorError("git-release git_commit must be an exact 40- or 64-hex commit ID")
+    version = str(artifact.get("version") or "")
+    if version not in {tag_name, tag_name[1:] if tag_name.startswith("v") else tag_name}:
+        raise ArtifactMirrorError("git-release version must match the immutable source tag")
+    return git_ref, git_commit
+
+
+def _validate_git_source(uri: str) -> str:
+    _validate_https_source(uri)
+    parsed = urlparse(uri)
+    if parsed.params or parsed.query or parsed.fragment:
+        raise ArtifactMirrorError("git-release source must not contain params, query, or fragment")
+    if not parsed.path or parsed.path.endswith("/"):
+        raise ArtifactMirrorError("git-release source must identify an HTTPS repository path")
+    return uri
+
+
+def _remote_git_commit(source: str, git_ref: str) -> str:
+    peeled_ref = f"{git_ref}^{{}}"
+    completed = _run_git_network(["ls-remote", "--exit-code", source, git_ref, peeled_ref])
+    refs: dict[str, str] = {}
+    for raw in completed.stdout.decode("ascii", errors="strict").splitlines():
+        parts = raw.split("\t", 1)
+        if len(parts) != 2:
+            raise ArtifactMirrorError("git ls-remote returned malformed output")
+        object_id, ref_name = parts
+        if not _GIT_COMMIT_RE.fullmatch(object_id.lower()):
+            raise ArtifactMirrorError("git ls-remote returned an unsupported object ID")
+        if ref_name not in {git_ref, peeled_ref}:
+            raise ArtifactMirrorError("git ls-remote returned an unexpected reference")
+        refs[ref_name] = object_id.lower()
+    resolved = refs.get(peeled_ref) or refs.get(git_ref)
+    if not resolved:
+        raise ArtifactMirrorError("git-release source tag was not found")
+    return resolved
+
+
+def _execute_git_release(typed_plan: dict[str, Any], artifact: dict[str, Any], expected: str, observed_at: int) -> dict[str, Any]:
+    artifact_id = str(artifact.get("id") or "")
+    source = str(artifact.get("source") or "")
+    destination = str(artifact.get("destination") or "")
+    base_evidence: dict[str, Any] = {
+        "source_scheme": "https",
+        "destination_scheme": "file",
+        "artifact_kind": "git-release",
+        "transport": "git-https-exact-tag",
+        "archive_format": "tar",
+        "arbitrary_shell": False,
+        "caller_git_flags": False,
+        "raw_credentials_returned": False,
+        "credential_helpers_disabled": True,
+        "redirects_followed": False,
+        "submodules_supported": False,
+        "network_attempt_limit": 2,
+    }
+    try:
+        source = _validate_git_source(source)
+        git_ref, git_commit = _git_release_binding(artifact)
+        base_evidence = {**base_evidence, "git_ref": git_ref, "git_commit": git_commit}
+        mirror_root = _root("HERMES_ARTIFACT_MIRROR_ROOT", "/data/artifact-mirror")
+        destination_path = _file_uri_path(destination, root=mirror_root, purpose="git-release destination")
+        destination_path.parent.mkdir(parents=True, exist_ok=True)
+        max_bytes = _max_bytes()
+        if destination_path.exists():
+            destination_digest, destination_bytes = _sha256_path(destination_path, max_bytes=max_bytes)
+            if destination_digest == expected:
+                checks = [
+                    {"id": "git-source-commit", "status": "SKIP", "summary": "destination already contains the exact pinned Git release archive", "evidence": {"reason": "idempotent-hit", "git_commit": git_commit}},
+                    {"id": "destination-digest", "status": "PASS", "summary": "existing Git release archive matches the pinned SHA-256 digest", "evidence": {"digest": destination_digest, "bytes": destination_bytes}},
+                ]
+                return {"schema_version": 1, "artifact_id": artifact_id, "state": "ALREADY_MIRRORED", "bytes": destination_bytes, "digest": destination_digest, "verification": {"observed_at": observed_at, "checks": checks, "evidence": {**base_evidence, "idempotent": True, "atomic_replace": False}}}
+            if not bool((typed_plan.get("parameters") or {}).get("replace_existing", False)):
+                checks = [_failure("destination-digest", "existing Git release archive differs from the pinned digest and replace_existing is false", evidence={"observed_digest": destination_digest})]
+                return {"schema_version": 1, "artifact_id": artifact_id, "state": "FAILED", "verification": {"observed_at": observed_at, "checks": checks, "evidence": base_evidence}}
+
+        remote_commit = _remote_git_commit(source, git_ref)
+        if remote_commit != git_commit:
+            checks = [_failure("git-source-commit", "Git release tag does not resolve to the exact pinned commit", evidence={"expected_commit": git_commit, "observed_commit": remote_commit})]
+            return {"schema_version": 1, "artifact_id": artifact_id, "state": "FAILED", "verification": {"observed_at": observed_at, "checks": checks, "evidence": base_evidence}}
+
+        with tempfile.TemporaryDirectory(prefix=".hermes-git-release-", dir=mirror_root) as tmp:
+            tmp_root = Path(tmp)
+            repo_path = tmp_root / "repo.git"
+            archive_path = tmp_root / "release.tar"
+            _run_git(["init", "--bare", str(repo_path)])
+            _run_git_network(["-C", str(repo_path), "fetch", "--no-tags", "--depth=1", source, f"+{git_ref}:{git_ref}"], timeout=min(300, max(30, _timeout_seconds() * 3)))
+            resolved = _run_git(["-C", str(repo_path), "rev-parse", f"{git_ref}^{{commit}}"])
+            fetched_commit = resolved.stdout.decode("ascii", errors="strict").strip().lower()
+            if fetched_commit != git_commit:
+                raise ArtifactMirrorError("fetched Git release commit differs from the pinned commit")
+            submodule_probe = _run_git(["-C", str(repo_path), "cat-file", "-e", f"{git_commit}:.gitmodules"], allowed_returncodes={0, 1, 128})
+            if submodule_probe.returncode == 0:
+                raise ArtifactMirrorError("git-release repositories containing .gitmodules are unsupported by the bounded archive runtime")
+            _run_git(["-C", str(repo_path), "archive", "--format=tar", f"--output={archive_path}", git_commit], timeout=min(300, max(30, _timeout_seconds() * 3)))
+            source_digest, byte_count = _sha256_path(archive_path, max_bytes=max_bytes)
+            if source_digest != expected:
+                checks = [
+                    {"id": "git-source-commit", "status": "PASS", "summary": "Git release tag resolves to the exact pinned commit", "evidence": {"git_ref": git_ref, "git_commit": git_commit}},
+                    _failure("source-digest", "canonical Git release archive digest does not match the pinned SHA-256 digest", evidence={"observed_digest": source_digest, "bytes": byte_count}),
+                ]
+                return {"schema_version": 1, "artifact_id": artifact_id, "state": "FAILED", "verification": {"observed_at": observed_at, "checks": checks, "evidence": base_evidence}}
+            os.replace(archive_path, destination_path)
+
+        destination_digest, destination_bytes = _sha256_path(destination_path, max_bytes=max_bytes)
+        if destination_digest != expected:
+            checks = [_failure("destination-digest", "mirrored Git release archive does not match the pinned SHA-256 digest", evidence={"observed_digest": destination_digest})]
+            return {"schema_version": 1, "artifact_id": artifact_id, "state": "FAILED", "verification": {"observed_at": observed_at, "checks": checks, "evidence": base_evidence}}
+        checks = [
+            {"id": "git-source-commit", "status": "PASS", "summary": "Git release tag resolves to the exact pinned commit", "evidence": {"git_ref": git_ref, "git_commit": git_commit}},
+            {"id": "source-digest", "status": "PASS", "summary": "canonical Git release archive matches the pinned SHA-256 digest", "evidence": {"digest": expected, "bytes": destination_bytes}},
+            {"id": "destination-digest", "status": "PASS", "summary": "mirrored Git release archive matches the pinned SHA-256 digest", "evidence": {"digest": destination_digest, "bytes": destination_bytes}},
+        ]
+        return {"schema_version": 1, "artifact_id": artifact_id, "state": "MIRRORED", "bytes": destination_bytes, "digest": destination_digest, "verification": {"observed_at": observed_at, "checks": checks, "evidence": {**base_evidence, "idempotent": False, "atomic_replace": True}}}
+    except ArtifactMirrorError as exc:
+        checks = [_failure("artifact-mirror-runtime", str(exc), evidence={"error_type": type(exc).__name__})]
+        return {"schema_version": 1, "artifact_id": artifact_id, "state": "FAILED", "verification": {"observed_at": observed_at, "checks": checks, "evidence": base_evidence}}
+    except (OSError, UnicodeDecodeError) as exc:
+        checks = [_failure("artifact-mirror-runtime", f"Git release mirror I/O failed: {type(exc).__name__}", evidence={"error_type": type(exc).__name__})]
+        return {"schema_version": 1, "artifact_id": artifact_id, "state": "FAILED", "verification": {"observed_at": observed_at, "checks": checks, "evidence": base_evidence}}
 
 
 def _execute_oci(typed_plan: dict[str, Any], artifact: dict[str, Any], expected: str, observed_at: int) -> dict[str, Any]:
@@ -406,9 +614,10 @@ def _open_https(uri: str):  # noqa: ANN202
 def runtime_capability(source: str, destination: str, *, kind: str = "") -> dict[str, Any]:
     source_scheme = urlparse(source).scheme.lower()
     destination_scheme = urlparse(destination).scheme.lower()
-    blob_capable = source_scheme in {"file", "https"} and destination_scheme == "file"
+    git_release_capable = kind == "git-release" and source_scheme == "https" and destination_scheme == "file"
+    blob_capable = source_scheme in {"file", "https"} and destination_scheme == "file" and not git_release_capable
     oci_capable = kind in {"oci-image", "helm-chart"} and source_scheme == "oci" and destination_scheme == "oci"
-    capable = blob_capable or oci_capable
+    capable = blob_capable or oci_capable or git_release_capable
     return {
         "capable": capable,
         "executor": "artifact-mirror-worker" if capable else "artifact-mirror-contract",
@@ -448,6 +657,8 @@ def execute(typed_plan: dict[str, Any]) -> dict[str, Any]:
     if not expected.startswith("sha256:") or len(expected) != 71:
         checks = [_failure("source-digest", "artifact plan is missing a pinned sha256 digest")]
         return {"schema_version": 1, "artifact_id": artifact_id, "state": "FAILED", "verification": {"observed_at": observed_at, "checks": checks, "evidence": base_evidence}}
+    if str(artifact.get("kind") or "") == "git-release" and capability["source_scheme"] == "https" and capability["destination_scheme"] == "file":
+        return _execute_git_release(typed_plan, artifact, expected, observed_at)
     if capability["source_scheme"] == "oci" and capability["destination_scheme"] == "oci":
         return _execute_oci(typed_plan, artifact, expected, observed_at)
 
