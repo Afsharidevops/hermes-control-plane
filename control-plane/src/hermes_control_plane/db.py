@@ -263,6 +263,7 @@ def init_db() -> None:
                 topology_json TEXT NOT NULL,
                 addon_defaults_json TEXT NOT NULL,
                 addon_versions_json TEXT NOT NULL,
+                artifact_dependencies_json TEXT NOT NULL DEFAULT '[]',
                 labels_json TEXT NOT NULL,
                 status TEXT NOT NULL,
                 created_at INTEGER NOT NULL,
@@ -617,8 +618,10 @@ def init_db() -> None:
             conn.execute("ALTER TABLE cluster_blueprints ADD COLUMN provider_version TEXT NOT NULL DEFAULT 'legacy-unpinned'")
         if "addon_versions_json" not in blueprint_cols:
             conn.execute("ALTER TABLE cluster_blueprints ADD COLUMN addon_versions_json TEXT NOT NULL DEFAULT '{}'")
+        if "artifact_dependencies_json" not in blueprint_cols:
+            conn.execute("ALTER TABLE cluster_blueprints ADD COLUMN artifact_dependencies_json TEXT NOT NULL DEFAULT '[]'")
 
-        conn.execute("PRAGMA user_version = 9")
+        conn.execute("PRAGMA user_version = 10")
         conn.commit()
 
 

@@ -304,4 +304,15 @@ Runtime/security properties:
 - an already-correct destination is idempotent; a mismatched destination tag fails unless the exact approved plan included `replace_existing=true`
 - returned evidence identifies the typed Helm OCI path and media types without returning raw credentials or stderr
 
-This remains **partial air-gap closure**. apt/yum/dnf repository metadata and packages, Python indexes/wheels/sdists, Ansible/Git-release mirroring where required, generalized authenticated repository delivery, broader signature/provenance policy, ClusterBlueprint dependency resolution, offline reference rewriting, graph ordering, and graph-level partial-sync recovery remain open.
+This remains **partial air-gap closure**. apt/yum/dnf repository metadata and packages, Python indexes/wheels/sdists, Ansible/Git-release mirroring where required, generalized authenticated repository delivery, broader signature/provenance policy, and provisioner-side offline reference rewriting remain open. A subsequent slice now adds deterministic ClusterBlueprint artifact binding, verified destination selection and dependency DAG ordering/resume evidence.
+
+
+## Slice 14 — Deterministic ClusterBlueprint artifact dependency resolution
+
+ClusterBlueprints now persist an explicit bounded list of artifact mirror item IDs. The binding is admin-controlled, rejects duplicate or malformed IDs, and requires each referenced artifact to exist. This does not infer authority from names or arbitrary repository content.
+
+`GET /v1/cluster-blueprints/{id}/artifact-manifest` resolves the blueprint's exact provider pin, Kubernetes pin and required/selected add-on pins against those bound artifacts. Each artifact must carry non-secret `blueprint_component`, `blueprint_name`, and `dependency_key` labels, must match the exact blueprint version, and must have persisted `PASS` / `MIRRORED` verification. The resulting manifest deliberately omits source URLs and arbitrary labels and exposes only exact digest/version, verified offline destination reference and bounded verification identifiers. `file://` and `oci://` offline destinations are revalidated as credential-free references before selection.
+
+Optional `depends_on` labels contain bound artifact IDs only. Hermes rejects self edges, unbound edges, duplicate dependency keys and graph cycles, then emits a deterministic topological `dependency_order`. If any bound artifact is unverified or otherwise invalid, the manifest is `BLOCKED` and includes `resume_from_artifact_id` for deterministic partial-sync continuation. The entire manifest is exact-hashed.
+
+This closes the deterministic ClusterBlueprint-to-artifact selection/ordering layer and graph-level resume evidence. It does **not** yet mutate Kubespray/K3s/RKE2 inputs to consume the selected offline references, and it does not claim apt/yum/dnf or Python repository-metadata synchronization, Ansible/Git catalog closure, generalized repository credentials or broader signature/provenance policy.

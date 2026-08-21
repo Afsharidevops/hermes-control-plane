@@ -65,6 +65,7 @@ from .models import (
     ProviderJobRetry,
     ClusterBlueprintCreate,
     OperationalProfileBlueprintCreate,
+    ClusterBlueprintArtifactDependenciesUpdate,
     ClusterProfileCreate,
     ClusterCreate,
     NodeRoleCreate,
@@ -396,6 +397,7 @@ def _blueprint_dict(row: Any) -> dict[str, Any]:
     item = _row_json(row, {"topology_json": "topology", "labels_json": "labels"})
     item["addon_defaults"] = json.loads(item.pop("addon_defaults_json") or "[]")
     item["addon_versions"] = json.loads(item.pop("addon_versions_json") or "{}")
+    item["artifact_dependencies"] = json.loads(item.pop("artifact_dependencies_json") or "[]")
     item["hubble_enabled"] = bool(item["hubble_enabled"])
     item["radar_enabled"] = bool(item["radar_enabled"])
     return item
@@ -2418,6 +2420,21 @@ def _validate_blueprint_addon_pins(*, addon_defaults: list[str], addon_versions:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
+def _validate_blueprint_artifact_dependency_ids(conn, artifact_ids: list[str]) -> None:
+    if len(artifact_ids) != len(set(artifact_ids)):
+        raise HTTPException(status_code=422, detail="cluster blueprint artifact dependency IDs must be unique")
+    for artifact_id in artifact_ids:
+        if not re.fullmatch(r"art_[0-9a-f]{16}", artifact_id):
+            raise HTTPException(status_code=422, detail="cluster blueprint artifact dependency ID is invalid")
+        _get_artifact_mirror_item(conn, artifact_id)
+
+
+def _blueprint_artifact_manifest(conn, blueprint_id: str) -> dict[str, Any]:
+    blueprint = _blueprint_dict(_get_blueprint(conn, blueprint_id))
+    artifacts = [_artifact_mirror_item_dict(row) for row in conn.execute("SELECT * FROM artifact_mirror_items ORDER BY id").fetchall()]
+    return cluster_factory.resolve_blueprint_artifact_manifest(blueprint=blueprint, artifacts=artifacts)
+
+
 @app.get("/v1/cluster-factory/operational-profiles")
 def list_operational_profiles() -> dict[str, Any]:
     return cluster_factory.OPERATIONAL_PROFILES
@@ -2430,10 +2447,11 @@ def create_cluster_blueprint(payload: ClusterBlueprintCreate, authorization: str
     blueprint_id = f"cbp_{uuid.uuid4().hex[:16]}"
     now = int(time.time())
     with closing(db.connect()) as conn:
+        _validate_blueprint_artifact_dependency_ids(conn, payload.artifact_dependencies)
         try:
             conn.execute(
-                "INSERT INTO cluster_blueprints (id,name,description,provider,provider_version,kubernetes_version,network_plugin,hubble_enabled,radar_enabled,topology_json,addon_defaults_json,addon_versions_json,labels_json,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (blueprint_id, payload.name, payload.description, payload.provider, payload.provider_version, payload.kubernetes_version, payload.network_plugin, int(payload.hubble_enabled), int(payload.radar_enabled), json.dumps(payload.topology, sort_keys=True), json.dumps(payload.addon_defaults), json.dumps(payload.addon_versions, sort_keys=True), json.dumps(payload.labels, sort_keys=True), "configured", now, now),
+                "INSERT INTO cluster_blueprints (id,name,description,provider,provider_version,kubernetes_version,network_plugin,hubble_enabled,radar_enabled,topology_json,addon_defaults_json,addon_versions_json,artifact_dependencies_json,labels_json,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (blueprint_id, payload.name, payload.description, payload.provider, payload.provider_version, payload.kubernetes_version, payload.network_plugin, int(payload.hubble_enabled), int(payload.radar_enabled), json.dumps(payload.topology, sort_keys=True), json.dumps(payload.addon_defaults), json.dumps(payload.addon_versions, sort_keys=True), json.dumps(payload.artifact_dependencies), json.dumps(payload.labels, sort_keys=True), "configured", now, now),
             )
         except Exception as exc:
             if "UNIQUE constraint failed" in str(exc):
@@ -2455,10 +2473,11 @@ def create_blueprint_from_operational_profile(payload: OperationalProfileBluepri
     blueprint_id = f"cbp_{uuid.uuid4().hex[:16]}"
     now = int(time.time())
     with closing(db.connect()) as conn:
+        _validate_blueprint_artifact_dependency_ids(conn, payload.artifact_dependencies)
         try:
             conn.execute(
-                "INSERT INTO cluster_blueprints (id,name,description,provider,provider_version,kubernetes_version,network_plugin,hubble_enabled,radar_enabled,topology_json,addon_defaults_json,addon_versions_json,labels_json,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (blueprint_id, payload.name, payload.description, preset["provider"], payload.provider_version, payload.kubernetes_version, "cilium", 1, 1, json.dumps(preset["topology"], sort_keys=True), json.dumps(addons), json.dumps(payload.addon_versions, sort_keys=True), json.dumps(labels, sort_keys=True), "configured", now, now),
+                "INSERT INTO cluster_blueprints (id,name,description,provider,provider_version,kubernetes_version,network_plugin,hubble_enabled,radar_enabled,topology_json,addon_defaults_json,addon_versions_json,artifact_dependencies_json,labels_json,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (blueprint_id, payload.name, payload.description, preset["provider"], payload.provider_version, payload.kubernetes_version, "cilium", 1, 1, json.dumps(preset["topology"], sort_keys=True), json.dumps(addons), json.dumps(payload.addon_versions, sort_keys=True), json.dumps(payload.artifact_dependencies), json.dumps(labels, sort_keys=True), "configured", now, now),
             )
         except Exception as exc:
             if "UNIQUE constraint failed" in str(exc):
@@ -2476,6 +2495,30 @@ def get_cluster_blueprint(blueprint_id: str, authorization: str | None = Header(
     with closing(db.connect()) as conn:
         row = _get_blueprint(conn, blueprint_id)
     return _blueprint_dict(row)
+
+
+@app.put("/v1/cluster-blueprints/{blueprint_id}/artifact-dependencies")
+def set_cluster_blueprint_artifact_dependencies(blueprint_id: str, payload: ClusterBlueprintArtifactDependenciesUpdate, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_admin(authorization)
+    with closing(db.connect()) as conn:
+        _get_blueprint(conn, blueprint_id)
+        _validate_blueprint_artifact_dependency_ids(conn, payload.artifact_dependencies)
+        now = int(time.time())
+        conn.execute("UPDATE cluster_blueprints SET artifact_dependencies_json=?,updated_at=? WHERE id=?", (json.dumps(payload.artifact_dependencies), now, blueprint_id))
+        db.audit(conn, "cluster_blueprint.artifact_dependencies_updated", "admin", "cluster_blueprint", blueprint_id, {"artifact_ids": payload.artifact_dependencies})
+        conn.commit()
+        row = _get_blueprint(conn, blueprint_id)
+    return _blueprint_dict(row)
+
+
+@app.get("/v1/cluster-blueprints/{blueprint_id}/artifact-manifest")
+def get_cluster_blueprint_artifact_manifest(blueprint_id: str, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_admin(authorization)
+    with closing(db.connect()) as conn:
+        manifest = _blueprint_artifact_manifest(conn, blueprint_id)
+        db.audit(conn, "cluster_blueprint.artifact_manifest_resolved", "admin", "cluster_blueprint", blueprint_id, {"manifest_hash": manifest["manifest_hash"], "state": manifest["state"], "issue_count": len(manifest["issues"])})
+        conn.commit()
+    return manifest
 
 
 @app.get("/v1/cluster-profiles")

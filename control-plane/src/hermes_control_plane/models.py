@@ -300,6 +300,7 @@ class ClusterBlueprintCreate(StrictModel):
     addon_defaults: list[str] = Field(default_factory=list, max_length=32)
     addon_versions: dict[str, str] = Field(default_factory=dict)
     labels: dict[str, str] = Field(default_factory=dict)
+    artifact_dependencies: list[str] = Field(default_factory=list, max_length=512)
 
 
 class OperationalProfileBlueprintCreate(StrictModel):
@@ -310,6 +311,11 @@ class OperationalProfileBlueprintCreate(StrictModel):
     provider_version: str = Field(min_length=1, max_length=80)
     addon_versions: dict[str, str] = Field(default_factory=dict)
     labels: dict[str, str] = Field(default_factory=dict)
+    artifact_dependencies: list[str] = Field(default_factory=list, max_length=512)
+
+
+class ClusterBlueprintArtifactDependenciesUpdate(StrictModel):
+    artifact_dependencies: list[str] = Field(default_factory=list, max_length=512)
 
 
 class ClusterProfileCreate(StrictModel):

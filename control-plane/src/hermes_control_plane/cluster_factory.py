@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any
+from urllib.parse import urlparse
 
 from .canonical import sha256_hex
 
@@ -149,6 +150,183 @@ NATIVE_DIAGNOSTICS: list[dict[str, Any]] = [
     {"id": "certificates.expiry", "source": "kubernetes-broker", "mode": "read-executable", "description": "Inspect cert-manager Certificate readiness/expiry metadata without private keys."},
     {"id": "backup.recency", "source": "kubernetes-broker", "mode": "read-executable", "description": "Inspect Velero Backup phase metadata when the CRD is visible."},
 ]
+
+
+
+
+BLUEPRINT_ARTIFACT_COMPONENT_LABEL = "blueprint_component"
+BLUEPRINT_ARTIFACT_NAME_LABEL = "blueprint_name"
+BLUEPRINT_ARTIFACT_KEY_LABEL = "dependency_key"
+BLUEPRINT_ARTIFACT_DEPENDS_ON_LABEL = "depends_on"
+
+
+def blueprint_required_artifact_components(blueprint: dict[str, Any]) -> list[dict[str, str]]:
+    required_addons = ["cilium", "hermes-agent"]
+    if bool(blueprint.get("hubble_enabled")):
+        required_addons.append("hubble")
+    if bool(blueprint.get("radar_enabled")):
+        required_addons.append("radar")
+    required_addons.extend(list(blueprint.get("addon_defaults") or []))
+    ordered_addons = [name for name in ADDON_CATALOG if name in set(required_addons)]
+    versions = blueprint.get("addon_versions") if isinstance(blueprint.get("addon_versions"), dict) else {}
+    required = [
+        {"component": "provider", "name": str(blueprint.get("provider") or ""), "version": str(blueprint.get("provider_version") or "")},
+        {"component": "kubernetes", "name": "kubernetes", "version": str(blueprint.get("kubernetes_version") or "")},
+    ]
+    required.extend({"component": "addon", "name": name, "version": str(versions.get(name) or "")} for name in ordered_addons)
+    return required
+
+
+def _artifact_offline_reference(artifact: dict[str, Any]) -> tuple[str | None, str | None]:
+    reference = str(artifact.get("destination") or "")
+    parsed = urlparse(reference)
+    if parsed.username is not None or parsed.password is not None:
+        return None, "offline destination contains embedded credentials"
+    if parsed.scheme not in {"file", "oci"}:
+        return None, "offline destination must use file:// or oci://"
+    if parsed.query or parsed.fragment:
+        return None, "offline destination must not contain query or fragment"
+    if parsed.scheme == "file" and (parsed.netloc or not parsed.path.startswith("/")):
+        return None, "offline file destination must be an absolute local file:// URI"
+    if parsed.scheme == "oci" and (not parsed.netloc or not parsed.path.strip("/")):
+        return None, "offline OCI destination must include registry and repository"
+    return reference, None
+
+
+def resolve_blueprint_artifact_manifest(*, blueprint: dict[str, Any], artifacts: list[dict[str, Any]]) -> dict[str, Any]:
+    required = blueprint_required_artifact_components(blueprint)
+    required_map = {(item["component"], item["name"]): item for item in required}
+    bound_ids = list(blueprint.get("artifact_dependencies") or [])
+    issues: list[dict[str, Any]] = []
+    if len(bound_ids) != len(set(bound_ids)):
+        issues.append({"code": "duplicate-binding", "summary": "blueprint artifact dependency IDs must be unique"})
+
+    by_id = {str(item.get("id") or ""): item for item in artifacts}
+    resolved: list[dict[str, Any]] = []
+    coverage: dict[tuple[str, str], int] = {key: 0 for key in required_map}
+    dependency_keys: set[tuple[str, str, str]] = set()
+
+    for artifact_id in bound_ids:
+        artifact = by_id.get(str(artifact_id))
+        if artifact is None:
+            issues.append({"code": "missing-artifact", "artifact_id": artifact_id, "summary": "bound artifact does not exist"})
+            continue
+        labels = artifact.get("labels") if isinstance(artifact.get("labels"), dict) else {}
+        component = str(labels.get(BLUEPRINT_ARTIFACT_COMPONENT_LABEL) or "")
+        name = str(labels.get(BLUEPRINT_ARTIFACT_NAME_LABEL) or "")
+        dependency_key = str(labels.get(BLUEPRINT_ARTIFACT_KEY_LABEL) or "")
+        required_item = required_map.get((component, name))
+        if required_item is None:
+            issues.append({"code": "unexpected-component", "artifact_id": artifact_id, "summary": "artifact labels do not match a required blueprint component"})
+            continue
+        if not dependency_key or len(dependency_key) > 120:
+            issues.append({"code": "invalid-dependency-key", "artifact_id": artifact_id, "summary": "dependency_key label is required and must be at most 120 characters"})
+            continue
+        key_tuple = (component, name, dependency_key)
+        if key_tuple in dependency_keys:
+            issues.append({"code": "duplicate-dependency-key", "artifact_id": artifact_id, "summary": "dependency_key must be unique within a blueprint component"})
+            continue
+        dependency_keys.add(key_tuple)
+        coverage[(component, name)] += 1
+
+        artifact_version = str(artifact.get("version") or "")
+        if artifact_version != required_item["version"]:
+            issues.append({
+                "code": "version-mismatch",
+                "artifact_id": artifact_id,
+                "summary": f"artifact version {artifact_version!r} does not match required {required_item['version']!r}",
+            })
+
+        reference, reference_error = _artifact_offline_reference(artifact)
+        if reference_error:
+            issues.append({"code": "unsafe-offline-reference", "artifact_id": artifact_id, "summary": reference_error})
+
+        verification = artifact.get("verification") if isinstance(artifact.get("verification"), dict) else {}
+        mirrored = verification.get("status") == "PASS" and verification.get("sync_state") == "MIRRORED"
+        if not mirrored:
+            issues.append({"code": "artifact-not-mirrored", "artifact_id": artifact_id, "summary": "artifact has no successful mirrored verification"})
+
+        raw_depends = str(labels.get(BLUEPRINT_ARTIFACT_DEPENDS_ON_LABEL) or "")
+        depends_on = [item.strip() for item in raw_depends.split(",") if item.strip()]
+        if len(depends_on) != len(set(depends_on)):
+            issues.append({"code": "duplicate-edge", "artifact_id": artifact_id, "summary": "depends_on contains duplicate artifact IDs"})
+
+        resolved.append({
+            "artifact_id": str(artifact_id),
+            "component": component,
+            "name": name,
+            "dependency_key": dependency_key,
+            "kind": str(artifact.get("kind") or ""),
+            "version": artifact_version,
+            "digest": str(artifact.get("digest") or ""),
+            "offline_reference": reference,
+            "depends_on": depends_on,
+            "mirrored": mirrored,
+            "verification_id": verification.get("verification_id"),
+            "observed_at": verification.get("observed_at"),
+        })
+
+    for key, item in required_map.items():
+        if coverage[key] == 0:
+            issues.append({"code": "missing-component", "component": item["component"], "name": item["name"], "version": item["version"], "summary": "no artifact is bound for required blueprint component"})
+
+    resolved_by_id = {item["artifact_id"]: item for item in resolved}
+    for item in resolved:
+        for dependency_id in item["depends_on"]:
+            if dependency_id == item["artifact_id"]:
+                issues.append({"code": "self-cycle", "artifact_id": item["artifact_id"], "summary": "artifact cannot depend on itself"})
+            elif dependency_id not in resolved_by_id:
+                issues.append({"code": "unbound-edge", "artifact_id": item["artifact_id"], "dependency_id": dependency_id, "summary": "depends_on references an artifact outside the bound set"})
+
+    indegree = {artifact_id: 0 for artifact_id in resolved_by_id}
+    followers = {artifact_id: [] for artifact_id in resolved_by_id}
+    for item in resolved:
+        for dependency_id in item["depends_on"]:
+            if dependency_id in resolved_by_id and dependency_id != item["artifact_id"]:
+                indegree[item["artifact_id"]] += 1
+                followers[dependency_id].append(item["artifact_id"])
+
+    def sort_key(artifact_id: str) -> tuple[str, str, str, str]:
+        item = resolved_by_id[artifact_id]
+        component_rank = {"provider": "0", "kubernetes": "1", "addon": "2"}.get(item["component"], "9")
+        return (component_rank, item["name"], item["dependency_key"], artifact_id)
+
+    ready = sorted([artifact_id for artifact_id, degree in indegree.items() if degree == 0], key=sort_key)
+    ordered_ids: list[str] = []
+    while ready:
+        artifact_id = ready.pop(0)
+        ordered_ids.append(artifact_id)
+        for follower in sorted(followers[artifact_id], key=sort_key):
+            indegree[follower] -= 1
+            if indegree[follower] == 0:
+                ready.append(follower)
+                ready.sort(key=sort_key)
+    if len(ordered_ids) != len(resolved_by_id):
+        cycle_ids = sorted([artifact_id for artifact_id, degree in indegree.items() if degree > 0])
+        issues.append({"code": "dependency-cycle", "artifact_ids": cycle_ids, "summary": "artifact dependency graph contains a cycle"})
+        ordered_ids.extend(artifact_id for artifact_id in sorted(resolved_by_id, key=sort_key) if artifact_id not in ordered_ids)
+
+    ordered = [resolved_by_id[artifact_id] for artifact_id in ordered_ids]
+    issue_artifacts = {str(issue.get("artifact_id")) for issue in issues if issue.get("artifact_id")}
+    resume_from = next((item["artifact_id"] for item in ordered if not item["mirrored"] or item["artifact_id"] in issue_artifacts), None)
+    state = "READY" if not issues else "BLOCKED"
+    manifest = {
+        "schema_version": 1,
+        "kind": "ClusterBlueprintArtifactManifest",
+        "blueprint_id": str(blueprint.get("id") or ""),
+        "blueprint_name": str(blueprint.get("name") or ""),
+        "state": state,
+        "required_components": required,
+        "bound_artifact_ids": bound_ids,
+        "dependency_order": ordered,
+        "issues": issues,
+        "resume_from_artifact_id": resume_from,
+        "offline_reference_selection": "verified-destination-only",
+        "credential_material_in_manifest": False,
+        "provisioner_rewrite_applied": False,
+    }
+    manifest["manifest_hash"] = sha256_hex(manifest)
+    return manifest
 
 
 def _require_supported_addons(addons: list[str], versions: dict[str, str]) -> None:
