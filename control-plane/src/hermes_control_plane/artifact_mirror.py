@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import socket
 import subprocess
@@ -22,6 +23,11 @@ class ArtifactMirrorError(RuntimeError):
 
 _OCI_TAG_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$")
 _OCI_REPOSITORY_RE = re.compile(r"^[a-z0-9]+(?:(?:[._-]|__)[a-z0-9]+)*(?:/[a-z0-9]+(?:(?:[._-]|__)[a-z0-9]+)*)*$")
+_HELM_VERSION_TAG_RE = re.compile(r"^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:_[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$")
+_HELM_MANIFEST_MEDIA_TYPE = "application/vnd.oci.image.manifest.v1+json"
+_HELM_CONFIG_MEDIA_TYPE = "application/vnd.cncf.helm.config.v1+json"
+_HELM_CHART_LAYER_MEDIA_TYPE = "application/vnd.cncf.helm.chart.content.v1.tar+gzip"
+_HELM_PROVENANCE_LAYER_MEDIA_TYPE = "application/vnd.cncf.helm.chart.provenance.v1.prov"
 
 
 def _oci_registry_allowlisted(host: str, *, destination: bool) -> bool:
@@ -111,11 +117,48 @@ def _run_skopeo(args: list[str], *, timeout: int | None = None, allow_not_found:
     return completed
 
 
-def _raw_manifest_digest(reference: str, *, auth_args: list[str], allow_not_found: bool = False) -> str | None:
+def _raw_manifest(reference: str, *, auth_args: list[str], allow_not_found: bool = False) -> bytes | None:
     completed = _run_skopeo(["inspect", *auth_args, "--raw", reference], allow_not_found=allow_not_found)
-    if completed is None:
+    return None if completed is None else completed.stdout
+
+
+def _raw_manifest_digest(reference: str, *, auth_args: list[str], allow_not_found: bool = False) -> str | None:
+    manifest = _raw_manifest(reference, auth_args=auth_args, allow_not_found=allow_not_found)
+    if manifest is None:
         return None
-    return "sha256:" + hashlib.sha256(completed.stdout).hexdigest()
+    return "sha256:" + hashlib.sha256(manifest).hexdigest()
+
+
+def _validate_helm_manifest(raw_manifest: bytes) -> dict[str, Any]:
+    try:
+        manifest = json.loads(raw_manifest)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ArtifactMirrorError("Helm OCI source manifest is not valid JSON") from exc
+    if not isinstance(manifest, dict) or manifest.get("schemaVersion") != 2:
+        raise ArtifactMirrorError("Helm OCI source manifest must be schemaVersion 2")
+    media_type = str(manifest.get("mediaType") or "")
+    if media_type != _HELM_MANIFEST_MEDIA_TYPE:
+        raise ArtifactMirrorError("Helm OCI source manifest has an unsupported OCI manifest media type")
+    config = manifest.get("config")
+    if not isinstance(config, dict) or config.get("mediaType") != _HELM_CONFIG_MEDIA_TYPE:
+        raise ArtifactMirrorError("Helm OCI source manifest is missing the Helm config media type")
+    layers = manifest.get("layers")
+    if not isinstance(layers, list) or not layers:
+        raise ArtifactMirrorError("Helm OCI source manifest must contain chart content")
+    media_types = [str(layer.get("mediaType") or "") for layer in layers if isinstance(layer, dict)]
+    if media_types.count(_HELM_CHART_LAYER_MEDIA_TYPE) != 1:
+        raise ArtifactMirrorError("Helm OCI source manifest must contain exactly one Helm chart content layer")
+    unsupported = sorted(set(media_types) - {_HELM_CHART_LAYER_MEDIA_TYPE, _HELM_PROVENANCE_LAYER_MEDIA_TYPE})
+    if unsupported:
+        raise ArtifactMirrorError("Helm OCI source manifest contains unsupported layer media types")
+    if media_types.count(_HELM_PROVENANCE_LAYER_MEDIA_TYPE) > 1:
+        raise ArtifactMirrorError("Helm OCI source manifest contains more than one provenance layer")
+    return {
+        "manifest_media_type": media_type,
+        "config_media_type": _HELM_CONFIG_MEDIA_TYPE,
+        "chart_layer_media_type": _HELM_CHART_LAYER_MEDIA_TYPE,
+        "provenance_layer_present": _HELM_PROVENANCE_LAYER_MEDIA_TYPE in media_types,
+    }
 
 
 def _execute_oci(typed_plan: dict[str, Any], artifact: dict[str, Any], expected: str, observed_at: int) -> dict[str, Any]:
@@ -123,21 +166,25 @@ def _execute_oci(typed_plan: dict[str, Any], artifact: dict[str, Any], expected:
     source = str(artifact.get("source") or "")
     destination = str(artifact.get("destination") or "")
     version = str(artifact.get("version") or "")
+    kind = str(artifact.get("kind") or "")
     base_evidence = {
         "source_scheme": "oci",
         "destination_scheme": "oci",
+        "artifact_kind": kind,
         "transport": "skopeo-docker-registry",
-        "multi_arch": "all",
+        "multi_arch": "all" if kind == "oci-image" else "not-applicable",
         "preserve_digests": True,
         "arbitrary_shell": False,
         "raw_credentials_returned": False,
         "authfiles_from_environment_only": True,
     }
     try:
-        if artifact.get("kind") != "oci-image":
-            raise ArtifactMirrorError("OCI registry runtime is limited to artifact kind oci-image")
+        if kind not in {"oci-image", "helm-chart"}:
+            raise ArtifactMirrorError("OCI registry runtime is limited to artifact kinds oci-image and helm-chart")
         if not _OCI_TAG_RE.fullmatch(version):
             raise ArtifactMirrorError("OCI artifact version must be a valid immutable destination tag")
+        if kind == "helm-chart" and not _HELM_VERSION_TAG_RE.fullmatch(version):
+            raise ArtifactMirrorError("Helm OCI artifact version must be an immutable SemVer-compatible tag")
         src_registry, src_repo = _oci_reference(source, destination=False)
         dst_registry, dst_repo = _oci_reference(destination, destination=True)
         source_authfile = _authfile_path(destination=False)
@@ -150,17 +197,25 @@ def _execute_oci(typed_plan: dict[str, Any], artifact: dict[str, Any], expected:
         destination_tag_ref = f"docker://{dst_registry}/{dst_repo}:{version}"
         destination_digest_ref = f"docker://{dst_registry}/{dst_repo}@{expected}"
 
-        source_digest = _raw_manifest_digest(source_ref, auth_args=source_inspect_auth)
+        source_manifest = _raw_manifest(source_ref, auth_args=source_inspect_auth)
+        if source_manifest is None:
+            raise ArtifactMirrorError("source OCI artifact was not found")
+        source_digest = "sha256:" + hashlib.sha256(source_manifest).hexdigest()
         if source_digest != expected:
             checks = [_failure("source-digest", "source OCI manifest digest does not match the pinned digest", evidence={"observed_digest": source_digest})]
             return {"schema_version": 1, "artifact_id": artifact_id, "state": "FAILED", "verification": {"observed_at": observed_at, "checks": checks, "evidence": base_evidence}}
+        if kind == "helm-chart":
+            base_evidence = {**base_evidence, **_validate_helm_manifest(source_manifest), "helm_oci_typed": True}
 
         current_tag_digest = _raw_manifest_digest(destination_tag_ref, auth_args=destination_inspect_auth, allow_not_found=True)
         if current_tag_digest == expected:
-            destination_digest = _raw_manifest_digest(destination_digest_ref, auth_args=destination_inspect_auth)
+            destination_manifest = _raw_manifest(destination_digest_ref, auth_args=destination_inspect_auth)
+            destination_digest = None if destination_manifest is None else "sha256:" + hashlib.sha256(destination_manifest).hexdigest()
             if destination_digest != expected:
                 checks = [_failure("destination-digest", "destination OCI digest reference does not verify after tag lookup", evidence={"observed_digest": destination_digest})]
                 return {"schema_version": 1, "artifact_id": artifact_id, "state": "FAILED", "verification": {"observed_at": observed_at, "checks": checks, "evidence": base_evidence}}
+            if kind == "helm-chart" and destination_manifest is not None:
+                _validate_helm_manifest(destination_manifest)
             checks = [
                 {"id": "source-digest", "status": "PASS", "summary": "source OCI manifest matches the pinned digest", "evidence": {"digest": source_digest}},
                 {"id": "destination-digest", "status": "PASS", "summary": "destination OCI tag already resolves to the pinned digest", "evidence": {"digest": destination_digest}},
@@ -194,11 +249,18 @@ def _execute_oci(typed_plan: dict[str, Any], artifact: dict[str, Any], expected:
             checks = [_failure("destination-digest", "OCI copy reported a destination digest different from the pinned digest", evidence={"observed_digest": reported})]
             return {"schema_version": 1, "artifact_id": artifact_id, "state": "FAILED", "verification": {"observed_at": observed_at, "checks": checks, "evidence": base_evidence}}
 
-        tag_digest = _raw_manifest_digest(destination_tag_ref, auth_args=destination_inspect_auth)
-        destination_digest = _raw_manifest_digest(destination_digest_ref, auth_args=destination_inspect_auth)
+        tag_manifest = _raw_manifest(destination_tag_ref, auth_args=destination_inspect_auth)
+        destination_manifest = _raw_manifest(destination_digest_ref, auth_args=destination_inspect_auth)
+        tag_digest = None if tag_manifest is None else "sha256:" + hashlib.sha256(tag_manifest).hexdigest()
+        destination_digest = None if destination_manifest is None else "sha256:" + hashlib.sha256(destination_manifest).hexdigest()
         if tag_digest != expected or destination_digest != expected:
             checks = [_failure("destination-digest", "mirrored OCI destination does not resolve to the pinned digest", evidence={"tag_digest": tag_digest, "digest_reference": destination_digest})]
             return {"schema_version": 1, "artifact_id": artifact_id, "state": "FAILED", "verification": {"observed_at": observed_at, "checks": checks, "evidence": base_evidence}}
+        if kind == "helm-chart":
+            if tag_manifest is None or destination_manifest is None:
+                raise ArtifactMirrorError("mirrored Helm OCI manifest could not be read back")
+            _validate_helm_manifest(tag_manifest)
+            _validate_helm_manifest(destination_manifest)
         checks = [
             {"id": "source-digest", "status": "PASS", "summary": "source OCI manifest matches the pinned digest", "evidence": {"digest": source_digest}},
             {"id": "destination-digest", "status": "PASS", "summary": "destination OCI tag and digest reference match the pinned digest", "evidence": {"digest": destination_digest}},
@@ -345,7 +407,7 @@ def runtime_capability(source: str, destination: str, *, kind: str = "") -> dict
     source_scheme = urlparse(source).scheme.lower()
     destination_scheme = urlparse(destination).scheme.lower()
     blob_capable = source_scheme in {"file", "https"} and destination_scheme == "file"
-    oci_capable = kind == "oci-image" and source_scheme == "oci" and destination_scheme == "oci"
+    oci_capable = kind in {"oci-image", "helm-chart"} and source_scheme == "oci" and destination_scheme == "oci"
     capable = blob_capable or oci_capable
     return {
         "capable": capable,

@@ -1,3 +1,4 @@
+- Dev.5 Helm OCI mirror runtime slice: `helm-chart` artifacts now use the same fixed no-shell Skopeo transport only after Helm-specific OCI manifest validation, SemVer-compatible immutable tag validation, digest-pinned source addressing, independent destination tag/digest verification, idempotent retry, and rejection of non-Helm OCI media types; broader package repository/provenance/dependency-resolution work remains open.
 # Changelog
 
 - Dev.5 OCI mirror runtime slice: ChangeSet-governed allowlisted registry-to-registry OCI image copy via fixed Skopeo arguments, full multi-arch copy, preserved digests, environment-only authfile boundary, idempotent destination-tag checks and independent source/destination manifest verification; Helm/package repository protocols remain open.

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -332,3 +333,156 @@ def test_oci_registry_mirror_rejects_unallowlisted_registry_and_embedded_referen
     assert executed.status_code == 200
     assert executed.json()["runtime_result"]["state"] == "FAILED"
     assert "allowlisted" in executed.json()["runtime_result"]["verification"]["checks"][0]["summary"]
+
+
+def test_helm_oci_registry_mirror_requires_helm_media_types_and_is_idempotent(client: TestClient, monkeypatch):
+    manifest = json.dumps(
+        {
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "mediaType": "application/vnd.cncf.helm.config.v1+json",
+                "digest": "sha256:" + "1" * 64,
+                "size": 128,
+            },
+            "layers": [
+                {
+                    "mediaType": "application/vnd.cncf.helm.chart.content.v1.tar+gzip",
+                    "digest": "sha256:" + "2" * 64,
+                    "size": 512,
+                }
+            ],
+        },
+        separators=(",", ":"),
+    ).encode()
+    digest = _digest(manifest)
+    monkeypatch.setenv("HERMES_ARTIFACT_OCI_SOURCE_REGISTRY_ALLOWLIST", "registry.example")
+    monkeypatch.setenv("HERMES_ARTIFACT_OCI_DESTINATION_REGISTRY_ALLOWLIST", "mirror.local")
+
+    state = {"copied": False}
+    calls: list[list[str]] = []
+
+    def fake_run(command, **kwargs):
+        calls.append(list(command))
+        if command[1] == "inspect":
+            ref = command[-1]
+            if ref.startswith("docker://registry.example/"):
+                return subprocess.CompletedProcess(command, 0, stdout=manifest, stderr=b"")
+            if ref == "docker://mirror.local/charts/cilium:1.18.1" and not state["copied"]:
+                return subprocess.CompletedProcess(command, 1, stdout=b"", stderr=b"manifest unknown")
+            if ref.startswith("docker://mirror.local/"):
+                return subprocess.CompletedProcess(command, 0, stdout=manifest, stderr=b"")
+        if command[1] == "copy":
+            assert "--preserve-digests" in command
+            assert command[-2] == f"docker://registry.example/charts/cilium@{digest}"
+            assert command[-1] == "docker://mirror.local/charts/cilium:1.18.1"
+            Path(command[command.index("--digestfile") + 1]).write_text(digest + "\n", encoding="utf-8")
+            state["copied"] = True
+            return subprocess.CompletedProcess(command, 0, stdout=b"", stderr=b"")
+        raise AssertionError(command)
+
+    monkeypatch.setattr(artifact_mirror.subprocess, "run", fake_run)
+    created = client.post(
+        "/v1/artifact-mirror/items",
+        headers=ADMIN,
+        json={
+            "name": "helm-cilium-runtime",
+            "kind": "helm-chart",
+            "source": "oci://registry.example/charts/cilium",
+            "destination": "oci://mirror.local/charts/cilium",
+            "version": "1.18.1",
+            "digest": digest,
+        },
+    )
+    assert created.status_code == 201, created.text
+    planned = client.post(
+        "/v1/operations-center/intents/plan",
+        headers=BOT,
+        json={"requested_by": "hermes-bot:airgap", "source_channel": "hermes-bot", "domain": "artifact", "operation": "artifact.mirror.apply", "target_id": created.json()["id"], "parameters": {"verify_destination": True}},
+    )
+    assert planned.status_code == 201, planned.text
+    body = planned.json()
+    assert body["operation_job"]["executor"] == "artifact-mirror-worker"
+    assert body["operation_plan"]["plan"]["runtime"]["state"] == "RUNTIME_CAPABLE"
+    auth = _approve_and_authorize(client, body)
+    executed = client.post(
+        f"/v1/operation-jobs/{body['operation_job']['id']}/execute",
+        headers=BOT,
+        json={"execution_ticket": auth["execution_ticket"], "signature": auth["signature"], "actor": "hermes-bot:airgap"},
+    )
+    assert executed.status_code == 200, executed.text
+    result = executed.json()
+    assert result["operation_job"]["state"] == "SUCCEEDED"
+    assert result["runtime_result"]["state"] == "MIRRORED"
+    evidence = result["runtime_result"]["verification"]["evidence"]
+    assert evidence["helm_oci_typed"] is True
+    assert evidence["chart_layer_media_type"] == "application/vnd.cncf.helm.chart.content.v1.tar+gzip"
+    assert evidence["multi_arch"] == "not-applicable"
+
+    retry = client.post(
+        "/v1/operations-center/intents/plan",
+        headers=BOT,
+        json={"requested_by": "hermes-bot:airgap-retry", "source_channel": "hermes-bot", "domain": "artifact", "operation": "artifact.mirror.apply", "target_id": created.json()["id"], "parameters": {"verify_destination": True}},
+    ).json()
+    retry_auth = _approve_and_authorize(client, retry)
+    retried = client.post(
+        f"/v1/operation-jobs/{retry['operation_job']['id']}/execute",
+        headers=BOT,
+        json={"execution_ticket": retry_auth["execution_ticket"], "signature": retry_auth["signature"], "actor": "hermes-bot:airgap-retry"},
+    )
+    assert retried.status_code == 200, retried.text
+    assert retried.json()["runtime_result"]["state"] == "ALREADY_MIRRORED"
+    assert sum(1 for call in calls if len(call) > 1 and call[1] == "copy") == 1
+
+
+def test_helm_oci_registry_mirror_rejects_non_helm_manifest_and_non_semver_tag(client: TestClient, monkeypatch):
+    image_manifest = b'{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json"},"layers":[]}'
+    digest = _digest(image_manifest)
+    monkeypatch.setenv("HERMES_ARTIFACT_OCI_SOURCE_REGISTRY_ALLOWLIST", "registry.example")
+    monkeypatch.setenv("HERMES_ARTIFACT_OCI_DESTINATION_REGISTRY_ALLOWLIST", "mirror.local")
+
+    def fake_run(command, **kwargs):
+        if command[1] == "inspect" and command[-1].startswith("docker://registry.example/"):
+            return subprocess.CompletedProcess(command, 0, stdout=image_manifest, stderr=b"")
+        raise AssertionError(command)
+
+    monkeypatch.setattr(artifact_mirror.subprocess, "run", fake_run)
+    bad_media = client.post(
+        "/v1/artifact-mirror/items",
+        headers=ADMIN,
+        json={"name": "not-a-chart", "kind": "helm-chart", "source": "oci://registry.example/charts/cilium", "destination": "oci://mirror.local/charts/cilium", "version": "1.18.1", "digest": digest},
+    ).json()
+    planned = client.post(
+        "/v1/operations-center/intents/plan",
+        headers=BOT,
+        json={"requested_by": "hermes-bot:airgap", "source_channel": "hermes-bot", "domain": "artifact", "operation": "artifact.mirror.apply", "target_id": bad_media["id"], "parameters": {"verify_destination": True}},
+    ).json()
+    auth = _approve_and_authorize(client, planned)
+    executed = client.post(
+        f"/v1/operation-jobs/{planned['operation_job']['id']}/execute",
+        headers=BOT,
+        json={"execution_ticket": auth["execution_ticket"], "signature": auth["signature"], "actor": "hermes-bot:airgap"},
+    )
+    assert executed.status_code == 200, executed.text
+    assert executed.json()["runtime_result"]["state"] == "FAILED"
+    assert "Helm config media type" in executed.json()["runtime_result"]["verification"]["checks"][0]["summary"]
+
+    bad_tag = client.post(
+        "/v1/artifact-mirror/items",
+        headers=ADMIN,
+        json={"name": "bad-version", "kind": "helm-chart", "source": "oci://registry.example/charts/cilium", "destination": "oci://mirror.local/charts/cilium", "version": "latest", "digest": digest},
+    ).json()
+    bad_plan = client.post(
+        "/v1/operations-center/intents/plan",
+        headers=BOT,
+        json={"requested_by": "hermes-bot:airgap", "source_channel": "hermes-bot", "domain": "artifact", "operation": "artifact.mirror.apply", "target_id": bad_tag["id"], "parameters": {"verify_destination": True}},
+    ).json()
+    bad_auth = _approve_and_authorize(client, bad_plan)
+    bad_execute = client.post(
+        f"/v1/operation-jobs/{bad_plan['operation_job']['id']}/execute",
+        headers=BOT,
+        json={"execution_ticket": bad_auth["execution_ticket"], "signature": bad_auth["signature"], "actor": "hermes-bot:airgap"},
+    )
+    assert bad_execute.status_code == 200, bad_execute.text
+    assert bad_execute.json()["runtime_result"]["state"] == "FAILED"
+    assert "SemVer-compatible" in bad_execute.json()["runtime_result"]["verification"]["checks"][0]["summary"]

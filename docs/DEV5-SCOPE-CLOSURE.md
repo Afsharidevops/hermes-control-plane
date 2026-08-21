@@ -206,7 +206,7 @@ Security/runtime properties:
 - `artifact_mirror_items.status` remains the operational enable/disable state; mirror success/failure is stored separately in `verification_json.sync_state`, so retry planning remains possible
 
 This is deliberately **partial air-gap closure**, not a claim that every artifact
-protocol is complete. The original blob-only slice did not close registry protocols. A later dev.5 slice now adds bounded OCI-image registry-to-registry copy; Helm OCI registry publication, OS/Python package repository metadata mirroring, broader signature policy, and generalized authenticated repository credential delivery remain release-blocking runtime work. Plans using unsupported
+protocol is complete. The original blob-only slice did not close registry protocols. Later dev.5 slices add bounded OCI-image and typed Helm OCI registry-to-registry copy; OS/Python package repository metadata mirroring, broader signature policy, dependency/reference resolution, and generalized authenticated repository credential delivery remain release-blocking runtime work. Plans using unsupported
 protocol pairs are retained for compatibility but receive executor
 `artifact-mirror-contract` and cannot enter the trusted runtime execution path.
 
@@ -285,4 +285,23 @@ Security/runtime properties:
 - optional source/destination authfiles are read only from trusted environment-mounted paths below `HERMES_ARTIFACT_AUTH_ROOT`; auth material never enters the plan, audit, or returned evidence
 - stderr is never returned to the caller, and runtime evidence attests `arbitrary_shell=false` and `raw_credentials_returned=false`
 
-This is still **partial air-gap closure**. Helm OCI artifacts, OS/Python/package repository metadata, repository signatures/policy beyond Skopeo's configured trust behavior, dependency graph resolution, offline reference rewriting and generalized repository credential delivery remain open.
+This is still **partial air-gap closure**. A subsequent slice closes typed Helm OCI chart transport. OS/Python/package repository metadata, repository signatures/policy beyond Skopeo's configured trust behavior, dependency graph resolution, offline reference rewriting and generalized repository credential delivery remain open.
+
+
+## Slice 13 — Trusted Helm OCI artifact synchronization runtime
+
+This slice extends `artifact.mirror.apply` for artifact kind `helm-chart` when both endpoints use `oci://registry/repository`. It is deliberately a separate typed artifact path from OCI images even though both use the constrained Skopeo registry transport.
+
+Runtime/security properties:
+
+- source and destination registries remain exact allowlist entries and endpoint URIs remain repository-only, with no embedded tag, digest, credentials, query, or caller-controlled CLI switches
+- the approved SHA-256 is the exact source OCI manifest digest and the source is addressed by digest, never by a mutable tag
+- `version` must be an OCI-valid, SemVer-compatible immutable Helm chart tag; `latest` and other non-version tags are rejected
+- before any copy, the source raw manifest must be schema version 2 with OCI image-manifest media type, Helm config media type, exactly one `application/vnd.cncf.helm.chart.content.v1.tar+gzip` layer, and no layer types other than the optional single Helm provenance layer
+- a normal OCI image manifest cannot be relabeled as `helm-chart` and enter this path
+- copy remains the fixed Skopeo command vector with no shell, environment-only bounded authfiles, retries, `--preserve-digests`, and no caller flags
+- destination tag and digest references are both read back, independently SHA-256 verified against the approved digest, and revalidated for Helm media types
+- an already-correct destination is idempotent; a mismatched destination tag fails unless the exact approved plan included `replace_existing=true`
+- returned evidence identifies the typed Helm OCI path and media types without returning raw credentials or stderr
+
+This remains **partial air-gap closure**. apt/yum/dnf repository metadata and packages, Python indexes/wheels/sdists, Ansible/Git-release mirroring where required, generalized authenticated repository delivery, broader signature/provenance policy, ClusterBlueprint dependency resolution, offline reference rewriting, graph ordering, and graph-level partial-sync recovery remain open.

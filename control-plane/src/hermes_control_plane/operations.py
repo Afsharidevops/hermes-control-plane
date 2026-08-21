@@ -441,7 +441,7 @@ def artifact_mirror_runtime_capable(plan: dict[str, Any]) -> bool:
     source_scheme = urlparse(str(artifact.get("source") or "")).scheme.lower()
     destination_scheme = urlparse(str(artifact.get("destination") or "")).scheme.lower()
     blob_runtime = source_scheme in {"file", "https"} and destination_scheme == "file"
-    oci_runtime = artifact.get("kind") == "oci-image" and source_scheme == "oci" and destination_scheme == "oci"
+    oci_runtime = artifact.get("kind") in {"oci-image", "helm-chart"} and source_scheme == "oci" and destination_scheme == "oci"
     return plan.get("operation") == "artifact.mirror.apply" and (blob_runtime or oci_runtime)
 
 
@@ -451,7 +451,7 @@ def artifact_mirror_plan(*, artifact_snapshot: dict[str, Any], parameters: dict[
     destination_scheme = urlparse(str(artifact_snapshot["destination"])).scheme.lower()
     runtime_capable = (
         (source_scheme in {"file", "https"} and destination_scheme == "file")
-        or (artifact_snapshot.get("kind") == "oci-image" and source_scheme == "oci" and destination_scheme == "oci")
+        or (artifact_snapshot.get("kind") in {"oci-image", "helm-chart"} and source_scheme == "oci" and destination_scheme == "oci")
     )
     return _finish({
         "schema_version": 4,
