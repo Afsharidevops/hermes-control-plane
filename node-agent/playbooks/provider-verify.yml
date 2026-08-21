@@ -1,0 +1,157 @@
+---
+- name: Hermes trusted provider active verification
+  hosts: all
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Verify Hermes runtime binding exists
+      ansible.builtin.stat:
+        path: /var/lib/hermes/provider/runtime-binding.json
+      register: hermes_binding
+
+    - name: Require runtime binding on all approved hosts
+      ansible.builtin.assert:
+        that:
+          - hermes_binding.stat.exists
+          - hermes_binding.stat.isreg
+
+    - name: Collect provider service facts
+      ansible.builtin.service_facts:
+
+    - name: Require active K3s service on retained hosts
+      ansible.builtin.assert:
+        that:
+          - >-
+            ((inventory_hostname in groups['kube_control_plane']) and
+             ('k3s.service' in ansible_facts.services) and
+             (ansible_facts.services['k3s.service'].state == 'running')) or
+            ((inventory_hostname not in groups['kube_control_plane']) and
+             ('k3s-agent.service' in ansible_facts.services) and
+             (ansible_facts.services['k3s-agent.service'].state == 'running'))
+      when: >-
+        hermes_provider == 'k3s' and not (hermes_operation in ['cluster.worker.remove', 'cluster.worker.replace'] and
+             (hermes_server_id == hostvars[inventory_hostname].hermes_server_id or
+              hermes_old_server_id == hostvars[inventory_hostname].hermes_server_id))
+
+    - name: Require removed K3s worker service stopped
+      ansible.builtin.assert:
+        that:
+          - "'k3s-agent.service' not in ansible_facts.services or ansible_facts.services['k3s-agent.service'].state != 'running'"
+      when: >-
+        hermes_provider == 'k3s' and hermes_operation in ['cluster.worker.remove', 'cluster.worker.replace'] and
+        (hermes_server_id == hostvars[inventory_hostname].hermes_server_id or
+         hermes_old_server_id == hostvars[inventory_hostname].hermes_server_id)
+
+    - name: Require active RKE2 service on retained hosts
+      ansible.builtin.assert:
+        that:
+          - >-
+            ((inventory_hostname in groups['kube_control_plane']) and
+             ('rke2-server.service' in ansible_facts.services) and
+             (ansible_facts.services['rke2-server.service'].state == 'running')) or
+            ((inventory_hostname not in groups['kube_control_plane']) and
+             ('rke2-agent.service' in ansible_facts.services) and
+             (ansible_facts.services['rke2-agent.service'].state == 'running'))
+      when: >-
+        hermes_provider == 'rke2' and not (hermes_operation in ['cluster.worker.remove', 'cluster.worker.replace'] and
+             (hermes_server_id == hostvars[inventory_hostname].hermes_server_id or
+              hermes_old_server_id == hostvars[inventory_hostname].hermes_server_id))
+
+    - name: Require removed RKE2 worker service stopped
+      ansible.builtin.assert:
+        that:
+          - "'rke2-agent.service' not in ansible_facts.services or ansible_facts.services['rke2-agent.service'].state != 'running'"
+      when: >-
+        hermes_provider == 'rke2' and hermes_operation in ['cluster.worker.remove', 'cluster.worker.replace'] and
+        (hermes_server_id == hostvars[inventory_hostname].hermes_server_id or
+         hermes_old_server_id == hostvars[inventory_hostname].hermes_server_id)
+
+    - name: Require active kubelet on retained Kubespray hosts
+      ansible.builtin.assert:
+        that:
+          - "'kubelet.service' in ansible_facts.services"
+          - "ansible_facts.services['kubelet.service'].state == 'running'"
+      when: >-
+        hermes_provider == 'kubespray' and not (hermes_operation in ['cluster.worker.remove', 'cluster.worker.replace'] and
+             (hermes_server_id == hostvars[inventory_hostname].hermes_server_id or
+              hermes_old_server_id == hostvars[inventory_hostname].hermes_server_id))
+
+    - name: Require removed Kubespray worker kubelet stopped
+      ansible.builtin.assert:
+        that:
+          - "'kubelet.service' not in ansible_facts.services or ansible_facts.services['kubelet.service'].state != 'running'"
+      when: >-
+        hermes_provider == 'kubespray' and hermes_operation in ['cluster.worker.remove', 'cluster.worker.replace'] and
+        (hermes_server_id == hostvars[inventory_hostname].hermes_server_id or
+         hermes_old_server_id == hostvars[inventory_hostname].hermes_server_id)
+
+    - name: Verify K3s API readiness from primary server
+      ansible.builtin.command:
+        argv: [/usr/local/bin/k3s, kubectl, get, '--raw=/readyz']
+      changed_when: false
+      when: >-
+        hermes_provider == 'k3s' and inventory_hostname == groups['kube_control_plane'][0]
+
+    - name: Verify RKE2 API readiness from primary server
+      ansible.builtin.command:
+        argv: [/var/lib/rancher/rke2/bin/kubectl, '--kubeconfig=/etc/rancher/rke2/rke2.yaml', get, '--raw=/readyz']
+      changed_when: false
+      when: >-
+        hermes_provider == 'rke2' and inventory_hostname == groups['kube_control_plane'][0]
+
+    - name: Verify Kubespray API readiness from primary control plane
+      ansible.builtin.command:
+        argv: [kubectl, '--kubeconfig=/etc/kubernetes/admin.conf', get, '--raw=/readyz']
+      changed_when: false
+      when: >-
+        hermes_provider == 'kubespray' and inventory_hostname == groups['kube_control_plane'][0]
+
+    - name: Verify deterministic embedded-etcd snapshot exists
+      ansible.builtin.stat:
+        path: "/var/lib/hermes/provider/snapshots/{{ hermes_snapshot_name }}.snapshot"
+      register: hermes_verified_snapshot
+      when: >-
+        hermes_provider in ['k3s', 'rke2'] and hermes_operation == 'cluster.etcd.snapshot' and
+        inventory_hostname == groups['etcd'][0]
+
+    - name: Require non-empty deterministic embedded-etcd snapshot
+      ansible.builtin.assert:
+        that:
+          - hermes_verified_snapshot.stat.exists
+          - hermes_verified_snapshot.stat.isreg
+          - hermes_verified_snapshot.stat.size | int > 0
+      when: >-
+        hermes_provider in ['k3s', 'rke2'] and hermes_operation == 'cluster.etcd.snapshot' and
+        inventory_hostname == groups['etcd'][0]
+
+    - name: Require K3s reset flag cleared after direct restore
+      ansible.builtin.stat:
+        path: /var/lib/rancher/k3s/server/db/reset-flag
+      register: hermes_k3s_reset_flag
+      when: >-
+        hermes_provider == 'k3s' and hermes_operation in ['cluster.etcd.restore', 'cluster.disaster-recovery'] and
+        inventory_hostname == groups['etcd'][0]
+
+    - name: Verify K3s restore completed normally
+      ansible.builtin.assert:
+        that:
+          - not hermes_k3s_reset_flag.stat.exists
+      when: >-
+        hermes_provider == 'k3s' and hermes_operation in ['cluster.etcd.restore', 'cluster.disaster-recovery'] and
+        inventory_hostname == groups['etcd'][0]
+
+    - name: Require RKE2 reset flag cleared after direct restore
+      ansible.builtin.stat:
+        path: /var/lib/rancher/rke2/server/db/reset-flag
+      register: hermes_rke2_reset_flag
+      when: >-
+        hermes_provider == 'rke2' and hermes_operation in ['cluster.etcd.restore', 'cluster.disaster-recovery'] and
+        inventory_hostname == groups['etcd'][0]
+
+    - name: Verify RKE2 restore completed normally
+      ansible.builtin.assert:
+        that:
+          - not hermes_rke2_reset_flag.stat.exists
+      when: >-
+        hermes_provider == 'rke2' and hermes_operation in ['cluster.etcd.restore', 'cluster.disaster-recovery'] and
+        inventory_hostname == groups['etcd'][0]

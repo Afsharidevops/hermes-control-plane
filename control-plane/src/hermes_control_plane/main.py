@@ -22,6 +22,7 @@ from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
 from . import db
 from .canonical import canonical_json, sha256_hex
 from . import kubernetes as kubernetes_broker
+from . import provider_worker
 from . import preflight as host_preflight
 from . import cluster_factory
 from . import operations
@@ -563,6 +564,15 @@ def _cluster_snapshot(conn, cluster_id: str) -> dict[str, Any]:
         "node_roles": [{"id": role["id"], "role": role["role"], "server_ids": role["server_ids"]} for role in roles],
         "server_snapshots": servers,
     }
+    if blueprint.get("artifact_dependencies"):
+        artifact_manifest = _blueprint_artifact_manifest(conn, blueprint["id"])
+        snapshot["blueprint_artifact_manifest_hash"] = artifact_manifest.get("manifest_hash")
+        snapshot["blueprint_artifact_manifest_state"] = artifact_manifest.get("state")
+        if artifact_manifest.get("state") == "READY" and not artifact_manifest.get("issues"):
+            try:
+                snapshot["artifact_supply"] = cluster_factory.offline_artifact_supply(artifact_manifest)
+            except ValueError:
+                snapshot["artifact_supply"] = None
     snapshot["snapshot_hash"] = sha256_hex(snapshot)
     return snapshot
 
@@ -695,6 +705,112 @@ def _provider_job_authorization(conn, job: Any) -> Any:
         if current_manifest.get("state") != "READY" or current_manifest.get("manifest_hash") != artifact_manifest_hash:
             raise HTTPException(status_code=409, detail="cluster blueprint artifact manifest drifted after provisioning plan approval")
     return changeset
+
+
+def _issue_provider_job_ticket(conn, job: Any, changeset: Any) -> tuple[dict[str, Any], str, list[str]]:
+    now = int(time.time())
+    changeset_plan = json.loads(changeset["plan_json"] or "{}")
+    typed_plan = ((changeset_plan.get("parameters") or {}).get("typed_plan") or {})
+    if not isinstance(typed_plan, dict) or not typed_plan.get("plan_hash"):
+        raise HTTPException(status_code=409, detail="provider job ChangeSet has no exact typed plan")
+    approval_ids = _valid_operation_approval_ids(conn, changeset, now=now)
+    expiry_candidates = [int(changeset["expires_at"] or now + 120)]
+    if approval_ids:
+        placeholders = ",".join("?" for _ in approval_ids)
+        rows = conn.execute(f"SELECT expires_at FROM approvals WHERE id IN ({placeholders})", approval_ids).fetchall()
+        expiry_candidates.extend(int(row["expires_at"]) for row in rows)
+    ttl_seconds = max(1, min(120, min(expiry_candidates) - now))
+    request = json.loads(job["request_json"] or "{}")
+    preconditions = {
+        "provider_job_id": job["id"],
+        "executor": "cluster-provider-worker",
+        "typed_plan_hash": typed_plan["plan_hash"],
+        "policy_generation": int(changeset["policy_generation"]),
+        "artifact_manifest_hash": str(request.get("artifact_manifest_hash") or (typed_plan.get("artifact_supply") or {}).get("manifest_hash") or ""),
+    }
+    try:
+        ticket, signature = issue_ticket(changeset["id"], changeset["plan_hash"], changeset_plan, ttl_seconds=ttl_seconds, preconditions=preconditions)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    request["authorization"] = {
+        "ticket_hash": sha256_hex(ticket),
+        "issued_at": ticket["issued_at"],
+        "expires_at": ticket["expires_at"],
+        "approval_ids": approval_ids,
+        "policy_generation": int(changeset["policy_generation"]),
+        "plan_hash": changeset["plan_hash"],
+    }
+    conn.execute("UPDATE provider_jobs SET request_json=?,updated_at=? WHERE id=?", (json.dumps(request, sort_keys=True), now, job["id"]))
+    return ticket, signature, approval_ids
+
+
+def _verify_provider_job_ticket(conn, job: Any, ticket: dict[str, Any], signature: str) -> tuple[Any, dict[str, Any], dict[str, Any], list[str]]:
+    changeset = _provider_job_authorization(conn, job)
+    changeset_plan = json.loads(changeset["plan_json"] or "{}")
+    typed_plan = ((changeset_plan.get("parameters") or {}).get("typed_plan") or {})
+    request = json.loads(job["request_json"] or "{}")
+    authorization = request.get("authorization") or {}
+    if not authorization.get("ticket_hash"):
+        raise HTTPException(status_code=409, detail="provider job has no issued execution ticket")
+    try:
+        verify_ticket(ticket, signature, require_fresh=True)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if sha256_hex(ticket) != authorization.get("ticket_hash"):
+        raise HTTPException(status_code=409, detail="execution ticket does not match the authorized provider job")
+    if ticket.get("changeset_id") != changeset["id"] or ticket.get("plan_hash") != changeset["plan_hash"] or ticket.get("plan") != changeset_plan:
+        raise HTTPException(status_code=409, detail="provider execution ticket ChangeSet binding mismatch")
+    expected = {
+        "provider_job_id": job["id"],
+        "executor": "cluster-provider-worker",
+        "typed_plan_hash": typed_plan.get("plan_hash"),
+        "policy_generation": int(changeset["policy_generation"]),
+        "artifact_manifest_hash": str(request.get("artifact_manifest_hash") or (typed_plan.get("artifact_supply") or {}).get("manifest_hash") or ""),
+    }
+    if (ticket.get("preconditions") or {}) != expected:
+        raise HTTPException(status_code=409, detail="provider execution ticket preconditions mismatch")
+    current_ids = _valid_operation_approval_ids(conn, changeset, now=int(time.time()))
+    if set(current_ids) != set(authorization.get("approval_ids") or []):
+        raise HTTPException(status_code=409, detail="provider execution ticket approvals no longer match exact-plan authorization")
+    return changeset, changeset_plan, typed_plan, current_ids
+
+
+def _persist_provider_job_verification(conn, *, job: Any, changeset: Any, runtime_result: dict[str, Any], actor: str) -> dict[str, Any]:
+    verification = runtime_result.get("verification") or {}
+    checks = verification.get("checks") or []
+    if not isinstance(checks, list) or not checks:
+        raise HTTPException(status_code=502, detail="provider worker returned no typed active verification")
+    normalized = []
+    for check in checks:
+        if not isinstance(check, dict):
+            raise HTTPException(status_code=502, detail="provider worker returned malformed verification")
+        item = {
+            "id": str(check.get("id") or "")[:160],
+            "status": str(check.get("status") or ""),
+            "summary": str(check.get("summary") or "")[:1000],
+            "evidence": check.get("evidence") if isinstance(check.get("evidence"), dict) else {},
+        }
+        if not item["id"] or item["status"] not in {"PASS", "FAIL", "WARN", "SKIP"} or not item["summary"]:
+            raise HTTPException(status_code=502, detail="provider worker returned invalid verification fields")
+        _validate_credential_metadata(item["evidence"])
+        normalized.append(item)
+    evidence = verification.get("evidence") if isinstance(verification.get("evidence"), dict) else {}
+    _validate_credential_metadata(evidence)
+    statuses = {item["status"] for item in normalized}
+    overall = "FAIL" if "FAIL" in statuses else "WARN" if "WARN" in statuses else "SKIP" if statuses == {"SKIP"} else "PASS"
+    result_id = f"ver_{uuid.uuid4().hex[:16]}"
+    observed_at = int(verification.get("observed_at") or time.time())
+    now = int(time.time())
+    request = json.loads(job["request_json"] or "{}")
+    cluster_id = str(request.get("cluster_id") or changeset["target_id"])
+    conn.execute(
+        "INSERT INTO verification_results (id,operation_plan_id,changeset_id,subject_type,subject_id,status,checks_json,evidence_json,observed_at,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (result_id, None, changeset["id"], "cluster", cluster_id, overall, json.dumps(normalized, sort_keys=True), json.dumps(evidence, sort_keys=True), observed_at, now),
+    )
+    db.audit(conn, "verification.provider_runtime_recorded", actor, "verification", result_id, {"provider_job_id": job["id"], "changeset_id": changeset["id"], "status": overall})
+    return {"id": result_id, "status": overall, "checks": normalized, "evidence": evidence, "observed_at": observed_at}
 
 
 def _provider_job_event(conn, job_id: str, stage: str, status: str, message: str, evidence: dict[str, Any] | None = None) -> None:
@@ -1609,12 +1725,97 @@ def authorize_provider_job(job_id: str, authorization: str | None = Header(defau
         if job["state"] != "WAITING_APPROVAL":
             raise HTTPException(status_code=409, detail="provider job is not waiting for approval")
         changeset = _provider_job_authorization(conn, job)
-        conn.execute("UPDATE provider_jobs SET state='READY',stage='apply',updated_at=? WHERE id=?", (now, job_id))
-        _provider_job_event(conn, job_id, "apply", "AUTHORIZED", "Exact approved ChangeSet hash authorized provider job")
-        db.audit(conn, "provider_job.authorized", "hermes-bot", "provider_job", job_id, {"changeset_id": changeset["id"], "plan_hash": job["plan_hash"]})
+        ticket = None
+        signature = None
+        approval_ids: list[str] = []
+        if job["operation"] == "cluster.provision.apply":
+            ticket, signature, approval_ids = _issue_provider_job_ticket(conn, job, changeset)
+        conn.execute("UPDATE provider_jobs SET state='READY',stage='authorized',updated_at=? WHERE id=?", (now, job_id))
+        _provider_job_event(conn, job_id, "authorized", "AUTHORIZED", "Exact approved ChangeSet hash authorized provider job", {"approval_count": len(approval_ids), "trusted_runtime": job["operation"] == "cluster.provision.apply"})
+        audit_payload = {"changeset_id": changeset["id"], "plan_hash": job["plan_hash"], "executor": "cluster-provider-worker" if job["operation"] == "cluster.provision.apply" else "legacy-provider-job"}
+        if ticket is not None:
+            audit_payload["ticket_hash"] = sha256_hex(ticket)
+        db.audit(conn, "provider_job.authorized", "hermes-bot", "provider_job", job_id, audit_payload)
         conn.commit()
         job = conn.execute("SELECT * FROM provider_jobs WHERE id=?", (job_id,)).fetchone()
-    return _provider_job_dict(job)
+    response = _provider_job_dict(job)
+    if ticket is not None and signature is not None:
+        response.update(execution_ticket=ticket, signature=signature)
+    return response
+
+
+@app.post("/v1/provider-jobs/{job_id}/execute")
+async def execute_provider_job(job_id: str, payload: OperationJobExecute, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_bot(authorization)
+    with closing(db.connect()) as conn:
+        job = conn.execute("SELECT * FROM provider_jobs WHERE id=?", (job_id,)).fetchone()
+        if not job:
+            raise HTTPException(status_code=404, detail="provider job not found")
+        if job["state"] != "READY":
+            raise HTTPException(status_code=409, detail="provider job must be READY before trusted execution")
+        if job["operation"] != "cluster.provision.apply":
+            raise HTTPException(status_code=422, detail="legacy/bootstrap provider job has no trusted cluster-provider runtime path")
+        changeset, _, typed_plan, approval_ids = _verify_provider_job_ticket(conn, job, payload.execution_ticket, payload.signature)
+        now = int(time.time())
+        if approval_ids:
+            placeholders = ",".join("?" for _ in approval_ids)
+            changed = conn.execute(
+                f"UPDATE approvals SET status='CONSUMED',consumed_at=?,decided_at=? WHERE id IN ({placeholders}) AND status='APPROVED' AND consumed_at IS NULL",
+                (now, now, *approval_ids),
+            )
+            if changed.rowcount != len(approval_ids):
+                raise HTTPException(status_code=409, detail="provider approval consumption race detected")
+        conn.execute("UPDATE provider_jobs SET state='RUNNING',stage='execute',updated_at=? WHERE id=?", (now, job_id))
+        conn.execute("UPDATE changesets SET state='EXECUTING',updated_at=? WHERE id=?", (now, changeset["id"]))
+        request = json.loads(job["request_json"] or "{}")
+        run = conn.execute("SELECT id FROM provisioning_runs WHERE changeset_id=?", (changeset["id"],)).fetchone()
+        if run:
+            conn.execute("UPDATE provisioning_runs SET state='RUNNING',stage='apply',updated_at=? WHERE id=?", (now, run["id"]))
+            conn.execute("UPDATE clusters SET state='PROVISIONING',updated_at=? WHERE id=?", (now, request.get("cluster_id") or changeset["target_id"]))
+        db.audit(conn, "provider_job.runtime_started", payload.actor, "provider_job", job_id, {"changeset_id": changeset["id"], "typed_plan_hash": typed_plan.get("plan_hash")})
+        conn.commit()
+
+    try:
+        runtime_result = await provider_worker.post("/v1/provider/execute", {"ticket": payload.execution_ticket, "signature": payload.signature})
+        _validate_credential_metadata(runtime_result)
+    except HTTPException as exc:
+        now = int(time.time())
+        with closing(db.connect()) as conn:
+            job = conn.execute("SELECT * FROM provider_jobs WHERE id=?", (job_id,)).fetchone()
+            if job:
+                changeset = _changeset(conn, job["changeset_id"])
+                error = {"type": "cluster-provider-worker-error", "status_code": exc.status_code, "detail": exc.detail}
+                conn.execute("UPDATE provider_jobs SET state='FAILED',stage='execute',result_json=?,updated_at=? WHERE id=?", (json.dumps(error, sort_keys=True), now, job_id))
+                conn.execute("UPDATE changesets SET state='FAILED',execution_json=?,executed_at=?,updated_at=? WHERE id=?", (json.dumps(error, sort_keys=True), now, now, changeset["id"]))
+                run = conn.execute("SELECT id,cluster_id FROM provisioning_runs WHERE changeset_id=?", (changeset["id"],)).fetchone()
+                if run:
+                    conn.execute("UPDATE provisioning_runs SET state='FAILED',stage='verify',result_json=?,updated_at=? WHERE id=?", (json.dumps(error, sort_keys=True), now, run["id"]))
+                    conn.execute("UPDATE clusters SET state='ERROR',updated_at=? WHERE id=?", (now, run["cluster_id"]))
+                _provider_job_event(conn, job_id, "execute", "FAILED", "Trusted provider runtime failed without returning raw stderr", {"error_type": "provider-runtime"})
+                db.audit(conn, "provider_job.runtime_failed", payload.actor, "provider_job", job_id, {"changeset_id": changeset["id"], "error_type": "runtime"})
+                conn.commit()
+        raise
+
+    now = int(time.time())
+    with closing(db.connect()) as conn:
+        job = conn.execute("SELECT * FROM provider_jobs WHERE id=?", (job_id,)).fetchone()
+        if not job:
+            raise HTTPException(status_code=409, detail="provider job disappeared during execution")
+        changeset = _changeset(conn, job["changeset_id"])
+        verification = _persist_provider_job_verification(conn, job=job, changeset=changeset, runtime_result=runtime_result, actor=payload.actor)
+        final_state = "SUCCEEDED" if verification["status"] == "PASS" else "FAILED"
+        result = {"state": final_state, "stage": "verify", "runtime_result": runtime_result, "verification_id": verification["id"], "completed_at": now}
+        conn.execute("UPDATE provider_jobs SET state=?,stage='verify',result_json=?,updated_at=? WHERE id=?", (final_state, json.dumps(result, sort_keys=True), now, job_id))
+        conn.execute("UPDATE changesets SET state=?,execution_json=?,executed_at=?,updated_at=? WHERE id=?", ("EXECUTED" if final_state == "SUCCEEDED" else "FAILED", json.dumps(runtime_result, sort_keys=True), now, now, changeset["id"]))
+        run = conn.execute("SELECT id,cluster_id FROM provisioning_runs WHERE changeset_id=?", (changeset["id"],)).fetchone()
+        if run:
+            conn.execute("UPDATE provisioning_runs SET state=?,stage='verify',result_json=?,updated_at=? WHERE id=?", (final_state, json.dumps({"provider_job_states": {job_id: final_state}, "verification_id": verification["id"]}, sort_keys=True), now, run["id"]))
+            conn.execute("UPDATE clusters SET state=?,updated_at=? WHERE id=?", ("READY" if final_state == "SUCCEEDED" else "ERROR", now, run["cluster_id"]))
+        _provider_job_event(conn, job_id, "verify", final_state, "Trusted provider runtime completed with typed active verification", {"verification_id": verification["id"], "verification_status": verification["status"]})
+        db.audit(conn, "provider_job.runtime_completed", payload.actor, "provider_job", job_id, {"changeset_id": changeset["id"], "verification_id": verification["id"], "verification_status": verification["status"]})
+        conn.commit()
+        updated = conn.execute("SELECT * FROM provider_jobs WHERE id=?", (job_id,)).fetchone()
+    return {"provider_job": _provider_job_dict(updated), "verification": verification, "runtime_result": runtime_result}
 
 
 @app.get("/v1/provider-jobs/{job_id}")
@@ -2703,19 +2904,24 @@ def create_provisioning_run(cluster_id: str, payload: ProvisioningRunCreate, aut
         preview = {"summary": f"Provision cluster {cluster['name']} with {blueprint['provider']}", "details": typed_plan, "source": "cluster-factory-deterministic-planner"}
         conn.execute("UPDATE changesets SET preview_json=?,state='PREVIEWED',updated_at=? WHERE id=?", (json.dumps(preview, sort_keys=True), int(time.time()), changeset["id"]))
         now = int(time.time())
-        job_ids: list[str] = []
-        for node in typed_plan["nodes"]:
-            job_id = f"job_{uuid.uuid4().hex[:16]}"
-            job_ids.append(job_id)
-            request = {"cluster_id": cluster_id, "provider": blueprint["provider"], "node": node, "typed_plan_hash": typed_plan["plan_hash"]}
-            if artifact_manifest is not None:
-                request["artifact_manifest_hash"] = artifact_manifest["manifest_hash"]
-                request["offline_artifacts"] = typed_plan["artifact_supply"]["dependency_order"]
-            conn.execute(
-                "INSERT INTO provider_jobs (id,provider_id,server_id,changeset_id,operation,state,stage,attempt,max_attempts,plan_hash,request_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (job_id, blueprint["provider"], node["server_id"], changeset["id"], "cluster.provision.apply", "WAITING_APPROVAL", "plan", 1, 3, changeset["plan_hash"], json.dumps(request, sort_keys=True), now, now),
-            )
-            _provider_job_event(conn, job_id, "plan", "WAITING_APPROVAL", "Cluster provisioning node job is blocked on exact ChangeSet approval", {"cluster_id": cluster_id, "role": node["role"]})
+        coordinator = next((node for node in typed_plan["nodes"] if node["role"] in {"control-plane", "control-plane-worker"}), typed_plan["nodes"][0])
+        job_id = f"job_{uuid.uuid4().hex[:16]}"
+        job_ids: list[str] = [job_id]
+        request = {
+            "cluster_id": cluster_id,
+            "provider": blueprint["provider"],
+            "coordinator_server_id": coordinator["server_id"],
+            "typed_plan_hash": typed_plan["plan_hash"],
+            "executor": "cluster-provider-worker",
+        }
+        if artifact_manifest is not None:
+            request["artifact_manifest_hash"] = artifact_manifest["manifest_hash"]
+            request["offline_artifact_count"] = len(typed_plan["artifact_supply"]["dependency_order"])
+        conn.execute(
+            "INSERT INTO provider_jobs (id,provider_id,server_id,changeset_id,operation,state,stage,attempt,max_attempts,plan_hash,request_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (job_id, blueprint["provider"], coordinator["server_id"], changeset["id"], "cluster.provision.apply", "WAITING_APPROVAL", "plan", 1, 3, changeset["plan_hash"], json.dumps(request, sort_keys=True), now, now),
+        )
+        _provider_job_event(conn, job_id, "plan", "WAITING_APPROVAL", "Cluster provisioning coordinator job is blocked on exact ChangeSet approval", {"cluster_id": cluster_id, "coordinator_server_id": coordinator["server_id"], "node_count": len(typed_plan["nodes"])})
         run_id = f"prn_{uuid.uuid4().hex[:16]}"
         conn.execute(
             "INSERT INTO provisioning_runs (id,cluster_id,profile_id,provider,state,stage,changeset_id,provider_job_ids_json,plan_json,result_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -3794,6 +4000,7 @@ async def plan_operations_intent(payload: OperationsIntentPlanCreate, authorizat
             executor = "cluster-provider-worker"
             adapter = "provider"
             runtime_preview = None
+            artifact_supply = None
             if operations.kubernetes_day2_runtime_capable(payload.operation):
                 try:
                     operations.validate_kubernetes_day2_parameters(payload.operation, payload.parameters)
@@ -3810,8 +4017,52 @@ async def plan_operations_intent(payload: OperationsIntentPlanCreate, authorizat
                     raise HTTPException(status_code=502, detail="Kubernetes Broker returned an unsafe or incomplete day-2 runtime preview")
                 executor = "kubernetes-broker"
                 adapter = "kubernetes"
+            elif operations.provider_day2_runtime_capable(payload.operation):
+                try:
+                    operations.validate_provider_day2_parameters(payload.operation, payload.parameters)
+                except ValueError as exc:
+                    raise HTTPException(status_code=422, detail=str(exc)) from exc
+                server_ids: list[str] = []
+                for key in ("server_id", "old_server_id", "new_server_id"):
+                    value = str(payload.parameters.get(key) or "")
+                    if value and value not in server_ids:
+                        server_ids.append(value)
+                cluster_server_ids = {str(item.get("id") or "") for item in target.get("server_snapshots") or []}
+                if payload.operation == "cluster.worker.add" and server_ids and server_ids[0] in cluster_server_ids:
+                    raise HTTPException(status_code=409, detail="worker add server is already part of the cluster")
+                if payload.operation == "cluster.worker.remove" and (not server_ids or server_ids[0] not in cluster_server_ids):
+                    raise HTTPException(status_code=409, detail="worker remove server is not part of the cluster")
+                if payload.operation == "cluster.worker.replace" and (payload.parameters.get("old_server_id") not in cluster_server_ids or payload.parameters.get("new_server_id") in cluster_server_ids):
+                    raise HTTPException(status_code=409, detail="worker replace requires old server in cluster and new server outside cluster")
+                if payload.operation == "cluster.node.maintenance" and (not server_ids or server_ids[0] not in cluster_server_ids):
+                    raise HTTPException(status_code=409, detail="maintenance server is not part of the cluster")
+                for server_id in server_ids:
+                    targets.append(_server_snapshot(conn, server_id))
+                if payload.operation == "cluster.decommission" and str(payload.parameters.get("confirm_cluster_name") or "") != cluster["name"]:
+                    raise HTTPException(status_code=409, detail="decommission confirmation must exactly match cluster name")
+                blueprint_id = str(payload.parameters.get("artifact_blueprint_id") or "")
+                if blueprint_id:
+                    candidate_blueprint = _blueprint_dict(_get_blueprint(conn, blueprint_id))
+                    if candidate_blueprint["provider"] != cluster["provider"]:
+                        raise HTTPException(status_code=409, detail="artifact blueprint provider does not match cluster provider")
+                    if payload.operation == "cluster.kubernetes.upgrade" and candidate_blueprint["kubernetes_version"] != str(payload.parameters.get("target_version") or "").lstrip("v"):
+                        requested = str(payload.parameters.get("target_version") or "").lstrip("v")
+                        if candidate_blueprint["kubernetes_version"].lstrip("v") != requested:
+                            raise HTTPException(status_code=409, detail="artifact blueprint Kubernetes version does not match target_version")
+                    candidate_manifest = _blueprint_artifact_manifest(conn, blueprint_id)
+                    try:
+                        artifact_supply = cluster_factory.offline_artifact_supply(candidate_manifest)
+                    except ValueError as exc:
+                        raise HTTPException(status_code=409, detail=str(exc)) from exc
+                else:
+                    artifact_supply = target.get("artifact_supply")
+                preliminary = operations.day2_plan(operation=payload.operation, targets=targets, parameters=payload.parameters, runtime_preview=None, artifact_supply=artifact_supply)
+                runtime_preview = await provider_worker.post("/v1/provider/preview", {"changeset_plan": {"parameters": {"typed_plan": preliminary}}})
+                _validate_credential_metadata(runtime_preview)
+                if runtime_preview.get("secret_output_suppressed") is not True or runtime_preview.get("arbitrary_shell") is not False or runtime_preview.get("arbitrary_ssh_command") is not False:
+                    raise HTTPException(status_code=502, detail="provider worker returned an unsafe runtime preview")
             try:
-                typed_plan = operations.day2_plan(operation=payload.operation, targets=targets, parameters=payload.parameters, runtime_preview=runtime_preview)
+                typed_plan = operations.day2_plan(operation=payload.operation, targets=targets, parameters=payload.parameters, runtime_preview=runtime_preview, artifact_supply=artifact_supply)
             except ValueError as exc:
                 raise HTTPException(status_code=422, detail=str(exc)) from exc
             result = _plan_mutation(conn, typed_plan=typed_plan, target_id=payload.target_id, subject_type="cluster", subject_id=payload.target_id, requested_by=payload.requested_by, source_channel=payload.source_channel, adapter=adapter, ttl_seconds=payload.ttl_seconds, executor=executor)
@@ -3937,7 +4188,7 @@ async def execute_operation_job(job_id: str, payload: OperationJobExecute, autho
             raise HTTPException(status_code=404, detail="operation job not found")
         if job["state"] != "READY":
             raise HTTPException(status_code=409, detail="operation job must be READY before trusted execution")
-        if job["executor"] not in {"kubernetes-broker", "artifact-mirror-worker"}:
+        if job["executor"] not in {"kubernetes-broker", "artifact-mirror-worker", "cluster-provider-worker"}:
             raise HTTPException(status_code=422, detail="operation job does not have a trusted runtime executor")
         changeset, _, typed_plan, current_approval_ids = _verify_operation_job_authorization(conn, job)
         ticket_auth = _verify_operation_job_ticket(conn, job, payload.execution_ticket, payload.signature, require_fresh=True)
@@ -3947,6 +4198,8 @@ async def execute_operation_job(job_id: str, payload: OperationJobExecute, autho
             raise HTTPException(status_code=422, detail="typed operation is not supported by the trusted Kubernetes day-2 runtime")
         if job["executor"] == "artifact-mirror-worker" and not operations.artifact_mirror_runtime_capable(typed_plan):
             raise HTTPException(status_code=422, detail="typed operation is not supported by the trusted artifact mirror runtime")
+        if job["executor"] == "cluster-provider-worker" and not operations.provider_day2_runtime_capable(str(typed_plan.get("operation") or "")):
+            raise HTTPException(status_code=422, detail="typed operation is not supported by the trusted cluster provider runtime")
         now = int(time.time())
         if current_approval_ids:
             placeholders = ",".join("?" for _ in current_approval_ids)
@@ -3966,6 +4219,8 @@ async def execute_operation_job(job_id: str, payload: OperationJobExecute, autho
     try:
         if executor == "kubernetes-broker":
             runtime_result = await kubernetes_broker.post("/v1/day2/execute", {"ticket": payload.execution_ticket, "signature": payload.signature})
+        elif executor == "cluster-provider-worker":
+            runtime_result = await provider_worker.post("/v1/provider/execute", {"ticket": payload.execution_ticket, "signature": payload.signature})
         else:
             runtime_result = await asyncio.to_thread(artifact_mirror.execute, typed_plan)
         _validate_credential_metadata(runtime_result)
@@ -4005,6 +4260,8 @@ async def execute_operation_job(job_id: str, payload: OperationJobExecute, autho
     response = {"operation_job": _operation_job_dict(updated), "verification": verification, "runtime_result": runtime_result}
     if executor == "kubernetes-broker":
         response["broker_result"] = runtime_result
+    elif executor == "cluster-provider-worker":
+        response["provider_worker_result"] = runtime_result
     return response
 
 

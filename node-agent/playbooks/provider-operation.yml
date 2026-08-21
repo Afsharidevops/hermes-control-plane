@@ -1,0 +1,707 @@
+---
+- name: Hermes trusted provider operation
+  hosts: all
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Require supported Hermes provider operation
+      ansible.builtin.assert:
+        that:
+          - hermes_operation in [
+              'cluster.provision.apply', 'cluster.worker.add', 'cluster.worker.remove',
+              'cluster.worker.replace', 'cluster.kubernetes.upgrade', 'cluster.etcd.snapshot',
+              'cluster.etcd.restore', 'cluster.certificate.rotate', 'cluster.node.maintenance',
+              'cluster.disaster-recovery'
+            ]
+          - hermes_provider in ['k3s', 'rke2', 'kubespray']
+
+    - name: Create Hermes runtime directory
+      ansible.builtin.file:
+        path: /var/lib/hermes/provider
+        state: directory
+        owner: root
+        group: root
+        mode: '0700'
+
+    - name: Record exact non-secret runtime binding
+      ansible.builtin.copy:
+        dest: /var/lib/hermes/provider/runtime-binding.json
+        owner: root
+        group: root
+        mode: '0600'
+        content: >-
+          {{ {'cluster_id': hermes_cluster_id, 'operation': hermes_operation, 'provider': hermes_provider,
+              'kubernetes_version': hermes_kubernetes_version, 'target_version': hermes_target_version,
+              'artifact_manifest_hash': hermes_offline_manifest_hash} | to_json }}
+
+    # K3s offline artifact preparation. The installer/script path and artifact names
+    # are fixed by the worker; no caller-supplied command line is accepted.
+    - name: K3s create air-gap image directory
+      ansible.builtin.file:
+        path: /var/lib/rancher/k3s/agent/images
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+      when: >-
+        hermes_provider == 'k3s' and
+        hermes_operation in ['cluster.provision.apply', 'cluster.worker.add', 'cluster.worker.replace', 'cluster.kubernetes.upgrade'] and
+        (hermes_operation not in ['cluster.worker.add', 'cluster.worker.replace'] or
+         hermes_server_id == hostvars[inventory_hostname].hermes_server_id or
+         hermes_new_server_id == hostvars[inventory_hostname].hermes_server_id)
+
+    - name: K3s remove stale air-gap image archives before exact replacement
+      ansible.builtin.find:
+        paths: /var/lib/rancher/k3s/agent/images
+        patterns: 'k3s-airgap-images*'
+        file_type: file
+      register: hermes_k3s_old_images
+      when: >-
+        hermes_provider == 'k3s' and
+        hermes_operation in ['cluster.provision.apply', 'cluster.worker.add', 'cluster.worker.replace', 'cluster.kubernetes.upgrade'] and
+        (hermes_operation not in ['cluster.worker.add', 'cluster.worker.replace'] or
+         hermes_server_id == hostvars[inventory_hostname].hermes_server_id or
+         hermes_new_server_id == hostvars[inventory_hostname].hermes_server_id)
+
+    - name: K3s delete stale air-gap image archives
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ hermes_k3s_old_images.files | default([]) }}"
+      when: hermes_provider == 'k3s'
+
+    - name: K3s copy exact binary
+      ansible.builtin.copy:
+        src: "{{ hermes_binary }}"
+        dest: /usr/local/bin/k3s
+        owner: root
+        group: root
+        mode: '0755'
+      when: >-
+        hermes_provider == 'k3s' and
+        hermes_operation in ['cluster.provision.apply', 'cluster.worker.add', 'cluster.worker.replace', 'cluster.kubernetes.upgrade'] and
+        (hermes_operation not in ['cluster.worker.add', 'cluster.worker.replace'] or
+         hermes_server_id == hostvars[inventory_hostname].hermes_server_id or
+         hermes_new_server_id == hostvars[inventory_hostname].hermes_server_id)
+
+    - name: K3s copy exact offline installer
+      ansible.builtin.copy:
+        src: "{{ hermes_install_script }}"
+        dest: /var/lib/hermes/provider/k3s-install.sh
+        owner: root
+        group: root
+        mode: '0700'
+      when: >-
+        hermes_provider == 'k3s' and
+        hermes_operation in ['cluster.provision.apply', 'cluster.worker.add', 'cluster.worker.replace'] and
+        (hermes_operation == 'cluster.provision.apply' or
+         hermes_server_id == hostvars[inventory_hostname].hermes_server_id or
+         hermes_new_server_id == hostvars[inventory_hostname].hermes_server_id)
+
+    - name: K3s copy exact air-gap images
+      ansible.builtin.copy:
+        src: "{{ hermes_images }}"
+        dest: "/var/lib/rancher/k3s/agent/images/{{ hermes_images | basename }}"
+        owner: root
+        group: root
+        mode: '0600'
+      when: >-
+        hermes_provider == 'k3s' and
+        hermes_operation in ['cluster.provision.apply', 'cluster.worker.add', 'cluster.worker.replace', 'cluster.kubernetes.upgrade'] and
+        (hermes_operation not in ['cluster.worker.add', 'cluster.worker.replace'] or
+         hermes_server_id == hostvars[inventory_hostname].hermes_server_id or
+         hermes_new_server_id == hostvars[inventory_hostname].hermes_server_id)
+
+    - name: K3s bootstrap primary embedded-etcd server
+      ansible.builtin.command:
+        argv: [/bin/sh, /var/lib/hermes/provider/k3s-install.sh]
+      environment:
+        INSTALL_K3S_SKIP_DOWNLOAD: 'true'
+        INSTALL_K3S_EXEC: >-
+          server --cluster-init --flannel-backend=none --disable-network-policy{% if hermes_offline_registry %} --system-default-registry={{ hermes_offline_registry }}{% endif %}
+      when: >-
+        hermes_provider == 'k3s' and hermes_operation == 'cluster.provision.apply' and
+        inventory_hostname == groups['kube_control_plane'][0]
+
+    - name: K3s wait for primary token
+      ansible.builtin.wait_for:
+        path: /var/lib/rancher/k3s/server/token
+        timeout: 180
+      when: >-
+        hermes_provider == 'k3s' and
+        hermes_operation in ['cluster.provision.apply', 'cluster.worker.add', 'cluster.worker.replace'] and
+        inventory_hostname == groups['kube_control_plane'][0]
+
+    - name: K3s read primary token inside trusted worker session
+      ansible.builtin.slurp:
+        src: /var/lib/rancher/k3s/server/token
+      register: hermes_k3s_token
+      no_log: true
+      when: >-
+        hermes_provider == 'k3s' and
+        hermes_operation in ['cluster.provision.apply', 'cluster.worker.add', 'cluster.worker.replace'] and
+        inventory_hostname == groups['kube_control_plane'][0]
+
+    - name: K3s join additional control-plane servers
+      ansible.builtin.command:
+        argv: [/bin/sh, /var/lib/hermes/provider/k3s-install.sh]
+      environment:
+        INSTALL_K3S_SKIP_DOWNLOAD: 'true'
+        K3S_URL: "{{ hermes_primary_api_url }}"
+        K3S_TOKEN: "{{ hostvars[groups['kube_control_plane'][0]].hermes_k3s_token.content | b64decode | trim }}"
+        INSTALL_K3S_EXEC: >-
+          server --flannel-backend=none --disable-network-policy{% if hermes_offline_registry %} --system-default-registry={{ hermes_offline_registry }}{% endif %}
+      no_log: true
+      when: >-
+        hermes_provider == 'k3s' and hermes_operation == 'cluster.provision.apply' and
+        inventory_hostname in groups['kube_control_plane'] and
+        inventory_hostname != groups['kube_control_plane'][0]
+
+    - name: K3s join initial worker nodes
+      ansible.builtin.command:
+        argv: [/bin/sh, /var/lib/hermes/provider/k3s-install.sh]
+      environment:
+        INSTALL_K3S_SKIP_DOWNLOAD: 'true'
+        K3S_URL: "{{ hermes_primary_api_url }}"
+        K3S_TOKEN: "{{ hostvars[groups['kube_control_plane'][0]].hermes_k3s_token.content | b64decode | trim }}"
+        INSTALL_K3S_EXEC: agent
+      no_log: true
+      when: >-
+        hermes_provider == 'k3s' and hermes_operation == 'cluster.provision.apply' and
+        hostvars[inventory_hostname].hermes_role == 'worker'
+
+    - name: K3s join approved replacement/new worker
+      ansible.builtin.command:
+        argv: [/bin/sh, /var/lib/hermes/provider/k3s-install.sh]
+      environment:
+        INSTALL_K3S_SKIP_DOWNLOAD: 'true'
+        K3S_URL: "{{ hermes_primary_api_url }}"
+        K3S_TOKEN: "{{ hostvars[groups['kube_control_plane'][0]].hermes_k3s_token.content | b64decode | trim }}"
+        INSTALL_K3S_EXEC: agent
+      no_log: true
+      when: >-
+        hermes_provider == 'k3s' and hermes_operation in ['cluster.worker.add', 'cluster.worker.replace'] and
+        (hermes_server_id == hostvars[inventory_hostname].hermes_server_id or
+         hermes_new_server_id == hostvars[inventory_hostname].hermes_server_id)
+
+    - name: K3s rolling restart after exact binary/image upgrade
+      ansible.builtin.systemd_service:
+        name: "{{ 'k3s' if inventory_hostname in groups['kube_control_plane'] else 'k3s-agent' }}"
+        state: restarted
+        enabled: true
+      throttle: 1
+      when: hermes_provider == 'k3s' and hermes_operation == 'cluster.kubernetes.upgrade'
+
+    # RKE2 offline artifact preparation and role-aware install/join.
+    - name: RKE2 create exact offline artifact directory
+      ansible.builtin.file:
+        path: /var/lib/hermes/provider/rke2-artifacts
+        state: directory
+        owner: root
+        group: root
+        mode: '0700'
+      when: >-
+        hermes_provider == 'rke2' and
+        hermes_operation in ['cluster.provision.apply', 'cluster.worker.add', 'cluster.worker.replace', 'cluster.kubernetes.upgrade'] and
+        (hermes_operation not in ['cluster.worker.add', 'cluster.worker.replace'] or
+         hermes_server_id == hostvars[inventory_hostname].hermes_server_id or
+         hermes_new_server_id == hostvars[inventory_hostname].hermes_server_id)
+
+    - name: RKE2 publish exact offline artifacts on approved nodes
+      ansible.builtin.copy:
+        src: "{{ hermes_bundle_root }}/"
+        dest: /var/lib/hermes/provider/rke2-artifacts/
+        owner: root
+        group: root
+        mode: preserve
+      when: >-
+        hermes_provider == 'rke2' and
+        hermes_operation in ['cluster.provision.apply', 'cluster.worker.add', 'cluster.worker.replace', 'cluster.kubernetes.upgrade'] and
+        (hermes_operation not in ['cluster.worker.add', 'cluster.worker.replace'] or
+         hermes_server_id == hostvars[inventory_hostname].hermes_server_id or
+         hermes_new_server_id == hostvars[inventory_hostname].hermes_server_id)
+
+    - name: RKE2 create configuration directory
+      ansible.builtin.file:
+        path: /etc/rancher/rke2
+        state: directory
+        owner: root
+        group: root
+        mode: '0700'
+      when: >-
+        hermes_provider == 'rke2' and
+        hermes_operation in ['cluster.provision.apply', 'cluster.worker.add', 'cluster.worker.replace']
+
+    - name: RKE2 write primary server configuration
+      ansible.builtin.copy:
+        dest: /etc/rancher/rke2/config.yaml
+        owner: root
+        group: root
+        mode: '0600'
+        content: |-
+          cni: cilium
+          secrets-encryption: true
+          protect-kernel-defaults: true
+          write-kubeconfig-mode: "0600"
+          {% if hermes_offline_registry %}system-default-registry: "{{ hermes_offline_registry }}"{% endif %}
+      when: >-
+        hermes_provider == 'rke2' and hermes_operation == 'cluster.provision.apply' and
+        inventory_hostname == groups['kube_control_plane'][0]
+
+    - name: RKE2 install primary server from exact local artifact directory
+      ansible.builtin.command:
+        argv: [/bin/sh, /var/lib/hermes/provider/rke2-artifacts/install.sh]
+      environment:
+        INSTALL_RKE2_ARTIFACT_PATH: /var/lib/hermes/provider/rke2-artifacts
+        INSTALL_RKE2_TYPE: server
+      when: >-
+        hermes_provider == 'rke2' and hermes_operation == 'cluster.provision.apply' and
+        inventory_hostname == groups['kube_control_plane'][0]
+
+    - name: RKE2 start primary server
+      ansible.builtin.systemd_service:
+        name: rke2-server
+        state: started
+        enabled: true
+      when: >-
+        hermes_provider == 'rke2' and hermes_operation == 'cluster.provision.apply' and
+        inventory_hostname == groups['kube_control_plane'][0]
+
+    - name: RKE2 wait for primary token
+      ansible.builtin.wait_for:
+        path: /var/lib/rancher/rke2/server/token
+        timeout: 180
+      when: >-
+        hermes_provider == 'rke2' and
+        hermes_operation in ['cluster.provision.apply', 'cluster.worker.add', 'cluster.worker.replace'] and
+        inventory_hostname == groups['kube_control_plane'][0]
+
+    - name: RKE2 read primary token inside trusted worker session
+      ansible.builtin.slurp:
+        src: /var/lib/rancher/rke2/server/token
+      register: hermes_rke2_token
+      no_log: true
+      when: >-
+        hermes_provider == 'rke2' and
+        hermes_operation in ['cluster.provision.apply', 'cluster.worker.add', 'cluster.worker.replace'] and
+        inventory_hostname == groups['kube_control_plane'][0]
+
+    - name: RKE2 write additional server configuration
+      ansible.builtin.copy:
+        dest: /etc/rancher/rke2/config.yaml
+        owner: root
+        group: root
+        mode: '0600'
+        content: |-
+          server: "{{ hermes_primary_supervisor_url }}"
+          token: "{{ hostvars[groups['kube_control_plane'][0]].hermes_rke2_token.content | b64decode | trim }}"
+          cni: cilium
+          secrets-encryption: true
+          protect-kernel-defaults: true
+          write-kubeconfig-mode: "0600"
+          {% if hermes_offline_registry %}system-default-registry: "{{ hermes_offline_registry }}"{% endif %}
+      no_log: true
+      when: >-
+        hermes_provider == 'rke2' and hermes_operation == 'cluster.provision.apply' and
+        inventory_hostname in groups['kube_control_plane'] and
+        inventory_hostname != groups['kube_control_plane'][0]
+
+    - name: RKE2 install additional server from exact local artifact directory
+      ansible.builtin.command:
+        argv: [/bin/sh, /var/lib/hermes/provider/rke2-artifacts/install.sh]
+      environment:
+        INSTALL_RKE2_ARTIFACT_PATH: /var/lib/hermes/provider/rke2-artifacts
+        INSTALL_RKE2_TYPE: server
+      when: >-
+        hermes_provider == 'rke2' and hermes_operation == 'cluster.provision.apply' and
+        inventory_hostname in groups['kube_control_plane'] and
+        inventory_hostname != groups['kube_control_plane'][0]
+
+    - name: RKE2 start additional server
+      ansible.builtin.systemd_service:
+        name: rke2-server
+        state: started
+        enabled: true
+      when: >-
+        hermes_provider == 'rke2' and hermes_operation == 'cluster.provision.apply' and
+        inventory_hostname in groups['kube_control_plane'] and
+        inventory_hostname != groups['kube_control_plane'][0]
+
+    - name: RKE2 write worker configuration
+      ansible.builtin.copy:
+        dest: /etc/rancher/rke2/config.yaml
+        owner: root
+        group: root
+        mode: '0600'
+        content: |-
+          server: "{{ hermes_primary_supervisor_url }}"
+          token: "{{ hostvars[groups['kube_control_plane'][0]].hermes_rke2_token.content | b64decode | trim }}"
+          {% if hermes_offline_registry %}system-default-registry: "{{ hermes_offline_registry }}"{% endif %}
+      no_log: true
+      when: >-
+        hermes_provider == 'rke2' and
+        ((hermes_operation == 'cluster.provision.apply' and hostvars[inventory_hostname].hermes_role == 'worker') or
+         (hermes_operation in ['cluster.worker.add', 'cluster.worker.replace'] and
+          (hermes_server_id == hostvars[inventory_hostname].hermes_server_id or
+           hermes_new_server_id == hostvars[inventory_hostname].hermes_server_id)))
+
+    - name: RKE2 install approved worker from exact local artifact directory
+      ansible.builtin.command:
+        argv: [/bin/sh, /var/lib/hermes/provider/rke2-artifacts/install.sh]
+      environment:
+        INSTALL_RKE2_ARTIFACT_PATH: /var/lib/hermes/provider/rke2-artifacts
+        INSTALL_RKE2_TYPE: agent
+      when: >-
+        hermes_provider == 'rke2' and
+        ((hermes_operation == 'cluster.provision.apply' and hostvars[inventory_hostname].hermes_role == 'worker') or
+         (hermes_operation in ['cluster.worker.add', 'cluster.worker.replace'] and
+          (hermes_server_id == hostvars[inventory_hostname].hermes_server_id or
+           hermes_new_server_id == hostvars[inventory_hostname].hermes_server_id)))
+
+    - name: RKE2 start approved worker
+      ansible.builtin.systemd_service:
+        name: rke2-agent
+        state: started
+        enabled: true
+      when: >-
+        hermes_provider == 'rke2' and
+        ((hermes_operation == 'cluster.provision.apply' and hostvars[inventory_hostname].hermes_role == 'worker') or
+         (hermes_operation in ['cluster.worker.add', 'cluster.worker.replace'] and
+          (hermes_server_id == hostvars[inventory_hostname].hermes_server_id or
+           hermes_new_server_id == hostvars[inventory_hostname].hermes_server_id)))
+
+    - name: RKE2 reinstall exact version during upgrade
+      ansible.builtin.command:
+        argv: [/bin/sh, /var/lib/hermes/provider/rke2-artifacts/install.sh]
+      environment:
+        INSTALL_RKE2_ARTIFACT_PATH: /var/lib/hermes/provider/rke2-artifacts
+        INSTALL_RKE2_TYPE: "{{ 'server' if inventory_hostname in groups['kube_control_plane'] else 'agent' }}"
+      when: hermes_provider == 'rke2' and hermes_operation == 'cluster.kubernetes.upgrade'
+
+    - name: RKE2 rolling restart after exact artifact upgrade
+      ansible.builtin.systemd_service:
+        name: "{{ 'rke2-server' if inventory_hostname in groups['kube_control_plane'] else 'rke2-agent' }}"
+        state: restarted
+        enabled: true
+      throttle: 1
+      when: hermes_provider == 'rke2' and hermes_operation == 'cluster.kubernetes.upgrade'
+
+    # Worker removal is deliberately bounded to worker-role nodes by provider-runtime validation.
+    - name: K3s delete worker Node object before host removal
+      ansible.builtin.command:
+        argv: [/usr/local/bin/k3s, kubectl, delete, node, "{{ item }}", '--ignore-not-found=true']
+      loop: "{{ groups['kube_node'] }}"
+      loop_control:
+        label: "{{ item }}"
+      when: >-
+        hermes_provider == 'k3s' and hermes_operation in ['cluster.worker.remove', 'cluster.worker.replace'] and
+        inventory_hostname == groups['kube_control_plane'][0] and
+        (hermes_server_id == hostvars[item].hermes_server_id or hermes_old_server_id == hostvars[item].hermes_server_id)
+
+    - name: K3s stop removed worker agent
+      ansible.builtin.systemd_service:
+        name: k3s-agent
+        state: stopped
+        enabled: false
+      when: >-
+        hermes_provider == 'k3s' and hermes_operation in ['cluster.worker.remove', 'cluster.worker.replace'] and
+        (hermes_server_id == hostvars[inventory_hostname].hermes_server_id or
+         hermes_old_server_id == hostvars[inventory_hostname].hermes_server_id)
+
+    - name: RKE2 delete worker Node object before host removal
+      ansible.builtin.command:
+        argv: [/var/lib/rancher/rke2/bin/kubectl, '--kubeconfig=/etc/rancher/rke2/rke2.yaml', delete, node, "{{ item }}", '--ignore-not-found=true']
+      loop: "{{ groups['kube_node'] }}"
+      loop_control:
+        label: "{{ item }}"
+      when: >-
+        hermes_provider == 'rke2' and hermes_operation in ['cluster.worker.remove', 'cluster.worker.replace'] and
+        inventory_hostname == groups['kube_control_plane'][0] and
+        (hermes_server_id == hostvars[item].hermes_server_id or hermes_old_server_id == hostvars[item].hermes_server_id)
+
+    - name: RKE2 stop removed worker agent
+      ansible.builtin.systemd_service:
+        name: rke2-agent
+        state: stopped
+        enabled: false
+      when: >-
+        hermes_provider == 'rke2' and hermes_operation in ['cluster.worker.remove', 'cluster.worker.replace'] and
+        (hermes_server_id == hostvars[inventory_hostname].hermes_server_id or
+         hermes_old_server_id == hostvars[inventory_hostname].hermes_server_id)
+
+    # Provider-backed maintenance and certificate rotation.
+    - name: Restart kubelet for Kubespray maintenance
+      ansible.builtin.systemd_service:
+        name: kubelet
+        state: restarted
+      when: >-
+        hermes_provider == 'kubespray' and hermes_operation == 'cluster.node.maintenance' and
+        hermes_maintenance_action == 'restart-kubelet' and
+        hermes_server_id == hostvars[inventory_hostname].hermes_server_id
+
+    - name: Restart K3s provider service for maintenance
+      ansible.builtin.systemd_service:
+        name: "{{ 'k3s' if inventory_hostname in groups['kube_control_plane'] else 'k3s-agent' }}"
+        state: restarted
+      when: >-
+        hermes_provider == 'k3s' and hermes_operation == 'cluster.node.maintenance' and
+        hermes_maintenance_action == 'restart-provider-service' and
+        hermes_server_id == hostvars[inventory_hostname].hermes_server_id
+
+    - name: Restart RKE2 provider service for maintenance
+      ansible.builtin.systemd_service:
+        name: "{{ 'rke2-server' if inventory_hostname in groups['kube_control_plane'] else 'rke2-agent' }}"
+        state: restarted
+      when: >-
+        hermes_provider == 'rke2' and hermes_operation == 'cluster.node.maintenance' and
+        hermes_maintenance_action == 'restart-provider-service' and
+        hermes_server_id == hostvars[inventory_hostname].hermes_server_id
+
+    - name: Reboot node for approved maintenance
+      ansible.builtin.reboot:
+        reboot_timeout: 900
+      when: >-
+        hermes_operation == 'cluster.node.maintenance' and hermes_maintenance_action == 'reboot' and
+        hermes_server_id == hostvars[inventory_hostname].hermes_server_id
+
+    - name: K3s certificate rotation
+      ansible.builtin.command:
+        argv: [/usr/local/bin/k3s, certificate, rotate]
+      throttle: 1
+      when: hermes_provider == 'k3s' and hermes_operation == 'cluster.certificate.rotate' and inventory_hostname in groups['kube_control_plane']
+
+    - name: Restart K3s after certificate rotation
+      ansible.builtin.systemd_service:
+        name: k3s
+        state: restarted
+      throttle: 1
+      when: hermes_provider == 'k3s' and hermes_operation == 'cluster.certificate.rotate' and inventory_hostname in groups['kube_control_plane']
+
+    - name: RKE2 certificate rotation
+      ansible.builtin.command:
+        argv: [/usr/local/bin/rke2, certificate, rotate]
+      throttle: 1
+      when: hermes_provider == 'rke2' and hermes_operation == 'cluster.certificate.rotate' and inventory_hostname in groups['kube_control_plane']
+
+    - name: Restart RKE2 after certificate rotation
+      ansible.builtin.systemd_service:
+        name: rke2-server
+        state: restarted
+      throttle: 1
+      when: hermes_provider == 'rke2' and hermes_operation == 'cluster.certificate.rotate' and inventory_hostname in groups['kube_control_plane']
+
+    - name: Kubespray kubeadm certificate rotation
+      ansible.builtin.command:
+        argv: [kubeadm, certs, renew, all]
+      throttle: 1
+      when: hermes_provider == 'kubespray' and hermes_operation == 'cluster.certificate.rotate' and inventory_hostname in groups['kube_control_plane']
+
+    - name: Discover Kubespray static control-plane pods after certificate rotation
+      ansible.builtin.command:
+        argv: [crictl, pods, '--namespace', kube-system, '--name', 'kube-apiserver|kube-controller-manager|kube-scheduler|etcd', '-q']
+      register: hermes_kubespray_control_plane_pods
+      changed_when: false
+      throttle: 1
+      when: hermes_provider == 'kubespray' and hermes_operation == 'cluster.certificate.rotate' and inventory_hostname in groups['kube_control_plane']
+
+    - name: Restart Kubespray static control-plane pods after certificate rotation
+      ansible.builtin.command:
+        argv: [crictl, rmp, '-f', "{{ item }}"]
+      loop: "{{ hermes_kubespray_control_plane_pods.stdout_lines | default([]) }}"
+      throttle: 1
+      when: hermes_provider == 'kubespray' and hermes_operation == 'cluster.certificate.rotate' and inventory_hostname in groups['kube_control_plane']
+
+    # Direct embedded-etcd snapshot: save using the provider CLI, then bind the
+    # generated timestamped file to a deterministic Hermes snapshot reference.
+    - name: Create deterministic Hermes snapshot directory
+      ansible.builtin.file:
+        path: /var/lib/hermes/provider/snapshots
+        state: directory
+        owner: root
+        group: root
+        mode: '0700'
+      when: >-
+        hermes_provider in ['k3s', 'rke2'] and hermes_operation == 'cluster.etcd.snapshot' and
+        inventory_hostname == groups['etcd'][0]
+
+    - name: Direct K3s embedded-etcd snapshot
+      ansible.builtin.command:
+        argv: [/usr/local/bin/k3s, etcd-snapshot, save, '--name', "{{ hermes_snapshot_name }}", '--etcd-snapshot-dir', /var/lib/hermes/provider/snapshots]
+      when: hermes_provider == 'k3s' and hermes_operation == 'cluster.etcd.snapshot' and inventory_hostname == groups['etcd'][0]
+
+    - name: Direct RKE2 embedded-etcd snapshot
+      ansible.builtin.command:
+        argv: [/usr/local/bin/rke2, etcd-snapshot, save, '--name', "{{ hermes_snapshot_name }}", '--etcd-snapshot-dir', /var/lib/hermes/provider/snapshots]
+      when: hermes_provider == 'rke2' and hermes_operation == 'cluster.etcd.snapshot' and inventory_hostname == groups['etcd'][0]
+
+    - name: Find generated provider snapshot
+      ansible.builtin.find:
+        paths: /var/lib/hermes/provider/snapshots
+        patterns: "{{ hermes_snapshot_name }}-*"
+        file_type: file
+      register: hermes_generated_snapshots
+      when: >-
+        hermes_provider in ['k3s', 'rke2'] and hermes_operation == 'cluster.etcd.snapshot' and
+        inventory_hostname == groups['etcd'][0]
+
+    - name: Require generated provider snapshot
+      ansible.builtin.assert:
+        that:
+          - hermes_generated_snapshots.matched | int > 0
+      when: >-
+        hermes_provider in ['k3s', 'rke2'] and hermes_operation == 'cluster.etcd.snapshot' and
+        inventory_hostname == groups['etcd'][0]
+
+    - name: Bind newest snapshot to deterministic Hermes reference
+      ansible.builtin.copy:
+        src: "{{ (hermes_generated_snapshots.files | sort(attribute='mtime') | last).path }}"
+        dest: "/var/lib/hermes/provider/snapshots/{{ hermes_snapshot_name }}.snapshot"
+        remote_src: true
+        owner: root
+        group: root
+        mode: '0600'
+      when: >-
+        hermes_provider in ['k3s', 'rke2'] and hermes_operation == 'cluster.etcd.snapshot' and
+        inventory_hostname == groups['etcd'][0]
+
+    # Multi-server restore follows the provider-supported sequence: stop all
+    # servers, reset the first server, start it, delete peer DB state, rejoin peers.
+    - name: Require deterministic snapshot before direct restore
+      ansible.builtin.stat:
+        path: "/var/lib/hermes/provider/snapshots/{{ hermes_snapshot_name }}.snapshot"
+      register: hermes_restore_snapshot
+      when: >-
+        hermes_provider in ['k3s', 'rke2'] and
+        hermes_operation in ['cluster.etcd.restore', 'cluster.disaster-recovery'] and
+        inventory_hostname == groups['etcd'][0]
+
+    - name: Require usable direct-restore snapshot
+      ansible.builtin.assert:
+        that:
+          - hermes_restore_snapshot.stat.exists
+          - hermes_restore_snapshot.stat.isreg
+          - hermes_restore_snapshot.stat.size | int > 0
+      when: >-
+        hermes_provider in ['k3s', 'rke2'] and
+        hermes_operation in ['cluster.etcd.restore', 'cluster.disaster-recovery'] and
+        inventory_hostname == groups['etcd'][0]
+
+    - name: Require K3s server token before restore
+      ansible.builtin.stat:
+        path: /var/lib/rancher/k3s/server/token
+      register: hermes_k3s_restore_token
+      when: >-
+        hermes_provider == 'k3s' and hermes_operation in ['cluster.etcd.restore', 'cluster.disaster-recovery'] and
+        inventory_hostname == groups['etcd'][0]
+
+    - name: Assert K3s restore token exists
+      ansible.builtin.assert:
+        that: [hermes_k3s_restore_token.stat.exists]
+      when: >-
+        hermes_provider == 'k3s' and hermes_operation in ['cluster.etcd.restore', 'cluster.disaster-recovery'] and
+        inventory_hostname == groups['etcd'][0]
+
+    - name: Require RKE2 server token before restore
+      ansible.builtin.stat:
+        path: /var/lib/rancher/rke2/server/token
+      register: hermes_rke2_restore_token
+      when: >-
+        hermes_provider == 'rke2' and hermes_operation in ['cluster.etcd.restore', 'cluster.disaster-recovery'] and
+        inventory_hostname == groups['etcd'][0]
+
+    - name: Assert RKE2 restore token exists
+      ansible.builtin.assert:
+        that: [hermes_rke2_restore_token.stat.exists]
+      when: >-
+        hermes_provider == 'rke2' and hermes_operation in ['cluster.etcd.restore', 'cluster.disaster-recovery'] and
+        inventory_hostname == groups['etcd'][0]
+
+    - name: Stop all K3s servers before direct restore
+      ansible.builtin.systemd_service:
+        name: k3s
+        state: stopped
+      when: hermes_provider == 'k3s' and hermes_operation in ['cluster.etcd.restore', 'cluster.disaster-recovery'] and inventory_hostname in groups['etcd']
+
+    - name: Reset primary K3s embedded-etcd from exact snapshot
+      ansible.builtin.command:
+        argv:
+          - /usr/local/bin/k3s
+          - server
+          - '--cluster-reset'
+          - "--cluster-reset-restore-path=/var/lib/hermes/provider/snapshots/{{ hermes_snapshot_name }}.snapshot"
+          - '--etcd-s3=false'
+      when: hermes_provider == 'k3s' and hermes_operation in ['cluster.etcd.restore', 'cluster.disaster-recovery'] and inventory_hostname == groups['etcd'][0]
+
+    - name: Start restored primary K3s server
+      ansible.builtin.systemd_service:
+        name: k3s
+        state: started
+      when: hermes_provider == 'k3s' and hermes_operation in ['cluster.etcd.restore', 'cluster.disaster-recovery'] and inventory_hostname == groups['etcd'][0]
+
+    - name: Wait for restored primary K3s API
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: 6443
+        timeout: 300
+      when: hermes_provider == 'k3s' and hermes_operation in ['cluster.etcd.restore', 'cluster.disaster-recovery'] and inventory_hostname == groups['etcd'][0]
+
+    - name: Delete old K3s peer DB before rejoin
+      ansible.builtin.file:
+        path: /var/lib/rancher/k3s/server/db
+        state: absent
+      when: >-
+        hermes_provider == 'k3s' and hermes_operation in ['cluster.etcd.restore', 'cluster.disaster-recovery'] and
+        inventory_hostname in groups['etcd'] and inventory_hostname != groups['etcd'][0]
+
+    - name: Rejoin K3s peer servers after restore
+      ansible.builtin.systemd_service:
+        name: k3s
+        state: started
+      when: >-
+        hermes_provider == 'k3s' and hermes_operation in ['cluster.etcd.restore', 'cluster.disaster-recovery'] and
+        inventory_hostname in groups['etcd'] and inventory_hostname != groups['etcd'][0]
+
+    - name: Stop all RKE2 servers before direct restore
+      ansible.builtin.systemd_service:
+        name: rke2-server
+        state: stopped
+      when: hermes_provider == 'rke2' and hermes_operation in ['cluster.etcd.restore', 'cluster.disaster-recovery'] and inventory_hostname in groups['etcd']
+
+    - name: Reset primary RKE2 embedded-etcd from exact snapshot
+      ansible.builtin.command:
+        argv:
+          - /usr/local/bin/rke2
+          - server
+          - '--cluster-reset'
+          - "--cluster-reset-restore-path=/var/lib/hermes/provider/snapshots/{{ hermes_snapshot_name }}.snapshot"
+          - '--etcd-s3=false'
+      when: hermes_provider == 'rke2' and hermes_operation in ['cluster.etcd.restore', 'cluster.disaster-recovery'] and inventory_hostname == groups['etcd'][0]
+
+    - name: Start restored primary RKE2 server
+      ansible.builtin.systemd_service:
+        name: rke2-server
+        state: started
+      when: hermes_provider == 'rke2' and hermes_operation in ['cluster.etcd.restore', 'cluster.disaster-recovery'] and inventory_hostname == groups['etcd'][0]
+
+    - name: Wait for restored primary RKE2 API
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: 6443
+        timeout: 300
+      when: hermes_provider == 'rke2' and hermes_operation in ['cluster.etcd.restore', 'cluster.disaster-recovery'] and inventory_hostname == groups['etcd'][0]
+
+    - name: Delete old RKE2 peer DB before rejoin
+      ansible.builtin.file:
+        path: /var/lib/rancher/rke2/server/db
+        state: absent
+      when: >-
+        hermes_provider == 'rke2' and hermes_operation in ['cluster.etcd.restore', 'cluster.disaster-recovery'] and
+        inventory_hostname in groups['etcd'] and inventory_hostname != groups['etcd'][0]
+
+    - name: Rejoin RKE2 peer servers after restore
+      ansible.builtin.systemd_service:
+        name: rke2-server
+        state: started
+      when: >-
+        hermes_provider == 'rke2' and hermes_operation in ['cluster.etcd.restore', 'cluster.disaster-recovery'] and
+        inventory_hostname in groups['etcd'] and inventory_hostname != groups['etcd'][0]

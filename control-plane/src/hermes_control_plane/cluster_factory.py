@@ -339,7 +339,7 @@ def _require_supported_addons(addons: list[str], versions: dict[str, str]) -> No
         raise ValueError(f"explicit version pins required for add-ons: {', '.join(missing)}")
 
 
-def _bind_ready_artifact_manifest(plan: dict[str, Any], artifact_manifest: dict[str, Any]) -> dict[str, Any]:
+def offline_artifact_supply(artifact_manifest: dict[str, Any]) -> dict[str, Any]:
     if artifact_manifest.get("state") != "READY" or artifact_manifest.get("issues"):
         raise ValueError("cluster blueprint artifact manifest must be READY before offline provisioning can be planned")
     manifest_hash = str(artifact_manifest.get("manifest_hash") or "")
@@ -387,25 +387,41 @@ def _bind_ready_artifact_manifest(plan: dict[str, Any], artifact_manifest: dict[
             "offline_reference": reference,
             "depends_on": list(item.get("depends_on") or []),
         })
-
     if not offline_artifacts:
         raise ValueError("cluster blueprint artifact manifest contains no resolved dependencies")
-
-    bound = deepcopy(plan)
-    bound["schema_version"] = max(int(bound.get("schema_version") or 0), 4)
-    bound["artifact_supply"] = {
+    return {
         "mode": "offline-manifest-bound",
         "manifest_hash": manifest_hash,
         "dependency_order": offline_artifacts,
         "offline_reference_selection": "verified-destination-only",
         "credential_material_in_plan": False,
-        "provisioner_rewrite_applied": False,
+        "provisioner_rewrite_applied": True,
+        "rewrite_contract": {
+            "file_artifacts": "provider-worker-local-mirror-path",
+            "oci_artifacts": "offline-registry-reference",
+            "repository_endpoints": "provider-worker-runtime-config",
+            "credential_delivery": "worker-only-mounted-secrets",
+            "public_network_required": False,
+        },
     }
+
+
+def _bind_ready_artifact_manifest(plan: dict[str, Any], artifact_manifest: dict[str, Any]) -> dict[str, Any]:
+    supply = offline_artifact_supply(artifact_manifest)
+    bound = deepcopy(plan)
+    bound["schema_version"] = max(int(bound.get("schema_version") or 0), 5)
+    bound["artifact_supply"] = supply
     provider_payload = dict(bound.get("provider_payload") or {})
-    provider_payload["offline_artifact_manifest_hash"] = manifest_hash
-    provider_payload["offline_artifacts"] = offline_artifacts
+    provider_payload["offline_artifact_manifest_hash"] = supply["manifest_hash"]
+    provider_payload["offline_artifacts"] = supply["dependency_order"]
     provider_payload["offline_reference_mode"] = "verified-mirror-destinations"
-    provider_payload["provisioner_rewrite_applied"] = False
+    provider_payload["provisioner_rewrite_applied"] = True
+    provider_payload["offline_execution_contract"] = {
+        "public_network_required": False,
+        "arbitrary_shell": False,
+        "arbitrary_ssh_command": False,
+        "credential_material_in_plan": False,
+    }
     bound["provider_payload"] = provider_payload
     bound.pop("plan_hash", None)
     bound["plan_hash"] = sha256_hex(bound)
@@ -428,14 +444,20 @@ def provisioning_plan(*, cluster: dict[str, Any], blueprint: dict[str, Any], pro
             raise ValueError(f"server {server['id']} has no NodeRole assignment")
         if server["preflight_status"] != "PASS":
             raise ValueError(f"server {server['id']} must have PASS preflight status")
-        assignments.append({
+        assignment = {
             "server_id": server["id"],
             "hostname": server["hostname"],
             "management_ip": server["management_ip"],
+            "ssh_port": int(server.get("ssh_port") or 22),
+            "ssh_user": server.get("ssh_user"),
+            "credential_ref": server.get("credential_ref"),
+            "status": server.get("status", "configured"),
             "role": role,
             "preflight_status": server["preflight_status"],
             "host_fingerprint": server["host_fingerprint"],
-        })
+        }
+        assignment["snapshot_hash"] = sha256_hex(assignment)
+        assignments.append(assignment)
     control_planes = [item for item in assignments if item["role"] in {"control-plane", "control-plane-worker"}]
     if not control_planes:
         raise ValueError("at least one control-plane capable node is required")

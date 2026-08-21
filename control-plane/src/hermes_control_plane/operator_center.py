@@ -58,10 +58,10 @@ GROUPS: list[dict[str, Any]] = [
         "surfaces": [
             _surface("cluster-factory.clusters", "Clusters", "LIVE", "cluster registry", "Cluster registry and state."),
             _surface("cluster-factory.servers", "Servers", "LIVE", "server registry", "Managed server inventory and preflight state."),
-            _surface("cluster-factory.provision", "Provision", "PARTIAL", "ProvisioningRun + provider jobs", "Governed provisioning plans exist; provider-worker repeatability closure remains."),
+            _surface("cluster-factory.provision", "Provision", "PARTIAL", "ProvisioningRun + trusted cluster provider worker", "Bounded Kubespray/K3s/RKE2 offline provider execution is wired through signed exact-plan tickets; real-target repeatability and infrastructure-provider capacity creation remain open."),
             _surface("cluster-factory.templates", "Templates", "LIVE", "ClusterBlueprint/ClusterProfile", "Deterministic blueprint and profile definitions."),
             _surface("cluster-factory.bare-metal", "Bare Metal", "CONTRACT_ONLY", "Redfish/IPMI/PXE provider contracts", "UI surface exists; real bare-metal executors remain release-blocking."),
-            _surface("cluster-factory.images-artifacts", "Images / Artifacts", "PARTIAL", "artifact inventory + trusted blob mirror runtime", "Digest-pinned file/allowlisted-HTTPS blob sync and allowlisted OCI-image registry-to-registry copy are executable; Helm/package repository metadata mirroring remains open."),
+            _surface("cluster-factory.images-artifacts", "Images / Artifacts", "LIVE", "typed offline artifact supply + trusted mirrors", "Blob, OCI image, Helm OCI, exact-tag Git release, Ansible collection, APT, RPM and Python repository snapshot paths are executable and bind into exact READY provisioning manifests."),
         ],
     },
     {
@@ -85,10 +85,10 @@ GROUPS: list[dict[str, Any]] = [
         "surfaces": [
             _surface("operations.diagnostics", "Diagnostics", "LIVE", "native diagnostics + active unified verification", "Executable read-only diagnostic engine plus persisted active cluster verification.", action="diagnostics"),
             _surface("operations.deployments", "Deployments", "PARTIAL", "ChangeSets + operation jobs", "Governed plans/jobs are visible; broader executor closure remains."),
-            _surface("operations.upgrades", "Upgrades", "PARTIAL", "UpgradePlan + trusted Cilium upgrade runtime", "Pinned Cilium Helm upgrade with active Cilium/Hubble verification is executable; Kubernetes/provider upgrades remain partial."),
-            _surface("operations.backups", "Backups", "PARTIAL", "BackupPlan + trusted Velero backup/schedule/restore runtime", "One-shot Velero Backup, bounded recurring Schedule upsert and bounded namespace Restore execution are ChangeSet-governed and actively verified; direct etcd recovery and provider-specific backup paths remain open."),
-            _surface("operations.recovery", "Recovery", "PARTIAL", "critical Velero restore runtime + broader DR contracts", "Explicit-namespace Velero restore is executable with two-person CRITICAL approval; direct etcd restore and provider DR remain release-blocking."),
-            _surface("operations.maintenance", "Maintenance", "CONTRACT_ONLY", "day-2 operation contracts", "Maintenance UI/contract exists; executor runtime remains release-blocking."),
+            _surface("operations.upgrades", "Upgrades", "PARTIAL", "UpgradePlan + Kubernetes/provider runtimes", "Pinned Cilium Helm upgrade and bounded Kubespray/K3s/RKE2 Kubernetes upgrade paths are executable through trusted workers; disposable-target repeatability remains to be evidenced."),
+            _surface("operations.backups", "Backups", "PARTIAL", "Velero + embedded-etcd snapshot runtimes", "Velero backup/schedule/restore is executable, and bounded direct K3s/RKE2 embedded-etcd snapshot is provider-worker backed; Kubespray direct-etcd and provider-specific backup coverage remain open."),
+            _surface("operations.recovery", "Recovery", "PARTIAL", "Velero + bounded embedded-etcd recovery", "Explicit-namespace Velero restore and bounded K3s/RKE2 embedded-etcd restore/DR are executable through governed trusted runtimes; Kubespray direct-etcd and full provider-recreation DR remain open."),
+            _surface("operations.maintenance", "Maintenance", "PARTIAL", "trusted cluster provider worker", "Bounded provider-service/kubelet restart and reboot maintenance paths are executable on approved existing hosts; broader provider maintenance remains open."),
         ],
     },
     {
@@ -100,7 +100,7 @@ GROUPS: list[dict[str, Any]] = [
             _surface("governance.credentials", "Credentials", "LIVE", "Credential Service references", "Metadata-only references; raw credentials are never rendered."),
             _surface("governance.agents", "Agents", "LIVE", "Hermes Agent registry", "Enrollment, heartbeat and task state."),
             _surface("governance.integrations", "Integrations", "LIVE", "integration registry", "Provider/integration metadata and health."),
-            _surface("governance.artifact-mirror", "Artifact Mirror", "PARTIAL", "artifact inventory + trusted blob mirror runtime", "ChangeSet-governed blob sync plus digest-pinned OCI-image registry copy is executable with independent source/destination verification; Helm/package repository protocols remain open."),
+            _surface("governance.artifact-mirror", "Artifact Mirror", "LIVE", "typed artifact/repository mirror runtime", "ChangeSet-governed bounded mirrors cover blobs, OCI/Helm OCI, exact-tag Git releases, Ansible collections and signed/hash-bound APT/RPM/Python repository snapshots with credential-isolated delivery."),
             _surface("governance.audit", "Audit", "LIVE", "Hermes audit", "Governance and execution audit events."),
             _surface("governance.ai-routing", "AI Routing", "PARTIAL", "shared intent backend/router metadata", "Shared channel contract exists; dedicated routing control UI remains bounded."),
             _surface("governance.settings", "Settings", "PARTIAL", "system/environment configuration", "System/runtime state and environment configuration; secret settings are intentionally absent."),

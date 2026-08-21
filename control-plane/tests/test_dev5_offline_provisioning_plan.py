@@ -178,7 +178,7 @@ def test_ready_artifact_manifest_is_bound_into_changeset_and_provider_job(client
     assert supply["mode"] == "offline-manifest-bound"
     assert supply["manifest_hash"] == manifest["manifest_hash"]
     assert supply["credential_material_in_plan"] is False
-    assert supply["provisioner_rewrite_applied"] is False
+    assert supply["provisioner_rewrite_applied"] is True
     assert len(supply["dependency_order"]) == 4
     assert all(item["offline_reference"].startswith("file:///srv/hermes-mirror/") for item in supply["dependency_order"])
     assert all("source" not in item and "labels" not in item and "verification" not in item for item in supply["dependency_order"])
@@ -187,7 +187,8 @@ def test_ready_artifact_manifest_is_bound_into_changeset_and_provider_job(client
 
     job = client.get(f"/v1/provider-jobs/{body['provider_job_ids'][0]}", headers=ADMIN).json()
     assert job["request"]["artifact_manifest_hash"] == manifest["manifest_hash"]
-    assert job["request"]["offline_artifacts"] == supply["dependency_order"]
+    assert job["request"]["offline_artifact_count"] == len(supply["dependency_order"])
+    assert job["request"]["executor"] == "cluster-provider-worker"
     serialized = json.dumps(job["request"], sort_keys=True)
     assert "source.example" not in serialized
     assert "credential_ref" not in serialized

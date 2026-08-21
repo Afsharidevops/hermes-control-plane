@@ -40,6 +40,10 @@ spec:
             - {name: HERMES_KUBERNETES_BROKER_URL, value: http://{{ include "hermes.fullname" . }}-kubernetes-broker:{{ .Values.kubernetesBroker.service.port }} }
             - name: HERMES_KUBERNETES_BROKER_TOKEN
               valueFrom: {secretKeyRef: {name: {{ include "hermes.secretName" . }}, key: kubernetes-broker-token}}
+            - {name: HERMES_PROVIDER_WORKER_URL, value: http://{{ include "hermes.fullname" . }}-node-agent:{{ .Values.nodeAgent.service.port }} }
+            - name: HERMES_PROVIDER_WORKER_TOKEN
+              valueFrom: {secretKeyRef: {name: {{ include "hermes.secretName" . }}, key: provider-worker-token}}
+            - {name: HERMES_PROVIDER_WORKER_TIMEOUT_SECONDS, value: {{ .Values.nodeAgent.commandTimeout | quote }}}
             - name: HERMES_EXECUTION_HMAC_KEY
               valueFrom: {secretKeyRef: {name: {{ include "hermes.secretName" . }}, key: execution-hmac-key}}
             - {name: HERMES_EXECUTION_ENABLED, value: {{ .Values.controlPlane.executionEnabled | quote }}}

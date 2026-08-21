@@ -11,13 +11,67 @@ spec:
     metadata:
       labels: {app.kubernetes.io/component: node-agent, app.kubernetes.io/instance: {{ .Release.Name }}}
     spec:
-      serviceAccountName: default
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10022
+        runAsGroup: 10022
+        fsGroup: 10022
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile: {type: RuntimeDefault}
       containers:
         - name: node-agent
           image: "{{ .Values.imageNamespace }}/hermes-control-plane-node-agent:{{ .Values.imageTag }}"
           imagePullPolicy: {{ .Values.imagePullPolicy }}
+          ports: [{name: http, containerPort: 8810}]
+          env:
+            - name: HERMES_PROVIDER_WORKER_TOKEN
+              valueFrom: {secretKeyRef: {name: {{ include "hermes.secretName" . }}, key: provider-worker-token}}
+            - name: HERMES_EXECUTION_HMAC_KEY
+              valueFrom: {secretKeyRef: {name: {{ include "hermes.secretName" . }}, key: execution-hmac-key}}
+            - {name: HERMES_PROVIDER_EXECUTION_ENABLED, value: {{ .Values.nodeAgent.executionEnabled | quote }}}
+            - {name: HERMES_PROVIDER_COMMAND_TIMEOUT, value: {{ .Values.nodeAgent.commandTimeout | quote }}}
+            - {name: HERMES_PROVIDER_SSH_PROFILE_ROOT, value: /credentials/ssh}
+            - {name: HERMES_PROVIDER_WORK_ROOT, value: /var/lib/hermes-provider}
+            - {name: HERMES_ARTIFACT_MIRROR_ROOT, value: /data/artifact-mirror}
+            - {name: HERMES_PROVIDER_FILES_REPO_URL, value: {{ .Values.nodeAgent.filesRepoUrl | quote }}}
+            - {name: HERMES_PROVIDER_APT_REPO_URL, value: {{ .Values.nodeAgent.aptRepoUrl | quote }}}
+            - {name: HERMES_PROVIDER_RPM_REPO_URL, value: {{ .Values.nodeAgent.rpmRepoUrl | quote }}}
+            - {name: HERMES_PROVIDER_PYPI_URL, value: {{ .Values.nodeAgent.pypiUrl | quote }}}
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities: {drop: ["ALL"]}
+          volumeMounts:
+            - {name: work, mountPath: /var/lib/hermes-provider}
+            {{- if .Values.persistence.enabled }}
+            - {name: data, mountPath: /data, readOnly: true}
+            {{- end }}
+            {{- if .Values.nodeAgent.sshProfileSecret }}
+            - {name: ssh-profiles, mountPath: /credentials/ssh, readOnly: true}
+            {{- end }}
+          readinessProbe: {httpGet: {path: /health, port: http}, initialDelaySeconds: 3, periodSeconds: 10}
+      volumes:
+        - name: work
+          emptyDir: {}
+        {{- if .Values.persistence.enabled }}
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ include "hermes.fullname" . }}-control-plane
+        {{- end }}
+        {{- if .Values.nodeAgent.sshProfileSecret }}
+        - name: ssh-profiles
+          secret:
+            secretName: {{ .Values.nodeAgent.sshProfileSecret | quote }}
+            defaultMode: 0440
+        {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "hermes.fullname" . }}-node-agent
+spec:
+  selector:
+    app.kubernetes.io/component: node-agent
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  ports: [{name: http, port: {{ .Values.nodeAgent.service.port }}, targetPort: http}]
 {{- end }}

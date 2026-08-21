@@ -99,6 +99,7 @@ DAY2_OPERATIONS: dict[str, dict[str, Any]] = {
     "cluster.backup.velero": {"kind": "VeleroBackupPlan", "stages": ["preflight", "create", "wait", "verify"]},
     "cluster.backup.schedule": {"kind": "VeleroSchedulePlan", "stages": ["preflight", "render", "upsert", "verify"]},
     "cluster.etcd.snapshot": {"kind": "EtcdSnapshotPlan", "stages": ["preflight", "snapshot", "integrity-verify"]},
+    "cluster.etcd.restore": {"kind": "EtcdRestorePlan", "stages": ["preflight", "quorum-check", "restore", "restart", "integrity-verify"]},
     "cluster.restore": {"kind": "RestorePlan", "stages": ["preflight", "restore", "workload-verify", "network-verify"]},
     "cluster.certificate.rotate": {"kind": "CertificateRotationPlan", "stages": ["preflight", "rotate", "component-restart", "verify"]},
     "cluster.node.maintenance": {"kind": "NodeMaintenancePlan", "stages": ["preflight", "cordon", "drain", "maintenance", "verify", "uncordon"]},
@@ -136,6 +137,74 @@ KUBERNETES_DAY2_RUNTIME_OPERATIONS: dict[str, dict[str, Any]] = {
 
 def kubernetes_day2_runtime_capable(operation: str) -> bool:
     return operation in KUBERNETES_DAY2_RUNTIME_OPERATIONS
+
+
+PROVIDER_DAY2_RUNTIME_OPERATIONS: dict[str, dict[str, Any]] = {
+    "cluster.worker.add": {"verification": ["provider-active-verify", "offline-artifact-binding"]},
+    "cluster.worker.remove": {"verification": ["provider-active-verify"]},
+    "cluster.worker.replace": {"verification": ["provider-active-verify", "offline-artifact-binding"]},
+    "cluster.kubernetes.upgrade": {"verification": ["provider-active-verify", "offline-artifact-binding"]},
+    "cluster.etcd.snapshot": {"verification": ["provider-active-verify"]},
+    "cluster.etcd.restore": {"verification": ["provider-active-verify"]},
+    "cluster.certificate.rotate": {"verification": ["provider-active-verify"]},
+    "cluster.node.maintenance": {"verification": ["provider-active-verify"]},
+    "cluster.disaster-recovery": {"verification": ["provider-active-verify"]},
+}
+
+
+def provider_day2_runtime_capable(operation: str) -> bool:
+    return operation in PROVIDER_DAY2_RUNTIME_OPERATIONS
+
+
+def validate_provider_day2_parameters(operation: str, parameters: dict[str, Any]) -> None:
+    if operation not in PROVIDER_DAY2_RUNTIME_OPERATIONS:
+        raise ValueError(f"operation {operation} does not have a trusted cluster provider runtime executor")
+    allowed_common = {"artifact_blueprint_id"}
+    if operation == "cluster.worker.add":
+        allowed = allowed_common | {"server_id"}
+        if not str(parameters.get("server_id") or "").startswith("srv_"):
+            raise ValueError("server_id is required for worker add")
+    elif operation == "cluster.worker.remove":
+        allowed = {"server_id"}
+        if not str(parameters.get("server_id") or "").startswith("srv_"):
+            raise ValueError("server_id is required for worker remove")
+    elif operation == "cluster.worker.replace":
+        allowed = allowed_common | {"old_server_id", "new_server_id"}
+        if not str(parameters.get("old_server_id") or "").startswith("srv_") or not str(parameters.get("new_server_id") or "").startswith("srv_"):
+            raise ValueError("old_server_id and new_server_id are required for worker replace")
+        if parameters.get("old_server_id") == parameters.get("new_server_id"):
+            raise ValueError("worker replacement requires distinct old/new servers")
+    elif operation == "cluster.kubernetes.upgrade":
+        allowed = {"target_version", "artifact_blueprint_id"}
+        version = str(parameters.get("target_version") or "")
+        import re
+        if not re.fullmatch(r"v?\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?", version):
+            raise ValueError("target_version must be an explicit Kubernetes version")
+        if not str(parameters.get("artifact_blueprint_id") or "").startswith("cbp_"):
+            raise ValueError("artifact_blueprint_id is required for offline Kubernetes upgrade")
+    elif operation in {"cluster.etcd.snapshot", "cluster.etcd.restore", "cluster.disaster-recovery"}:
+        key = "snapshot_name" if operation == "cluster.etcd.snapshot" else "snapshot_reference"
+        allowed = {key, "artifact_blueprint_id"} if operation == "cluster.disaster-recovery" else {key}
+        import re
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,119}", str(parameters.get(key) or "")):
+            raise ValueError(f"{key} must be a bounded snapshot identifier")
+    elif operation == "cluster.certificate.rotate":
+        allowed = set()
+    elif operation == "cluster.node.maintenance":
+        allowed = {"server_id", "action"}
+        if not str(parameters.get("server_id") or "").startswith("srv_"):
+            raise ValueError("server_id is required for provider-backed maintenance")
+        if parameters.get("action") not in {"reboot", "restart-kubelet", "restart-provider-service"}:
+            raise ValueError("maintenance action must be reboot, restart-kubelet or restart-provider-service")
+    elif operation == "cluster.decommission":
+        allowed = {"confirm_cluster_name"}
+        if not str(parameters.get("confirm_cluster_name") or "").strip():
+            raise ValueError("confirm_cluster_name is required for decommission")
+    else:
+        allowed = set()
+    unknown = sorted(set(parameters) - allowed)
+    if unknown:
+        raise ValueError(f"unsupported provider day-2 parameter(s): {', '.join(unknown)}")
 
 
 def _validate_velero_schedule_cron(value: str) -> str:
@@ -335,12 +404,12 @@ def read_query_plan(*, operation: str, selector: dict[str, Any], parameters: dic
     })
 
 
-def day2_plan(*, operation: str, targets: list[dict[str, Any]], parameters: dict[str, Any], runtime_preview: dict[str, Any] | None = None) -> dict[str, Any]:
+def day2_plan(*, operation: str, targets: list[dict[str, Any]], parameters: dict[str, Any], runtime_preview: dict[str, Any] | None = None, artifact_supply: dict[str, Any] | None = None) -> dict[str, Any]:
     contract = DAY2_OPERATIONS.get(operation)
     if not contract:
         raise ValueError(f"unsupported day-2 operation: {operation}")
-    return _finish({
-        "schema_version": 4,
+    plan = {
+        "schema_version": 5,
         "kind": contract["kind"],
         "operation": operation,
         "targets": targets,
@@ -350,7 +419,10 @@ def day2_plan(*, operation: str, targets: list[dict[str, Any]], parameters: dict
         "verification_required": True,
         "mutation_gate": MUTATION_GATE,
         "arbitrary_shell": False,
-    })
+    }
+    if artifact_supply is not None:
+        plan["artifact_supply"] = artifact_supply
+    return _finish(plan)
 
 
 def fleet_plan(*, operation: str, selector: dict[str, Any], targets: list[dict[str, Any]], parameters: dict[str, Any]) -> dict[str, Any]:
@@ -518,6 +590,7 @@ def contracts() -> dict[str, Any]:
         "read_operations": READ_OPERATIONS,
         "day2_operations": DAY2_OPERATIONS,
         "kubernetes_day2_runtime": KUBERNETES_DAY2_RUNTIME_OPERATIONS,
+        "cluster_provider_day2_runtime": PROVIDER_DAY2_RUNTIME_OPERATIONS,
         "cloud_virtualization": CLOUD_PROVIDER_CONTRACTS,
         "bare_metal": BARE_METAL_PROVIDER_CONTRACTS,
         "network": NETWORK_PROVIDER_CONTRACTS,

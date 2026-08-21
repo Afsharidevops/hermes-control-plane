@@ -168,8 +168,8 @@ def test_day2_runtime_rejects_missing_native_target_and_non_runtime_operation(cl
         headers=BOT,
         json={"requested_by": "hermes-bot:day2", "source_channel": "hermes-bot", "domain": "day2", "operation": "cluster.worker.add", "target_id": cluster["id"], "parameters": {"server_id": "srv_future"}},
     )
-    assert provider_only.status_code == 201, provider_only.text
-    assert provider_only.json()["operation_job"]["executor"] == "cluster-provider-worker"
+    assert provider_only.status_code == 404
+    assert "server not found" in provider_only.text
 
 
 def test_gitops_sync_is_runtime_bound_to_exact_revision_and_active_verification(client: TestClient, monkeypatch):

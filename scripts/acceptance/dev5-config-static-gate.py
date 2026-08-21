@@ -105,6 +105,15 @@ assert (ROOT / "control-plane/tests/test_dev5_git_release_mirror_runtime.py").is
 assert (ROOT / "control-plane/tests/test_dev5_ansible_collection_mirror_runtime.py").is_file()
 assert (ROOT / "control-plane/tests/test_dev5_repository_snapshot_runtime.py").is_file()
 assert (ROOT / "control-plane/src/hermes_control_plane/repository_snapshot.py").is_file()
+assert (ROOT / "control-plane/tests/test_dev5_batch_b_provider_runtime.py").is_file()
+assert (ROOT / "node-agent/tests/test_provider_runtime.py").is_file()
+assert (ROOT / "node-agent/src/hermes_node_agent/provider_runtime.py").is_file()
+assert (ROOT / "node-agent/playbooks/provider-operation.yml").is_file()
+assert (ROOT / "node-agent/playbooks/provider-verify.yml").is_file()
+node_agent_requirements = (ROOT / "node-agent/requirements.txt").read_text()
+for marker in ("ansible==9.13.0", "cryptography==45.0.2", "jmespath==1.0.1", "netaddr==1.3.0"):
+    assert marker in node_agent_requirements, marker
+
 cluster_factory = (ROOT / "control-plane/src/hermes_control_plane/cluster_factory.py").read_text()
 assert "resolve_blueprint_artifact_manifest" in cluster_factory
 assert "credential_material_in_manifest" in cluster_factory
@@ -132,6 +141,22 @@ assert values["controlPlane"]["artifactMirror"]["maxBytes"] == 536870912
 assert values["controlPlane"]["artifactMirror"]["timeoutSeconds"] == 60
 assert values["controlPlane"]["artifactMirror"]["repositoryMaxExpandedBytes"] == 4294967296
 assert values["controlPlane"]["artifactMirror"]["repositoryMetadataMaxBytes"] == 268435456
+assert services["control-plane"]["environment"]["HERMES_PROVIDER_WORKER_URL"] == "http://node-agent:8810"
+assert "HERMES_PROVIDER_WORKER_TOKEN" in services["control-plane"]["environment"]
+assert services["node-agent"]["environment"]["HERMES_PROVIDER_EXECUTION_ENABLED"] == "${HERMES_PROVIDER_EXECUTION_ENABLED:-false}"
+assert "HERMES_EXECUTION_HMAC_KEY" in services["node-agent"]["environment"]
+assert "HERMES_PROVIDER_SSH_PROFILE_ROOT" in services["node-agent"]["environment"]
+assert values["nodeAgent"]["enabled"] is False
+assert values["nodeAgent"]["executionEnabled"] is False
+assert values["nodeAgent"]["sshProfileSecret"] == ""
+node_agent_template = (ROOT / "charts/hermes-control-plane/templates/node-agent.yaml").read_text()
+for marker in ("runAsNonRoot: true", "runAsUser: 10022", "runAsGroup: 10022", "fsGroup: 10022", "defaultMode: 0440"):
+    assert marker in node_agent_template, marker
+validate_script = (ROOT / "validate.sh").read_text()
+assert 'PYTHONPATH=node-agent/src "$PYTHON_BIN" -m pytest -q node-agent/tests' in validate_script
+assert 'HERMES_PROVIDER_EXECUTION_ENABLED:-false' in (ROOT / "docker-compose.yml").read_text()
+assert 'executionEnabled: false' in (ROOT / "charts/hermes-control-plane/values.yaml").read_text()
+
 assert (ROOT / "kubernetes-broker/tests/test_day2_runtime.py").is_file()
 day2_tests = (ROOT / "kubernetes-broker/tests/test_day2_runtime.py").read_text() + (ROOT / "control-plane/tests/test_dev5_day2_runtime.py").read_text()
 assert "cluster.gitops.sync" in day2_tests

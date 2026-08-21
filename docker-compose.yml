@@ -208,6 +208,9 @@ services:
       HERMES_CONTROL_DB: /data/control-plane.sqlite3
       HERMES_KUBERNETES_BROKER_URL: http://kubernetes-broker:8830
       HERMES_KUBERNETES_BROKER_TOKEN: ${HERMES_KUBERNETES_BROKER_TOKEN}
+      HERMES_PROVIDER_WORKER_URL: http://node-agent:8810
+      HERMES_PROVIDER_WORKER_TOKEN: ${HERMES_PROVIDER_WORKER_TOKEN}
+      HERMES_PROVIDER_WORKER_TIMEOUT_SECONDS: ${HERMES_PROVIDER_COMMAND_TIMEOUT:-1800}
       HERMES_EXECUTION_HMAC_KEY: ${HERMES_EXECUTION_HMAC_KEY}
       HERMES_EXECUTION_ENABLED: ${HERMES_EXECUTION_ENABLED:-false}
       HERMES_ARTIFACT_SOURCE_ROOT: /data/artifact-source
@@ -229,6 +232,8 @@ services:
       - ${HERMES_ARTIFACT_AUTH_HOST_PATH:-./data/artifact-auth}:/run/secrets/hermes-artifact-auth:ro
     depends_on:
       kubernetes-broker:
+        condition: service_healthy
+      node-agent:
         condition: service_healthy
     networks: [app-net, credential-net]
     security_opt: ["no-new-privileges:true"]
@@ -295,7 +300,6 @@ services:
     networks: [app-net]
 
   node-agent:
-    profiles: ["node-agent"]
     image: ${IMAGE_NAMESPACE:-afsharidevops}/hermes-control-plane-node-agent:${VERSION:-0.5.11-dev.5}
     build:
       context: ./node-agent
@@ -303,10 +307,34 @@ services:
     ports:
       - "127.0.0.1:8810:8810"
     environment:
-      HERMES_AGENT_NAME: local-docker-agent
+      HERMES_AGENT_NAME: local-docker-provider-worker
+      HERMES_PROVIDER_WORKER_TOKEN: ${HERMES_PROVIDER_WORKER_TOKEN}
+      HERMES_EXECUTION_HMAC_KEY: ${HERMES_EXECUTION_HMAC_KEY}
+      HERMES_PROVIDER_EXECUTION_ENABLED: ${HERMES_PROVIDER_EXECUTION_ENABLED:-false}
+      HERMES_PROVIDER_COMMAND_TIMEOUT: ${HERMES_PROVIDER_COMMAND_TIMEOUT:-1800}
+      HERMES_PROVIDER_SSH_PROFILE_ROOT: /credentials/ssh
+      HERMES_PROVIDER_WORK_ROOT: /var/lib/hermes-provider
+      HERMES_ARTIFACT_MIRROR_ROOT: /data/artifact-mirror
+      HERMES_PROVIDER_FILES_REPO_URL: ${HERMES_PROVIDER_FILES_REPO_URL:-}
+      HERMES_PROVIDER_APT_REPO_URL: ${HERMES_PROVIDER_APT_REPO_URL:-}
+      HERMES_PROVIDER_RPM_REPO_URL: ${HERMES_PROVIDER_RPM_REPO_URL:-}
+      HERMES_PROVIDER_PYPI_URL: ${HERMES_PROVIDER_PYPI_URL:-}
+    volumes:
+      - control-plane-data:/data:ro
+      - ${HERMES_PROVIDER_SSH_PROFILE_HOST_PATH:-./data/provider-ssh}:/credentials/ssh:ro
+      - provider-worker-data:/var/lib/hermes-provider
     networks: [app-net]
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
     security_opt: ["no-new-privileges:true"]
     cap_drop: ["ALL"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8810/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
 
 networks:
   app-net:
@@ -325,3 +353,4 @@ volumes:
   control-plane-data:
   credential-service-data:
   hermes-data:
+  provider-worker-data:

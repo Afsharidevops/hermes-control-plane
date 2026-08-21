@@ -37,7 +37,7 @@ Do not amend, reset, squash, force-push, move or recreate the frozen dev.4 tag.
 - offline provisioning-plan artifact binding that requires a READY integrity-checked ClusterBlueprint artifact manifest, copies only verified destination/digest metadata into the exact ChangeSet and per-node provider-job request, and rechecks the current manifest hash before provider-job authorization
 - bounded exact-tag Git release archive synchronization for allowlisted public HTTPS repositories, with immutable tag+commit binding, fixed credential-free Git transport, submodule rejection, canonical archive SHA-256 verification, atomic publication and idempotent retry; exact-SHA `validate` is green at `395059d63d86316d3056cd28790941726c7e42dd` (run `32477791912`)
 - typed digest-pinned Ansible Galaxy collection archive synchronization with exact namespace/name/SemVer identity, MANIFEST.json -> FILES.json checksum binding, per-file SHA-256 verification, unsafe tar member rejection and no filesystem extraction; exact-SHA CI green at `26855cbb6f45176ee99029cdbc29b7c847ae79b6` (run `32478857268`)
-- Batch A repository substrate candidate: signed APT repository snapshots (Release.gpg -> Release SHA256 -> Packages -> .deb), signed RPM repository snapshots (repomd.xml.asc -> repomd SHA256 -> primary -> .rpm), and PEP 503-style Python Simple snapshots with `#sha256=` distribution binding; atomic staging/rollback, idempotency, bounded HTTPS retries and environment-mounted auth/keyrings are enforced
+- merged Batch A delivery substrate is committed/pushed and exact-SHA `validate` CI-green at `aab6d31ac8af598ee7d9651543137776ca82391b` (run `32481855314`): signed APT repository snapshots (Release.gpg -> Release SHA256 -> Packages -> .deb), signed RPM repository snapshots (repomd.xml.asc -> repomd SHA256 -> primary -> .rpm), and PEP 503-style Python Simple snapshots with `#sha256=` distribution binding; atomic staging/rollback, idempotency, bounded HTTPS retries and environment-mounted auth/keyrings are enforced
 - development Docker image publication is decoupled from `dev/**` pushes: `validate` remains branch-triggered while `publish-images` stays on main/tags/manual publication boundaries
 - trusted Argo CD GitOps sync runtime bound to a full approved commit digest, with Application state-drift rejection, fixed server-side patching, sync wait and active sync/health verification
 - trusted pinned Cilium Helm upgrade runtime with exact release-state preconditions plus active Helm, Cilium-agent and sanitized Hubble verification
@@ -45,14 +45,17 @@ Do not amend, reset, squash, force-push, move or recreate the frozen dev.4 tag.
 - trusted bounded Velero Restore runtime for explicit namespaces with CRITICAL two-person approval, exact source-Backup/Restore-state preconditions, fixed non-destructive CR creation and active completion/error/plugin-operation verification
 - trusted Velero Schedule create/update runtime with fixed no-more-frequent-than-hourly cron, exact live-state binding, namespace scope enforcement, bounded Backup template fields and active validation/spec verification
 
+- merged Batch B trusted existing-host cluster provider runtime: disabled by default on the existing Node Agent image; exact HMAC-signed ChangeSet/typed-plan tickets; one-time ticket replay rejection; private per-execution SSH credential staging; fixed no-shell/no-caller-CLI provider execution; Kubespray v2.28.1 plus pinned Ansible dependency contract; role-aware offline K3s/RKE2 server/agent installation; deterministic offline registry/file/package/PyPI binding; worker add/remove/replace; Kubernetes upgrades; certificate rotation; bounded existing-host maintenance; direct K3s/RKE2 embedded-etcd snapshot/restore and existing-host DR; active service/API/snapshot/reset-state verification; execution output and raw credentials suppressed
+
 ## Still release-blocking for dev.5 scope closure
 
-- remaining day-2/provider operations not covered by the trusted Kubernetes runtime (worker lifecycle, Kubernetes upgrades, direct etcd snapshot/restore, full-cluster/provider DR, certificate rotation, decommission; broader non-Argo GitOps remains open)
-- Cluster Factory runtime/repeatability closure
-- provider/bare-metal/network executors or explicit user-approved deferral
-- standalone Ansible role source archives, where required, use the exact-tag `git-release` mirror plus existing artifact-catalog/ClusterBlueprint labels; no Galaxy role API/server or arbitrary Git history/submodules are claimed
-- remaining air-gap closure after Batch A: actual provisioner-worker offline reference rewrite/install consumption; full Git-repository/submodule semantics only if the final scope audit proves them required
-- provider-specific verification extensions coupled to the remaining provider/bare-metal/network runtimes
+- Batch C provider-capacity executors: infrastructure creation/destruction/scale, true cluster decommission and capacity-backed template cloning
+- Kubespray direct-etcd snapshot/restore/DR remains fail-closed; Batch B direct embedded-etcd recovery is bounded to K3s/RKE2
+- provider/bare-metal/network executors for the intended original scope, or explicit user-approved deferral where real runtime cannot be completed
+- matching host/direct-etcd/provider/bare-metal/network/cloud active verification collectors; unsupported collectors remain SKIP
+- broader non-Argo GitOps or full Git-history/submodule/Galaxy-role API behavior only if the final original-scope audit proves those capabilities were promised
+- disposable real-target repeatability/evidence where available; never convert local integration into invented real-target evidence
+- final full scope-conformance re-audit and dev.5 release gate
 
 `v0.5.11-dev.5` must not be created until the full dev.5 closure scope is complete,
 local validation passes, and branch CI succeeds on the exact intended tag SHA.

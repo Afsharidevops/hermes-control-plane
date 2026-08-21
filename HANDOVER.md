@@ -415,3 +415,16 @@ APT requires detached GPG verification of `dists/<distribution>/Release.gpg`, SH
 HTTPS credentials and repository keyrings are trusted environment-mounted files below `HERMES_ARTIFACT_AUTH_ROOT`; raw content is never copied into plans, audit or evidence. Publication uses a staging directory plus rollback-safe rename, so partial extraction never becomes the active mirror.
 
 This closes the intended package-repository substrate for Batch A only after its forward-only commit/push/exact-SHA CI. It does not claim that Kubespray/K3s/RKE2 have consumed or rewritten these references yet.
+
+
+## 0.5.11-dev.5 Batch B — trusted existing-host cluster provider runtime
+
+Batch B turns the exact READY offline artifact supply into constrained execution through the existing `node-agent` image, which now also exposes a dedicated provider-worker API. Provider execution is disabled by default and requires a bearer worker token plus the existing execution HMAC key. The Control Plane issues a short-lived exact ChangeSet/typed-plan ticket only after normal risk/policy/approval authorization; the worker verifies the signature, exact plan hash, `cluster-provider-worker` precondition and one-time ticket use before doing any work.
+
+The worker supports only `kubespray`, `k3s` and `rke2` and only a fixed provider/operation matrix. It builds Ansible inventory exclusively from approved server snapshots, verifies each host remains configured/PASS, resolves only bounded `cred_*` SSH profiles from the mounted worker credential root, copies identity/known-host files into a private `0700` execution workspace with `0600` permissions, suppresses subprocess stdout/stderr, and deletes the workspace in `finally`. No SSH key material is copied into the ChangeSet, provider job, audit, verification result, UI or AI boundary.
+
+Offline install/upgrade paths require the exact READY artifact manifest with `provisioner_rewrite_applied=true`. File artifacts are rehashed under the controlled mirror root before execution; OCI references must resolve to one offline registry. Kubespray is pinned to release `v2.28.1` with the bundled `ansible==9.13.0`, `cryptography==45.0.2`, `jmespath==1.0.1` and `netaddr==1.3.0` contract and requires configured internal file/APT/RPM/PyPI endpoints. K3s/RKE2 use role-aware fixed installation/rejoin paths and do not download from the public Internet.
+
+Batch B provider-backed day-2 covers worker add/remove/replace, Kubernetes upgrades, certificate rotation and bounded existing-host maintenance. K3s/RKE2 embedded-etcd snapshot/restore and existing-host disaster recovery use the provider's direct embedded-etcd/server reset paths and active verification; there is no generic `kubectl exec etcdctl` shortcut. Provider verification checks the runtime binding, provider services, Kubernetes `/readyz`, snapshot existence and restore reset-state.
+
+The boundary remains explicit: Kubespray direct-etcd recovery fails closed, and `cluster.decommission` is not a provider-runtime operation until Batch C can destroy/reconcile actual infrastructure capacity. Infrastructure scale, provider-capacity creation/destruction, capacity-backed template cloning, full provider-recreation DR and provider/bare-metal/network/cloud executors/collectors remain Batch C or final-audit work. Local/mock integration must not be presented as real-target evidence.

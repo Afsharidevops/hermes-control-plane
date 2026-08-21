@@ -70,6 +70,8 @@ echo "kubernetes-broker tests:"
 PYTHONPATH=kubernetes-broker/src "$PYTHON_BIN" -m pytest -q kubernetes-broker/tests
 echo "execution-broker tests:"
 PYTHONPATH=execution-broker/src "$PYTHON_BIN" -m pytest -q execution-broker/tests
+echo "node-agent tests:"
+PYTHONPATH=node-agent/src "$PYTHON_BIN" -m pytest -q node-agent/tests
 echo "smart-router tests:"
 PYTHONPATH=smart-router/src "$PYTHON_BIN" -m pytest -q smart-router/tests
 

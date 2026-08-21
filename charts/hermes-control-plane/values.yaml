@@ -72,6 +72,15 @@ hermesAgent:
 
 nodeAgent:
   enabled: false
+  executionEnabled: false
+  commandTimeout: 1800
+  sshProfileSecret: ""
+  filesRepoUrl: ""
+  aptRepoUrl: ""
+  rpmRepoUrl: ""
+  pypiUrl: ""
+  service:
+    port: 8810
 
 # Alpha bootstrap only. Prefer an externally managed Secret before production.
 secrets:
@@ -86,6 +95,7 @@ secrets:
   credentialMasterKey: ""
   credentialMasterKeyVersion: "v1"
   kubernetesBrokerToken: ""
+  providerWorkerToken: ""
   executionHmacKey: ""
   routerGatewayAdminToken: ""
   smartRouterHmacSecret: ""

@@ -34,6 +34,10 @@ radar = text("control-plane/src/hermes_control_plane/radar.py")
 hubble = text("kubernetes-broker/src/hermes_kubernetes_broker/hubble.py")
 diagnostics = text("kubernetes-broker/src/hermes_kubernetes_broker/diagnostics.py")
 kube_broker = text("kubernetes-broker/src/hermes_kubernetes_broker/main.py")
+provider_runtime = text("node-agent/src/hermes_node_agent/provider_runtime.py")
+provider_agent_main = text("node-agent/src/hermes_node_agent/main.py")
+provider_operation_playbook = text("node-agent/playbooks/provider-operation.yml")
+provider_verify_playbook = text("node-agent/playbooks/provider-verify.yml")
 
 # Frozen dev.3/dev.4 contracts remain intact while dev.5 adds real runtime surfaces.
 for marker in (
@@ -173,13 +177,82 @@ for contract_only in (
 ):
     fragment = operator_center.split(f'"{contract_only}"', 1)[1].split("),", 1)[0]
     assert '"CONTRACT_ONLY"' in fragment, contract_only
-for partial_surface in ("cluster-factory.images-artifacts", "governance.artifact-mirror"):
-    fragment = operator_center.split(f'"{partial_surface}"', 1)[1].split("),", 1)[0]
-    assert '"PARTIAL"' in fragment, partial_surface
+for live_artifact_surface in ("cluster-factory.images-artifacts", "governance.artifact-mirror"):
+    fragment = operator_center.split(f'"{live_artifact_surface}"', 1)[1].split("),", 1)[0]
+    assert '"LIVE"' in fragment, live_artifact_surface
 assert 'Operator Center' in ui and '/v1/operator-center/contracts' in ui
 operator_section = ui.split('<section id="operator-center"', 1)[1].split('</section>', 1)[0]
 for forbidden in ("approveChange", "executeChange", "createChange", "kubectl", "helm upgrade"):
     assert forbidden not in operator_section, forbidden
+
+
+# Dev.5 Batch B trusted cluster provider execution is disabled by default, exact-ticket-bound and fixed-playbook only.
+for marker in (
+    'PROVIDER_DAY2_RUNTIME_OPERATIONS',
+    'provider_day2_runtime_capable',
+    'validate_provider_day2_parameters',
+):
+    assert marker in operations, marker
+for marker in (
+    '@app.post("/v1/provider-jobs/{job_id}/execute")',
+    'cluster-provider-worker',
+    'provider_worker.post("/v1/provider/preview"',
+    'provider_worker.post("/v1/provider/execute"',
+    '_issue_provider_job_ticket',
+    '_verify_provider_job_ticket',
+):
+    assert marker in cp_main, marker
+for marker in (
+    'HERMES_PROVIDER_EXECUTION_ENABLED',
+    'EXECUTION_ENABLED = os.getenv("HERMES_PROVIDER_EXECUTION_ENABLED", "false")',
+    'preconditions.get("executor") != "cluster-provider-worker"',
+    'shell=False',
+    'stdin=subprocess.DEVNULL',
+    'stdout=subprocess.DEVNULL',
+    'stderr=subprocess.DEVNULL',
+    'ansible-playbook',
+    'arbitrary_shell": False',
+    'arbitrary_ssh_command": False',
+    'raw_credentials_returned": False',
+    'execution ticket has already been used',
+    'provider plan has not applied deterministic offline reference rewriting',
+    'shutil.copyfile(profile["identity"], local_identity)',
+    'shutil.rmtree(work, ignore_errors=True)',
+):
+    assert marker in provider_runtime, marker
+for forbidden in ('shell=True', 'os.system', 'subprocess.Popen', 'kubectl exec', 'kubectl cp'):
+    assert forbidden not in provider_runtime, forbidden
+for forbidden in ('ansible.builtin.shell', 'ansible.builtin.raw', 'kubectl exec', 'kubectl cp'):
+    assert forbidden not in provider_operation_playbook, forbidden
+for marker in (
+    'PROVIDER_OPERATION_MATRIX',
+    'direct etcd snapshot/restore and DR are currently bounded to K3s/RKE2 embedded-etcd runtimes; Kubespray fails closed',
+    'KUBESPRAY_ARTIFACT_OPERATIONS',
+    'KUBESPRAY_SUPPORTED_RELEASES = {"2.28.1", "v2.28.1"}',
+    'trusted Kubespray runtime is pinned to provider release v2.28.1',
+    'Kubespray offline execution requires internal file/package/PyPI endpoints',
+):
+    assert marker in provider_runtime, marker
+# Provider destruction/capacity lifecycle stays fail-closed until Batch C executors exist.
+assert '"cluster.decommission": {"verification": ["provider-active-verify"]}' not in operations
+matrix_section = provider_runtime.split('PROVIDER_OPERATION_MATRIX =', 1)[1].split('INSTALL_OPERATIONS =', 1)[0]
+assert '(set(SUPPORTED_OPERATIONS) - {"cluster.decommission"})' in matrix_section
+for marker in (
+    'K3S_URL', 'K3S_TOKEN', 'INSTALL_K3S_SKIP_DOWNLOAD', 'INSTALL_RKE2_ARTIFACT_PATH',
+    'Delete old K3s peer DB before rejoin', 'Delete old RKE2 peer DB before rejoin',
+    '--cluster-reset-restore-path=/var/lib/hermes/provider/snapshots/', '--etcd-s3=false',
+):
+    assert marker in provider_operation_playbook, marker
+assert 'ansible.builtin.command' in provider_operation_playbook
+assert '/v1/provider/preview' in provider_agent_main and '/v1/provider/execute' in provider_agent_main
+assert 'provider-active-verify' in provider_runtime
+assert 'provider-verify.yml' in provider_runtime
+assert 'service_facts' in provider_verify_playbook
+assert '--raw=/readyz' in provider_verify_playbook
+# Batch B mutations must not silently fall through as LOW-risk no-approval actions.
+for marker in ('".add"', '".replace"', '".rotate"', '".maintenance"'):
+    assert marker in risk, marker
+assert '"decommission"' in risk.split('_CRITICAL_MARKERS', 1)[1].split('_HIGH_MARKERS', 1)[0]
 
 # Dev.5 trusted Kubernetes day-2 execution is exact-preview-bound and actively verified.
 for marker in (
@@ -190,7 +263,7 @@ for marker in (
     assert marker in operations, marker
 for marker in (
     '@app.post("/v1/operation-jobs/{job_id}/execute")',
-    'job["executor"] not in {"kubernetes-broker", "artifact-mirror-worker"}',
+    'job["executor"] not in {"kubernetes-broker", "artifact-mirror-worker", "cluster-provider-worker"}',
     '"/v1/day2/preview"',
     '"/v1/day2/execute"',
     'verification.runtime_recorded',
