@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from typing import Any
 from urllib.parse import urlparse
 
@@ -338,7 +339,80 @@ def _require_supported_addons(addons: list[str], versions: dict[str, str]) -> No
         raise ValueError(f"explicit version pins required for add-ons: {', '.join(missing)}")
 
 
-def provisioning_plan(*, cluster: dict[str, Any], blueprint: dict[str, Any], profile: dict[str, Any], node_roles: list[dict[str, Any]], servers: list[dict[str, Any]]) -> dict[str, Any]:
+def _bind_ready_artifact_manifest(plan: dict[str, Any], artifact_manifest: dict[str, Any]) -> dict[str, Any]:
+    if artifact_manifest.get("state") != "READY" or artifact_manifest.get("issues"):
+        raise ValueError("cluster blueprint artifact manifest must be READY before offline provisioning can be planned")
+    manifest_hash = str(artifact_manifest.get("manifest_hash") or "")
+    unsigned_manifest = deepcopy(artifact_manifest)
+    unsigned_manifest.pop("manifest_hash", None)
+    if not manifest_hash or sha256_hex(unsigned_manifest) != manifest_hash:
+        raise ValueError("cluster blueprint artifact manifest hash verification failed")
+    if artifact_manifest.get("credential_material_in_manifest") is not False:
+        raise ValueError("cluster blueprint artifact manifest must attest credential-free content")
+    if artifact_manifest.get("offline_reference_selection") != "verified-destination-only":
+        raise ValueError("cluster blueprint artifact manifest must use verified destination references only")
+
+    offline_artifacts: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for item in artifact_manifest.get("dependency_order") or []:
+        artifact_id = str(item.get("artifact_id") or "")
+        if not artifact_id or artifact_id in seen_ids:
+            raise ValueError("cluster blueprint artifact manifest contains duplicate or empty artifact IDs")
+        seen_ids.add(artifact_id)
+        if item.get("mirrored") is not True:
+            raise ValueError(f"artifact {artifact_id} is not verified mirrored content")
+        reference = str(item.get("offline_reference") or "")
+        parsed = urlparse(reference)
+        if parsed.username is not None or parsed.password is not None or parsed.query or parsed.fragment:
+            raise ValueError(f"artifact {artifact_id} has an unsafe offline reference")
+        if parsed.scheme == "file":
+            if parsed.netloc or not parsed.path.startswith("/"):
+                raise ValueError(f"artifact {artifact_id} has an invalid offline file reference")
+        elif parsed.scheme == "oci":
+            if not parsed.netloc or not parsed.path.strip("/"):
+                raise ValueError(f"artifact {artifact_id} has an invalid offline OCI reference")
+        else:
+            raise ValueError(f"artifact {artifact_id} has an unsupported offline reference scheme")
+        digest = str(item.get("digest") or "")
+        if not digest.startswith("sha256:") or len(digest) != 71:
+            raise ValueError(f"artifact {artifact_id} must be bound by an exact SHA-256 digest")
+        offline_artifacts.append({
+            "artifact_id": artifact_id,
+            "component": str(item.get("component") or ""),
+            "name": str(item.get("name") or ""),
+            "dependency_key": str(item.get("dependency_key") or ""),
+            "kind": str(item.get("kind") or ""),
+            "version": str(item.get("version") or ""),
+            "digest": digest,
+            "offline_reference": reference,
+            "depends_on": list(item.get("depends_on") or []),
+        })
+
+    if not offline_artifacts:
+        raise ValueError("cluster blueprint artifact manifest contains no resolved dependencies")
+
+    bound = deepcopy(plan)
+    bound["schema_version"] = max(int(bound.get("schema_version") or 0), 4)
+    bound["artifact_supply"] = {
+        "mode": "offline-manifest-bound",
+        "manifest_hash": manifest_hash,
+        "dependency_order": offline_artifacts,
+        "offline_reference_selection": "verified-destination-only",
+        "credential_material_in_plan": False,
+        "provisioner_rewrite_applied": False,
+    }
+    provider_payload = dict(bound.get("provider_payload") or {})
+    provider_payload["offline_artifact_manifest_hash"] = manifest_hash
+    provider_payload["offline_artifacts"] = offline_artifacts
+    provider_payload["offline_reference_mode"] = "verified-mirror-destinations"
+    provider_payload["provisioner_rewrite_applied"] = False
+    bound["provider_payload"] = provider_payload
+    bound.pop("plan_hash", None)
+    bound["plan_hash"] = sha256_hex(bound)
+    return bound
+
+
+def provisioning_plan(*, cluster: dict[str, Any], blueprint: dict[str, Any], profile: dict[str, Any], node_roles: list[dict[str, Any]], servers: list[dict[str, Any]], artifact_manifest: dict[str, Any] | None = None) -> dict[str, Any]:
     provider_id = blueprint["provider"]
     provider = CLUSTER_PROVIDERS[provider_id]
     assignments = []
@@ -441,6 +515,8 @@ def provisioning_plan(*, cluster: dict[str, Any], blueprint: dict[str, Any], pro
         "mutation_gate": "changeset-exact-hash-approval",
     }
     plan["plan_hash"] = sha256_hex(plan)
+    if artifact_manifest is not None:
+        plan = _bind_ready_artifact_manifest(plan, artifact_manifest)
     return plan
 
 

@@ -684,6 +684,16 @@ def _provider_job_authorization(conn, job: Any) -> Any:
         raise HTTPException(status_code=409, detail=f"provider job requires ChangeSet state {required_state}")
     if changeset["plan_hash"] != job["plan_hash"]:
         raise HTTPException(status_code=409, detail="provider job plan hash no longer matches ChangeSet")
+    request = json.loads(job["request_json"] or "{}")
+    artifact_manifest_hash = str(request.get("artifact_manifest_hash") or "")
+    if artifact_manifest_hash:
+        cluster_id = str(request.get("cluster_id") or "")
+        cluster = _cluster_dict(_get_cluster(conn, cluster_id))
+        profile = _profile_dict(_get_profile(conn, cluster["profile_id"]))
+        blueprint = _blueprint_dict(_get_blueprint(conn, profile["blueprint_id"]))
+        current_manifest = _blueprint_artifact_manifest(conn, blueprint["id"])
+        if current_manifest.get("state") != "READY" or current_manifest.get("manifest_hash") != artifact_manifest_hash:
+            raise HTTPException(status_code=409, detail="cluster blueprint artifact manifest drifted after provisioning plan approval")
     return changeset
 
 
@@ -2668,11 +2678,23 @@ def create_provisioning_run(cluster_id: str, payload: ProvisioningRunCreate, aut
         blueprint = _blueprint_dict(_get_blueprint(conn, profile["blueprint_id"]))
         roles = [_node_role_dict(row) for row in conn.execute("SELECT * FROM node_roles WHERE profile_id=? AND status='configured' ORDER BY created_at,id", (profile["id"],)).fetchall()]
         servers = [_server_dict(_get_server(conn, server_id)) for server_id in profile["server_ids"]]
+        artifact_manifest = None
+        if blueprint.get("artifact_dependencies"):
+            artifact_manifest = _blueprint_artifact_manifest(conn, blueprint["id"])
         try:
-            typed_plan = cluster_factory.provisioning_plan(cluster=cluster, blueprint=blueprint, profile=profile, node_roles=roles, servers=servers)
+            typed_plan = cluster_factory.provisioning_plan(
+                cluster=cluster,
+                blueprint=blueprint,
+                profile=profile,
+                node_roles=roles,
+                servers=servers,
+                artifact_manifest=artifact_manifest,
+            )
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         params = {"resource_type": "ProvisioningRun", "typed_plan": typed_plan, "profile_id": profile["id"], "provider": blueprint["provider"]}
+        if artifact_manifest is not None:
+            params["artifact_manifest_hash"] = artifact_manifest["manifest_hash"]
         changeset = _insert_changeset(
             conn, operation="cluster.provision.apply", adapter="bootstrap", target_id=cluster_id,
             requested_by=payload.requested_by, source_channel=payload.source_channel, source_revision=None,
@@ -2686,6 +2708,9 @@ def create_provisioning_run(cluster_id: str, payload: ProvisioningRunCreate, aut
             job_id = f"job_{uuid.uuid4().hex[:16]}"
             job_ids.append(job_id)
             request = {"cluster_id": cluster_id, "provider": blueprint["provider"], "node": node, "typed_plan_hash": typed_plan["plan_hash"]}
+            if artifact_manifest is not None:
+                request["artifact_manifest_hash"] = artifact_manifest["manifest_hash"]
+                request["offline_artifacts"] = typed_plan["artifact_supply"]["dependency_order"]
             conn.execute(
                 "INSERT INTO provider_jobs (id,provider_id,server_id,changeset_id,operation,state,stage,attempt,max_attempts,plan_hash,request_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (job_id, blueprint["provider"], node["server_id"], changeset["id"], "cluster.provision.apply", "WAITING_APPROVAL", "plan", 1, 3, changeset["plan_hash"], json.dumps(request, sort_keys=True), now, now),
@@ -2697,7 +2722,11 @@ def create_provisioning_run(cluster_id: str, payload: ProvisioningRunCreate, aut
             (run_id, cluster_id, profile["id"], blueprint["provider"], "WAITING_APPROVAL", "plan", changeset["id"], json.dumps(job_ids), json.dumps(typed_plan, sort_keys=True), None, now, now),
         )
         conn.execute("UPDATE clusters SET state='PLANNED',updated_at=? WHERE id=?", (now, cluster_id))
-        db.audit(conn, "cluster.provisioning_planned", payload.requested_by, "provisioning_run", run_id, {"cluster_id": cluster_id, "changeset_id": changeset["id"], "provider_job_ids": job_ids, "typed_plan_hash": typed_plan["plan_hash"]})
+        audit_payload = {"cluster_id": cluster_id, "changeset_id": changeset["id"], "provider_job_ids": job_ids, "typed_plan_hash": typed_plan["plan_hash"]}
+        if artifact_manifest is not None:
+            audit_payload["artifact_manifest_hash"] = artifact_manifest["manifest_hash"]
+            audit_payload["offline_artifact_count"] = len(typed_plan["artifact_supply"]["dependency_order"])
+        db.audit(conn, "cluster.provisioning_planned", payload.requested_by, "provisioning_run", run_id, audit_payload)
         conn.commit()
         row = conn.execute("SELECT * FROM provisioning_runs WHERE id=?", (run_id,)).fetchone()
         chg = conn.execute("SELECT * FROM changesets WHERE id=?", (changeset["id"],)).fetchone()

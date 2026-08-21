@@ -316,3 +316,13 @@ ClusterBlueprints now persist an explicit bounded list of artifact mirror item I
 Optional `depends_on` labels contain bound artifact IDs only. Hermes rejects self edges, unbound edges, duplicate dependency keys and graph cycles, then emits a deterministic topological `dependency_order`. If any bound artifact is unverified or otherwise invalid, the manifest is `BLOCKED` and includes `resume_from_artifact_id` for deterministic partial-sync continuation. The entire manifest is exact-hashed.
 
 This closes the deterministic ClusterBlueprint-to-artifact selection/ordering layer and graph-level resume evidence. It does **not** yet mutate Kubespray/K3s/RKE2 inputs to consume the selected offline references, and it does not claim apt/yum/dnf or Python repository-metadata synchronization, Ansible/Git catalog closure, generalized repository credentials or broader signature/provenance policy.
+
+## Slice 15 — READY artifact manifest binding into provisioning plans
+
+Cluster provisioning now consumes the deterministic ClusterBlueprint artifact resolver instead of leaving it as a read-only catalog boundary. If a blueprint declares artifact dependencies, `POST /v1/clusters/{id}/provisioning-runs` resolves the manifest in the same database transaction and fails closed unless the manifest is `READY`, issue-free and integrity-valid.
+
+The provisioning plan copies only bounded resolver output: artifact ID, component/name/dependency key, exact version and SHA-256 digest, dependency edges, and the verified `file://` or `oci://` offline destination. Source repository URLs, arbitrary labels, verification payloads and credential material are not copied into the ChangeSet or provider-job request. The exact manifest hash is bound into the typed plan, ChangeSet parameters and every per-node provider-job request.
+
+Before a provider job can be authorized, Hermes re-resolves the current blueprint manifest and requires the same exact `READY` manifest hash. Mirror verification or dependency drift after approval therefore fails closed rather than silently changing the artifact supply. Existing online blueprints with no artifact dependency binding remain backward-compatible.
+
+This closes the resolver-to-provisioning-plan consumption boundary only. `provisioner_rewrite_applied` remains false: trusted Kubespray/K3s/RKE2 provider workers still need to consume these bounded references and deterministically rewrite/install from offline mirrors. apt/yum/dnf and Python repository metadata synchronization, broader Ansible/Git catalogs, generalized authenticated repository delivery, and broader signature/provenance policy remain open.
