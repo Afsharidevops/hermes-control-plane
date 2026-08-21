@@ -101,14 +101,14 @@ Implemented source foundations include:
 - shared Web UI, Telegram, Hermes/AI and API intent planning through one governed operations backend;
 - persisted multi-cluster/fleet views, selectors and exact fleet/target snapshot binding;
 - typed advanced day-2 planning for worker/node, workload, add-on, Helm/GitOps, Kubernetes/Cilium upgrade, backup/restore, certificate, maintenance, decommission, clone and DR operations;
-- typed provider foundations for VMware, OpenStack, AWS, Azure and GCP with explicit provider/API pins and constrained operation contracts;
+- typed provider foundations for VMware vSphere, VMware Workstation Pro, Proxmox VE, OpenStack, AWS, Azure and GCP with explicit provider/API pins and constrained operation contracts; VMware Workstation is treated as a local/lab clone-based provider and Proxmox as a first-class virtualization target;
 - typed empty-disk bare-metal planning for Redfish/BMC, IPMI and PXE/iPXE plus network/switch contracts, without arbitrary generated shell execution;
 - digest-pinned OCI/Helm/package/Git-release air-gap mirror items and governed mirror plans;
 - persisted operation plans/jobs, short-lived HMAC-signed exact-plan execution tickets, one-time approval consumption at execution start, and unified typed verification results;
 - exact ChangeSet plan-hash, current-policy-generation and current target/fleet snapshot authorization checks before operation-job authorization;
 - negative security tests for raw-secret-shaped parameters, embedded URL credentials and target/fleet drift.
 
-Live VMware/cloud/BMC/switch/provider execution is not claimed by this source checkpoint unless backed by separate disposable-target evidence. Production images remain CI-owned.
+Live VMware vSphere/Workstation, Proxmox, cloud, BMC, switch or other provider execution is not claimed by this source checkpoint unless the corresponding trusted runtime exists and is backed by separate disposable-target evidence. Production images remain CI-owned.
 
 ## Release path
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 from urllib.parse import urlparse
 
@@ -14,6 +15,20 @@ CLOUD_PROVIDER_CONTRACTS: dict[str, dict[str, Any]] = {
         "credential_boundary": "credential-service-provider-worker-only",
         "required_pins": ["api_version", "implementation_version"],
         "actions": ["vm.create", "vm.update", "vm.delete", "vm.power", "vm.clone"],
+    },
+    "vmware-workstation": {
+        "kind": "local-virtualization",
+        "plan_contract": "VMwareWorkstationResourcePlan",
+        "credential_boundary": "credential-service-provider-worker-only",
+        "required_pins": ["api_version", "implementation_version"],
+        "actions": ["vm.clone", "vm.update", "vm.delete", "vm.power", "network.attach"],
+    },
+    "proxmox": {
+        "kind": "virtualization",
+        "plan_contract": "ProxmoxResourcePlan",
+        "credential_boundary": "credential-service-provider-worker-only",
+        "required_pins": ["api_version", "implementation_version"],
+        "actions": ["vm.create", "vm.clone", "vm.update", "vm.delete", "vm.power", "network.attach", "snapshot.create", "snapshot.restore"],
     },
     "openstack": {
         "kind": "cloud",
@@ -50,7 +65,7 @@ BARE_METAL_PROVIDER_CONTRACTS: dict[str, dict[str, Any]] = {
         "kind": "bare-metal",
         "plan_contract": "RedfishBareMetalPlan",
         "credential_boundary": "credential-service-provider-worker-only",
-        "actions": ["power.set", "boot.set", "bios.apply", "firmware.apply", "inventory.refresh"],
+        "actions": ["power.set", "boot.set", "boot-order.apply", "secure-boot.apply", "sriov.apply", "iommu.apply", "virtual-media.insert", "virtual-media.eject", "bios.apply", "firmware.apply", "storage.volume.apply", "storage.volume.delete", "inventory.refresh"],
         "arbitrary_command": False,
     },
     "ipmi": {
@@ -78,6 +93,34 @@ NETWORK_PROVIDER_CONTRACTS: dict[str, dict[str, Any]] = {
         "arbitrary_cli": False,
     }
 }
+
+INFRASTRUCTURE_RUNTIME_OPERATIONS: dict[str, set[str]] = {
+    "redfish": {"inventory.refresh", "power.set", "boot.set", "boot-order.apply", "secure-boot.apply", "sriov.apply", "iommu.apply", "virtual-media.insert", "virtual-media.eject", "bios.apply", "firmware.apply", "storage.volume.apply", "storage.volume.delete"},
+    "ipmi": {"power.set", "boot.set"},
+    "pxe": {"os.provision", "os.reimage"},
+}
+REDFISH_POWER_STATES = {"on", "force-off", "graceful-shutdown", "restart", "graceful-restart", "power-cycle"}
+REDFISH_BOOT_TARGETS = {"pxe", "disk", "cd", "none"}
+REDFISH_BOOT_ENABLED = {"once", "continuous", "disabled"}
+REDFISH_BOOT_MODES = {"uefi", "legacy"}
+REDFISH_BOOT_ORDER_REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+REDFISH_PLATFORM_FEATURES = {"sriov", "iommu"}
+REDFISH_PLATFORM_ACTIVATIONS = {"immediate", "reboot"}
+REDFISH_RESET_TYPES = {"GracefulRestart", "ForceRestart"}
+REDFISH_BIOS_ATTRIBUTE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+REDFISH_FIRMWARE_COMPONENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+REDFISH_STORAGE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}$")
+REDFISH_VOLUME_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_. -]{0,79}$")
+REDFISH_RAID_TYPES = {"RAID0", "RAID1", "RAID5", "RAID6", "RAID10", "RAID50", "RAID60"}
+IPMI_POWER_STATES = {"on", "force-off", "graceful-shutdown"}
+IPMI_BOOT_TARGETS = {"pxe", "disk", "cd"}
+IPMI_BOOT_ENABLED = {"once", "continuous"}
+PXE_BOOT_METHODS = {"pxe", "ipxe"}
+PXE_ARTIFACT_ROLES = {"kernel", "initrd", "rootfs", "installer", "unattended"}
+PXE_REQUIRED_ARTIFACT_ROLES = {"kernel", "initrd", "unattended"}
+PXE_REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{2,119}$")
+PXE_ARTIFACT_ID_RE = re.compile(r"^art_[A-Za-z0-9]{8,64}$")
+PXE_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 ARTIFACT_KINDS = ("oci-image", "helm-chart", "package", "git-release", "ansible-collection", "apt-repository", "rpm-repository", "python-repository")
 
@@ -445,6 +488,236 @@ def fleet_plan(*, operation: str, selector: dict[str, Any], targets: list[dict[s
     })
 
 
+def infrastructure_runtime_operation_capable(provider_kind: str, operation: str) -> bool:
+    return operation in INFRASTRUCTURE_RUNTIME_OPERATIONS.get(provider_kind, set())
+
+
+def validate_infrastructure_desired_state(provider_kind: str, operation: str, desired_state: dict[str, Any]) -> None:
+    if not infrastructure_runtime_operation_capable(provider_kind, operation):
+        return
+    if provider_kind == "ipmi":
+        if operation == "power.set":
+            if set(desired_state) != {"state"}:
+                raise ValueError("IPMI power.set requires only desired_state.state")
+            if str(desired_state.get("state") or "").lower() not in IPMI_POWER_STATES:
+                raise ValueError("unsupported IPMI power state")
+            return
+        allowed = {"target", "enabled", "mode"}
+        unknown = sorted(set(desired_state) - allowed)
+        if unknown:
+            raise ValueError("unsupported IPMI boot desired_state field(s): " + ", ".join(unknown))
+        if str(desired_state.get("target") or "").lower() not in IPMI_BOOT_TARGETS:
+            raise ValueError("unsupported IPMI boot target")
+        if str(desired_state.get("enabled") or "once").lower() not in IPMI_BOOT_ENABLED:
+            raise ValueError("unsupported IPMI boot enable mode")
+        mode = str(desired_state.get("mode") or "").lower()
+        if mode and mode not in REDFISH_BOOT_MODES:
+            raise ValueError("unsupported IPMI boot mode")
+        return
+    if provider_kind == "pxe":
+        allowed = {
+            "boot_method", "artifacts", "unattended_profile_ref", "callback_ref", "callback_token_sha256",
+            "completion_timeout_seconds", "host_ready_timeout_seconds", "boot_mode", "confirm_server",
+        }
+        unknown = sorted(set(desired_state) - allowed)
+        if unknown:
+            raise ValueError("unsupported PXE desired_state field(s): " + ", ".join(unknown))
+        boot_method = str(desired_state.get("boot_method") or "").lower()
+        if boot_method not in PXE_BOOT_METHODS:
+            raise ValueError("PXE boot_method must be pxe or ipxe")
+        boot_mode = str(desired_state.get("boot_mode") or "uefi").lower()
+        if boot_mode not in REDFISH_BOOT_MODES:
+            raise ValueError("PXE boot_mode must be uefi or legacy")
+        artifacts = desired_state.get("artifacts")
+        if not isinstance(artifacts, dict):
+            raise ValueError("PXE desired_state.artifacts must be an object")
+        unknown_roles = sorted(set(artifacts) - PXE_ARTIFACT_ROLES)
+        if unknown_roles:
+            raise ValueError("unsupported PXE artifact role(s): " + ", ".join(unknown_roles))
+        missing_roles = sorted(PXE_REQUIRED_ARTIFACT_ROLES - set(artifacts))
+        if missing_roles:
+            raise ValueError("PXE artifacts require: " + ", ".join(missing_roles))
+        if len(set(str(value) for value in artifacts.values())) != len(artifacts):
+            raise ValueError("PXE artifact IDs must be unique across roles")
+        for artifact_id in artifacts.values():
+            if not PXE_ARTIFACT_ID_RE.fullmatch(str(artifact_id or "")):
+                raise ValueError("PXE artifacts must reference exact artifact mirror IDs")
+        for field in ("unattended_profile_ref", "callback_ref"):
+            if not PXE_REF_RE.fullmatch(str(desired_state.get(field) or "")):
+                raise ValueError(f"PXE {field} is invalid")
+        if not PXE_SHA256_RE.fullmatch(str(desired_state.get("callback_token_sha256") or "")):
+            raise ValueError("PXE callback_token_sha256 must be an exact lowercase SHA-256 digest")
+        completion = desired_state.get("completion_timeout_seconds", 3600)
+        host_ready = desired_state.get("host_ready_timeout_seconds", 300)
+        if not isinstance(completion, int) or isinstance(completion, bool) or not 60 <= completion <= 7200:
+            raise ValueError("PXE completion_timeout_seconds must be between 60 and 7200")
+        if not isinstance(host_ready, int) or isinstance(host_ready, bool) or not 10 <= host_ready <= 900:
+            raise ValueError("PXE host_ready_timeout_seconds must be between 10 and 900")
+        confirm = str(desired_state.get("confirm_server") or "")
+        if operation == "os.reimage" and not confirm:
+            raise ValueError("PXE os.reimage requires confirm_server")
+        if operation == "os.provision" and confirm:
+            raise ValueError("PXE os.provision does not accept confirm_server")
+        return
+    if provider_kind != "redfish":
+        return
+    if operation == "inventory.refresh":
+        if desired_state:
+            raise ValueError("Redfish inventory.refresh does not accept desired_state fields")
+        return
+    if operation == "power.set":
+        if set(desired_state) != {"state"}:
+            raise ValueError("Redfish power.set requires only desired_state.state")
+        if str(desired_state.get("state") or "").lower() not in REDFISH_POWER_STATES:
+            raise ValueError("unsupported Redfish power state")
+        return
+    if operation == "virtual-media.eject":
+        if desired_state:
+            raise ValueError("Redfish virtual-media.eject does not accept desired_state fields")
+        return
+    if operation == "virtual-media.insert":
+        allowed = {"image_url", "write_protected"}
+        unknown = sorted(set(desired_state) - allowed)
+        if unknown:
+            raise ValueError("unsupported Redfish virtual-media.insert desired_state field(s): " + ", ".join(unknown))
+        image_url = str(desired_state.get("image_url") or "")
+        parsed = urlparse(image_url)
+        if parsed.scheme != "https" or not parsed.hostname or parsed.username is not None or parsed.password is not None or parsed.query or parsed.fragment:
+            raise ValueError("Redfish virtual media image_url must be credential-free HTTPS without query/fragment")
+        if desired_state.get("write_protected", True) is not True:
+            raise ValueError("Redfish virtual media must be write-protected")
+        return
+    if operation == "secure-boot.apply":
+        if set(desired_state) != {"enabled", "activation"}:
+            raise ValueError("Redfish secure-boot.apply requires enabled and activation")
+        if not isinstance(desired_state.get("enabled"), bool):
+            raise ValueError("Redfish secure boot enabled must be boolean")
+        if str(desired_state.get("activation") or "").lower() != "reboot":
+            raise ValueError("Redfish SecureBootEnable is activated on reboot; activation must be reboot")
+        return
+    if operation in {"sriov.apply", "iommu.apply"}:
+        if set(desired_state) != {"enabled", "activation"}:
+            raise ValueError(f"Redfish {operation} requires enabled and activation")
+        if not isinstance(desired_state.get("enabled"), bool):
+            raise ValueError(f"Redfish {operation} enabled must be boolean")
+        if str(desired_state.get("activation") or "").lower() not in REDFISH_PLATFORM_ACTIVATIONS:
+            raise ValueError(f"Redfish {operation} activation must be immediate or reboot")
+        return
+    if operation == "boot-order.apply":
+        if set(desired_state) != {"order", "activation"}:
+            raise ValueError("Redfish boot-order.apply requires order and activation")
+        order = desired_state.get("order")
+        if not isinstance(order, list) or not 1 <= len(order) <= 32:
+            raise ValueError("Redfish boot order must contain between 1 and 32 exact boot option references")
+        normalized = [str(item or "") for item in order]
+        if any(not REDFISH_BOOT_ORDER_REF_RE.fullmatch(item) for item in normalized):
+            raise ValueError("Redfish boot order contains an unsafe boot option reference")
+        if len(set(normalized)) != len(normalized):
+            raise ValueError("Redfish boot order references must be unique")
+        if str(desired_state.get("activation") or "").lower() not in REDFISH_PLATFORM_ACTIVATIONS:
+            raise ValueError("Redfish boot order activation must be immediate or reboot")
+        return
+    if operation == "bios.apply":
+        if set(desired_state) != {"attributes"}:
+            raise ValueError("Redfish bios.apply requires only desired_state.attributes")
+        attributes = desired_state.get("attributes")
+        if not isinstance(attributes, dict) or not attributes or len(attributes) > 64:
+            raise ValueError("Redfish bios.apply attributes must contain between 1 and 64 entries")
+        for raw_name, raw_value in attributes.items():
+            name = str(raw_name)
+            if not REDFISH_BIOS_ATTRIBUTE_RE.fullmatch(name):
+                raise ValueError("Redfish BIOS attribute name is unsafe")
+            if isinstance(raw_value, bool):
+                continue
+            if isinstance(raw_value, int) and not isinstance(raw_value, bool):
+                if raw_value < -(2**63) or raw_value > 2**63 - 1:
+                    raise ValueError("Redfish BIOS integer attribute is out of range")
+                continue
+            if isinstance(raw_value, str) and raw_value and len(raw_value) <= 256 and not any(ord(ch) < 32 for ch in raw_value):
+                continue
+            raise ValueError("Redfish BIOS attribute values must be bounded string, integer or boolean scalars")
+        return
+    if operation == "firmware.apply":
+        if set(desired_state) != {"image_url", "component_id", "expected_version"}:
+            raise ValueError("Redfish firmware.apply requires only image_url, component_id and expected_version")
+        image_url = str(desired_state.get("image_url") or "")
+        parsed = urlparse(image_url)
+        if parsed.scheme != "https" or not parsed.hostname or parsed.username is not None or parsed.password is not None or parsed.query or parsed.fragment:
+            raise ValueError("Redfish firmware image_url must be credential-free HTTPS without query/fragment")
+        component_id = str(desired_state.get("component_id") or "")
+        if not REDFISH_FIRMWARE_COMPONENT_RE.fullmatch(component_id):
+            raise ValueError("Redfish firmware component_id is unsafe")
+        expected_version = str(desired_state.get("expected_version") or "")
+        if not expected_version or len(expected_version) > 160 or any(ord(ch) < 32 for ch in expected_version):
+            raise ValueError("Redfish firmware expected_version must be a bounded printable string")
+        return
+    if operation == "storage.volume.apply":
+        if set(desired_state) != {"controller_id", "volume_name", "raid_type", "drive_ids"}:
+            raise ValueError("Redfish storage.volume.apply requires only controller_id, volume_name, raid_type and drive_ids")
+        controller_id = str(desired_state.get("controller_id") or "")
+        volume_name = str(desired_state.get("volume_name") or "")
+        raid_type = str(desired_state.get("raid_type") or "").upper()
+        drive_ids = desired_state.get("drive_ids")
+        if not REDFISH_STORAGE_ID_RE.fullmatch(controller_id):
+            raise ValueError("Redfish storage controller_id is unsafe")
+        if not REDFISH_VOLUME_NAME_RE.fullmatch(volume_name):
+            raise ValueError("Redfish storage volume_name is unsafe")
+        if raid_type not in REDFISH_RAID_TYPES:
+            raise ValueError("unsupported Redfish RAID type")
+        if not isinstance(drive_ids, list) or not 1 <= len(drive_ids) <= 64:
+            raise ValueError("Redfish storage drive_ids must contain between 1 and 64 exact drive IDs")
+        normalized = [str(item or "") for item in drive_ids]
+        if any(not REDFISH_STORAGE_ID_RE.fullmatch(item) for item in normalized):
+            raise ValueError("Redfish storage drive_id is unsafe")
+        if len(set(normalized)) != len(normalized):
+            raise ValueError("Redfish storage drive_ids must be unique")
+        minimum = {"RAID0": 1, "RAID1": 2, "RAID5": 3, "RAID6": 4, "RAID10": 4, "RAID50": 6, "RAID60": 8}[raid_type]
+        if len(normalized) < minimum:
+            raise ValueError(f"{raid_type} requires at least {minimum} drives")
+        return
+    if operation == "storage.volume.delete":
+        if set(desired_state) != {"controller_id", "volume_id", "confirm_volume_id"}:
+            raise ValueError("Redfish storage.volume.delete requires controller_id, volume_id and confirm_volume_id")
+        controller_id = str(desired_state.get("controller_id") or "")
+        volume_id = str(desired_state.get("volume_id") or "")
+        confirm = str(desired_state.get("confirm_volume_id") or "")
+        if not REDFISH_STORAGE_ID_RE.fullmatch(controller_id) or not REDFISH_STORAGE_ID_RE.fullmatch(volume_id):
+            raise ValueError("Redfish storage controller/volume ID is unsafe")
+        if confirm != volume_id:
+            raise ValueError("Redfish storage volume deletion confirmation must exactly match volume_id")
+        return
+    allowed = {"target", "enabled", "mode"}
+    unknown = sorted(set(desired_state) - allowed)
+    if unknown:
+        raise ValueError("unsupported Redfish boot desired_state field(s): " + ", ".join(unknown))
+    if str(desired_state.get("target") or "").lower() not in REDFISH_BOOT_TARGETS:
+        raise ValueError("unsupported Redfish boot target")
+    if str(desired_state.get("enabled") or "once").lower() not in REDFISH_BOOT_ENABLED:
+        raise ValueError("unsupported Redfish boot enable mode")
+    mode = str(desired_state.get("mode") or "").lower()
+    if mode and mode not in REDFISH_BOOT_MODES:
+        raise ValueError("unsupported Redfish boot mode")
+
+
+def infrastructure_runtime_capable(plan: dict[str, Any]) -> bool:
+    provider = plan.get("provider") if isinstance(plan.get("provider"), dict) else {}
+    preview = plan.get("runtime_preview") if isinstance(plan.get("runtime_preview"), dict) else {}
+    kind = str(provider.get("kind") or "")
+    operation = str(plan.get("operation") or "")
+    return (
+        infrastructure_runtime_operation_capable(kind, operation)
+        and preview.get("provider_kind") == kind
+        and preview.get("operation") == operation
+        and preview.get("active_probe") is True
+        and preview.get("secret_output_suppressed") is True
+        and preview.get("credential_material_returned") is False
+        and preview.get("arbitrary_cli") is False
+        and preview.get("arbitrary_shell") is False
+        and isinstance(preview.get("current_hash"), str)
+        and len(preview["current_hash"]) == 64
+    )
+
+
 def infrastructure_plan(
     *,
     provider: dict[str, Any],
@@ -452,6 +725,8 @@ def infrastructure_plan(
     operation: str,
     subject_targets: list[dict[str, Any]],
     desired_state: dict[str, Any],
+    runtime_preview: dict[str, Any] | None = None,
+    artifact_supply: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     provider_kind = provider["kind"]
     if provider_kind in CLOUD_PROVIDER_CONTRACTS:
@@ -470,8 +745,127 @@ def infrastructure_plan(
         raise ValueError(f"unsupported infrastructure provider kind: {provider_kind}")
     if operation not in contract["actions"]:
         raise ValueError(f"operation {operation} is not supported by {provider_kind}")
-    return _finish({
-        "schema_version": 4,
+    validate_infrastructure_desired_state(provider_kind, operation, desired_state)
+    runtime_operation = infrastructure_runtime_operation_capable(provider_kind, operation)
+    if runtime_preview is not None:
+        if not runtime_operation:
+            raise ValueError(f"runtime preview is not supported for {provider_kind} {operation}")
+        if runtime_preview.get("provider_kind") != provider_kind or runtime_preview.get("operation") != operation:
+            raise ValueError("infrastructure runtime preview does not match provider operation")
+        if runtime_preview.get("secret_output_suppressed") is not True or runtime_preview.get("credential_material_returned") is not False:
+            raise ValueError("infrastructure runtime preview violates credential boundary")
+        if runtime_preview.get("arbitrary_cli") is not False or runtime_preview.get("arbitrary_shell") is not False:
+            raise ValueError("infrastructure runtime preview exposes an arbitrary command surface")
+    if provider_kind == "redfish" and operation == "secure-boot.apply":
+        capabilities = provider.get("capabilities") if isinstance(provider.get("capabilities"), dict) else {}
+        policy = capabilities.get("secure_boot")
+        if not isinstance(policy, dict) or set(policy) - {"activation", "reset_type"}:
+            raise ValueError("Redfish secure boot requires a bounded capabilities.secure_boot policy")
+        activation = str(policy.get("activation") or "").lower()
+        if activation != "reboot":
+            raise ValueError("Redfish secure boot capability activation must be reboot")
+        if str(desired_state.get("activation") or "").lower() != activation:
+            raise ValueError("Redfish secure boot desired activation does not match provider capability")
+        if str(policy.get("reset_type") or "") not in REDFISH_RESET_TYPES:
+            raise ValueError("Redfish secure boot requires a fixed supported reset_type")
+    if provider_kind == "redfish" and operation in {"sriov.apply", "iommu.apply"}:
+        capabilities = provider.get("capabilities") if isinstance(provider.get("capabilities"), dict) else {}
+        feature = operation.split(".", 1)[0]
+        feature_map = capabilities.get("hardware_feature_map")
+        if not isinstance(feature_map, dict):
+            raise ValueError("Redfish platform feature runtime requires capabilities.hardware_feature_map")
+        policy = feature_map.get(feature)
+        allowed_keys = {"attribute", "enabled_value", "disabled_value", "activation", "reset_type"}
+        if not isinstance(policy, dict) or set(policy) - allowed_keys:
+            raise ValueError(f"Redfish {feature} capability mapping is missing or contains unsupported fields")
+        attribute = str(policy.get("attribute") or "")
+        if not REDFISH_BIOS_ATTRIBUTE_RE.fullmatch(attribute):
+            raise ValueError(f"Redfish {feature} capability attribute is unsafe")
+        raw_allowlist = capabilities.get("bios_attribute_allowlist")
+        if not isinstance(raw_allowlist, list) or attribute not in {str(item) for item in raw_allowlist}:
+            raise ValueError(f"Redfish {feature} capability attribute must also be BIOS-allowlisted")
+        for key in ("enabled_value", "disabled_value"):
+            value = policy.get(key)
+            if not isinstance(value, (str, int, bool)) or (isinstance(value, str) and (not value or len(value) > 256 or any(ord(ch) < 32 for ch in value))):
+                raise ValueError(f"Redfish {feature} capability {key} must be a bounded scalar")
+        if policy.get("enabled_value") == policy.get("disabled_value"):
+            raise ValueError(f"Redfish {feature} enabled and disabled capability values must differ")
+        activation = str(policy.get("activation") or "").lower()
+        if activation not in REDFISH_PLATFORM_ACTIVATIONS:
+            raise ValueError(f"Redfish {feature} capability activation must be immediate or reboot")
+        if str(desired_state.get("activation") or "").lower() != activation:
+            raise ValueError(f"Redfish {feature} desired activation does not match provider capability")
+        if activation == "reboot" and str(policy.get("reset_type") or "") not in REDFISH_RESET_TYPES:
+            raise ValueError(f"Redfish {feature} reboot activation requires a fixed supported reset_type")
+        if activation == "immediate" and policy.get("reset_type") not in {None, ""}:
+            raise ValueError(f"Redfish {feature} immediate activation must not configure reset_type")
+    if provider_kind == "redfish" and operation == "boot-order.apply":
+        capabilities = provider.get("capabilities") if isinstance(provider.get("capabilities"), dict) else {}
+        policy = capabilities.get("boot_order")
+        allowed_keys = {"allowlist", "activation", "reset_type"}
+        if not isinstance(policy, dict) or set(policy) - allowed_keys:
+            raise ValueError("Redfish boot-order runtime requires a bounded capabilities.boot_order policy")
+        raw_order = policy.get("allowlist")
+        if not isinstance(raw_order, list) or not raw_order or len(raw_order) > 64:
+            raise ValueError("Redfish boot-order runtime requires a non-empty exact allowlist")
+        allowed = [str(item) for item in raw_order]
+        if any(not REDFISH_BOOT_ORDER_REF_RE.fullmatch(item) for item in allowed) or len(set(allowed)) != len(allowed):
+            raise ValueError("Redfish boot-order allowlist contains unsafe or duplicate references")
+        denied = [item for item in desired_state.get("order") or [] if str(item) not in set(allowed)]
+        if denied:
+            raise ValueError("Redfish boot option is not allowlisted by provider capabilities: " + ", ".join(str(item) for item in denied))
+        activation = str(policy.get("activation") or "").lower()
+        if activation not in REDFISH_PLATFORM_ACTIVATIONS:
+            raise ValueError("Redfish boot-order capability activation must be immediate or reboot")
+        if str(desired_state.get("activation") or "").lower() != activation:
+            raise ValueError("Redfish boot-order desired activation does not match provider capability")
+        if activation == "reboot" and str(policy.get("reset_type") or "") not in REDFISH_RESET_TYPES:
+            raise ValueError("Redfish boot-order reboot activation requires a fixed supported reset_type")
+        if activation == "immediate" and policy.get("reset_type") not in {None, ""}:
+            raise ValueError("Redfish boot-order immediate activation must not configure reset_type")
+    if provider_kind == "redfish" and operation.startswith("storage.volume."):
+        capabilities = provider.get("capabilities") if isinstance(provider.get("capabilities"), dict) else {}
+        raw_controllers = capabilities.get("storage_controller_allowlist")
+        if not isinstance(raw_controllers, dict) or not raw_controllers:
+            raise ValueError("Redfish storage runtime requires capabilities.storage_controller_allowlist")
+        controller_id = str(desired_state.get("controller_id") or "")
+        controller_policy = raw_controllers.get(controller_id)
+        if not isinstance(controller_policy, dict):
+            raise ValueError("Redfish storage controller is not allowlisted by provider capabilities")
+        allowed_keys = {"drive_ids", "raid_types", "volume_names", "allow_volume_delete"}
+        if set(controller_policy) - allowed_keys:
+            raise ValueError("Redfish storage controller allowlist contains unsupported policy fields")
+        if operation == "storage.volume.apply":
+            raw_drives = controller_policy.get("drive_ids")
+            raw_raid = controller_policy.get("raid_types")
+            raw_names = controller_policy.get("volume_names")
+            if not isinstance(raw_drives, list) or not raw_drives or not isinstance(raw_raid, list) or not raw_raid or not isinstance(raw_names, list) or not raw_names:
+                raise ValueError("Redfish storage apply requires drive_ids, raid_types and volume_names allowlists")
+            denied_drives = sorted(set(str(item) for item in desired_state.get("drive_ids") or []) - set(str(item) for item in raw_drives))
+            if denied_drives:
+                raise ValueError("Redfish storage drive is not allowlisted: " + ", ".join(denied_drives))
+            if str(desired_state.get("raid_type") or "").upper() not in {str(item).upper() for item in raw_raid}:
+                raise ValueError("Redfish RAID type is not allowlisted by provider capabilities")
+            if str(desired_state.get("volume_name") or "") not in {str(item) for item in raw_names}:
+                raise ValueError("Redfish storage volume name is not allowlisted by provider capabilities")
+        elif controller_policy.get("allow_volume_delete") is not True:
+            raise ValueError("Redfish storage volume deletion is disabled by provider capabilities")
+    if provider_kind == "pxe":
+        capabilities = provider.get("capabilities") if isinstance(provider.get("capabilities"), dict) else {}
+        if capabilities.get("network_scope") != "private-offline":
+            raise ValueError("PXE runtime requires provider capabilities.network_scope=private-offline")
+        if capabilities.get("artifact_delivery") != "shared-readonly-mirror":
+            raise ValueError("PXE runtime requires provider capabilities.artifact_delivery=shared-readonly-mirror")
+        if not isinstance(artifact_supply, dict) or artifact_supply.get("mode") != "pxe-ready-manifest-bound":
+            raise ValueError("PXE runtime requires an exact READY artifact supply")
+        if artifact_supply.get("credential_material_in_plan") is not False or artifact_supply.get("public_network_required") is not False:
+            raise ValueError("PXE artifact supply violates credential/network boundary")
+        if not isinstance(artifact_supply.get("manifest_hash"), str) or len(artifact_supply["manifest_hash"]) != 64:
+            raise ValueError("PXE artifact supply manifest hash is invalid")
+    elif artifact_supply is not None:
+        raise ValueError("artifact_supply is only supported for trusted PXE infrastructure runtime")
+    plan = {
+        "schema_version": 5,
         "kind": kind,
         "operation": operation,
         "provider": {
@@ -484,13 +878,22 @@ def infrastructure_plan(
         },
         "targets": [provider_snapshot, *subject_targets],
         "desired_state": desired_state,
+        "runtime_preview": runtime_preview,
+        "runtime": {
+            "state": "RUNTIME_CAPABLE" if runtime_operation and runtime_preview is not None else ("PREVIEW_REQUIRED" if runtime_operation else "CONTRACT_ONLY"),
+            "executor": "infrastructure-provider-worker" if runtime_operation else "infrastructure-provider-contract",
+            "active_verification": runtime_operation,
+        },
         "stages": stages,
         "credential_delivery": "credential-service-to-provider-worker-only",
         "credential_material_in_plan": False,
         "verification_required": True,
         "mutation_gate": MUTATION_GATE,
         "arbitrary_cli_or_shell": False,
-    })
+    }
+    if artifact_supply is not None:
+        plan["artifact_supply"] = artifact_supply
+    return _finish(plan)
 
 
 ARTIFACT_RUNTIME_SOURCE_SCHEMES = {"file", "https", "oci"}
@@ -594,6 +997,7 @@ def contracts() -> dict[str, Any]:
         "cloud_virtualization": CLOUD_PROVIDER_CONTRACTS,
         "bare_metal": BARE_METAL_PROVIDER_CONTRACTS,
         "network": NETWORK_PROVIDER_CONTRACTS,
+        "infrastructure_runtime": {key: sorted(value) for key, value in INFRASTRUCTURE_RUNTIME_OPERATIONS.items()},
         "artifact_kinds": list(ARTIFACT_KINDS),
         "verification_checks": VERIFICATION_CHECKS,
         "credential_boundary": "raw-credentials-never-enter-llm-ui-telegram-plans",

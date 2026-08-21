@@ -10,7 +10,7 @@ _READ_PREFIXES = (
 _CRITICAL_MARKERS = (
     "cluster-admin", "cluster_admin", "rbac.", "namespace.delete", "secret.read", "secret.export",
     "docker.privileged", "host.mount", "host_root", "force-push", "force_push",
-    "restore", "disaster-recovery", "disaster_recovery", "decommission",
+    "restore", "disaster-recovery", "disaster_recovery", "decommission", "storage.volume.delete",
 )
 _HIGH_MARKERS = (
     ".delete", ".remove", ".add", ".replace", ".apply", ".install", ".uninstall", ".upgrade", ".rollback", ".scale", ".restart",

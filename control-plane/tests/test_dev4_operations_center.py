@@ -177,7 +177,7 @@ def test_operations_center_contract_covers_compressed_dev4_scope(client: TestCli
     contract = client.get("/v1/operations-center/contracts").json()
     assert contract["shared_intent_backend"] is True
     assert set(contract["channels"]) == {"ui", "telegram", "hermes-bot", "api"}
-    assert set(contract["cloud_virtualization"]) == {"vmware", "openstack", "aws", "azure", "gcp"}
+    assert set(contract["cloud_virtualization"]) == {"vmware", "vmware-workstation", "proxmox", "openstack", "aws", "azure", "gcp"}
     assert {"redfish", "ipmi", "pxe"}.issubset(contract["bare_metal"])
     assert contract["network"]["network-switch"]["arbitrary_cli"] is False
     assert set(contract["artifact_kinds"]) == {"oci-image", "helm-chart", "package", "git-release", "ansible-collection", "apt-repository", "rpm-repository", "python-repository"}

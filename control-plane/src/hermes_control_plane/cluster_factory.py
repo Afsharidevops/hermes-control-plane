@@ -330,6 +330,113 @@ def resolve_blueprint_artifact_manifest(*, blueprint: dict[str, Any], artifacts:
     return manifest
 
 
+
+PXE_ARTIFACT_ROLES = {"kernel", "initrd", "rootfs", "installer", "unattended"}
+PXE_REQUIRED_ARTIFACT_ROLES = {"kernel", "initrd", "unattended"}
+
+
+def resolve_pxe_artifact_manifest(*, role_bindings: dict[str, str], artifacts: list[dict[str, Any]]) -> dict[str, Any]:
+    if not isinstance(role_bindings, dict):
+        raise ValueError("PXE artifact role bindings must be an object")
+    unknown_roles = sorted(set(role_bindings) - PXE_ARTIFACT_ROLES)
+    if unknown_roles:
+        raise ValueError("unsupported PXE artifact role(s): " + ", ".join(unknown_roles))
+    missing_roles = sorted(PXE_REQUIRED_ARTIFACT_ROLES - set(role_bindings))
+    if missing_roles:
+        raise ValueError("PXE artifact bindings require: " + ", ".join(missing_roles))
+    if len(set(role_bindings.values())) != len(role_bindings):
+        raise ValueError("PXE artifact IDs must be unique across roles")
+
+    by_id = {str(item.get("id") or ""): item for item in artifacts}
+    issues: list[dict[str, Any]] = []
+    resolved: dict[str, dict[str, Any]] = {}
+    for role in sorted(role_bindings):
+        artifact_id = str(role_bindings[role] or "")
+        artifact = by_id.get(artifact_id)
+        if artifact is None:
+            issues.append({"code": "missing-artifact", "role": role, "artifact_id": artifact_id, "summary": "bound PXE artifact does not exist"})
+            continue
+        verification = artifact.get("verification") if isinstance(artifact.get("verification"), dict) else {}
+        mirrored = verification.get("status") == "PASS" and verification.get("sync_state") == "MIRRORED"
+        if not mirrored:
+            issues.append({"code": "artifact-not-mirrored", "role": role, "artifact_id": artifact_id, "summary": "PXE artifact has no successful mirrored verification"})
+        reference, reference_error = _artifact_offline_reference(artifact)
+        if reference_error:
+            issues.append({"code": "unsafe-offline-reference", "role": role, "artifact_id": artifact_id, "summary": reference_error})
+        elif not str(reference).startswith("file:///"):
+            issues.append({"code": "unsupported-pxe-reference", "role": role, "artifact_id": artifact_id, "summary": "PXE runtime requires an exact verified local file:// mirror destination"})
+        digest = str(artifact.get("digest") or "")
+        if not digest.startswith("sha256:") or len(digest) != 71:
+            issues.append({"code": "invalid-digest", "role": role, "artifact_id": artifact_id, "summary": "PXE artifact must be bound by an exact SHA-256 digest"})
+        resolved[role] = {
+            "artifact_id": artifact_id,
+            "kind": str(artifact.get("kind") or ""),
+            "version": str(artifact.get("version") or ""),
+            "digest": digest,
+            "offline_reference": reference,
+            "mirrored": mirrored,
+            "verification_id": verification.get("verification_id"),
+            "observed_at": verification.get("observed_at"),
+        }
+
+    manifest = {
+        "schema_version": 1,
+        "kind": "PXEProvisioningArtifactManifest",
+        "state": "READY" if not issues else "BLOCKED",
+        "role_bindings": {role: str(role_bindings[role]) for role in sorted(role_bindings)},
+        "artifacts": resolved,
+        "issues": issues,
+        "offline_reference_selection": "verified-destination-only",
+        "credential_material_in_manifest": False,
+        "public_network_required": False,
+    }
+    manifest["manifest_hash"] = sha256_hex(manifest)
+    return manifest
+
+
+def pxe_artifact_supply(manifest: dict[str, Any]) -> dict[str, Any]:
+    if manifest.get("kind") != "PXEProvisioningArtifactManifest" or manifest.get("state") != "READY" or manifest.get("issues"):
+        raise ValueError("PXE artifact manifest must be READY before unattended provisioning can be planned")
+    manifest_hash = str(manifest.get("manifest_hash") or "")
+    unsigned = deepcopy(manifest)
+    unsigned.pop("manifest_hash", None)
+    if not manifest_hash or sha256_hex(unsigned) != manifest_hash:
+        raise ValueError("PXE artifact manifest hash verification failed")
+    if manifest.get("credential_material_in_manifest") is not False or manifest.get("public_network_required") is not False:
+        raise ValueError("PXE artifact manifest violates the offline credential/network boundary")
+    artifacts = manifest.get("artifacts") if isinstance(manifest.get("artifacts"), dict) else {}
+    if not PXE_REQUIRED_ARTIFACT_ROLES.issubset(artifacts):
+        raise ValueError("PXE artifact manifest is missing required roles")
+    safe_artifacts: dict[str, dict[str, Any]] = {}
+    for role in sorted(artifacts):
+        item = artifacts[role]
+        if role not in PXE_ARTIFACT_ROLES or not isinstance(item, dict) or item.get("mirrored") is not True:
+            raise ValueError("PXE artifact manifest contains an invalid role entry")
+        reference = str(item.get("offline_reference") or "")
+        parsed = urlparse(reference)
+        if parsed.scheme != "file" or parsed.netloc or not parsed.path.startswith("/") or parsed.query or parsed.fragment:
+            raise ValueError("PXE runtime requires exact local verified file:// artifact references")
+        digest = str(item.get("digest") or "")
+        if not digest.startswith("sha256:") or len(digest) != 71:
+            raise ValueError("PXE artifact supply contains an invalid digest")
+        safe_artifacts[role] = {
+            "artifact_id": str(item.get("artifact_id") or ""),
+            "kind": str(item.get("kind") or ""),
+            "version": str(item.get("version") or ""),
+            "digest": digest,
+            "offline_reference": reference,
+        }
+    supply = {
+        "mode": "pxe-ready-manifest-bound",
+        "manifest_hash": manifest_hash,
+        "artifacts": safe_artifacts,
+        "credential_material_in_plan": False,
+        "public_network_required": False,
+        "provisioner_rewrite_applied": True,
+    }
+    supply["supply_hash"] = sha256_hex(supply)
+    return supply
+
 def _require_supported_addons(addons: list[str], versions: dict[str, str]) -> None:
     unknown = sorted(set(addons) - set(ADDON_CATALOG))
     if unknown:

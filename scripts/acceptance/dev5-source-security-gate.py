@@ -35,6 +35,7 @@ hubble = text("kubernetes-broker/src/hermes_kubernetes_broker/hubble.py")
 diagnostics = text("kubernetes-broker/src/hermes_kubernetes_broker/diagnostics.py")
 kube_broker = text("kubernetes-broker/src/hermes_kubernetes_broker/main.py")
 provider_runtime = text("node-agent/src/hermes_node_agent/provider_runtime.py")
+infrastructure_runtime = text("node-agent/src/hermes_node_agent/infrastructure_runtime.py")
 provider_agent_main = text("node-agent/src/hermes_node_agent/main.py")
 provider_operation_playbook = text("node-agent/playbooks/provider-operation.yml")
 provider_verify_playbook = text("node-agent/playbooks/provider-verify.yml")
@@ -263,7 +264,7 @@ for marker in (
     assert marker in operations, marker
 for marker in (
     '@app.post("/v1/operation-jobs/{job_id}/execute")',
-    'job["executor"] not in {"kubernetes-broker", "artifact-mirror-worker", "cluster-provider-worker"}',
+    'job["executor"] not in {"kubernetes-broker", "artifact-mirror-worker", "cluster-provider-worker", "infrastructure-provider-worker"}',
     '"/v1/day2/preview"',
     '"/v1/day2/execute"',
     'verification.runtime_recorded',
@@ -453,5 +454,92 @@ assert 'source=executor' in cp_main
 assert 'sync_state' in cp_main
 dockerfile = text('control-plane/Dockerfile')
 assert 'apt-get install -y --no-install-recommends ca-certificates git gpgv skopeo' in dockerfile
+
+# Dev.5 Batch C real infrastructure execution remains bounded to fixed Redfish/IPMI operations and the typed PXE controller state machine.
+for marker in (
+    'INFRASTRUCTURE_RUNTIME_OPERATIONS',
+    'infrastructure_runtime_operation_capable',
+    'infrastructure_runtime_capable',
+    'validate_infrastructure_desired_state',
+    '"redfish": {"inventory.refresh", "power.set", "boot.set", "boot-order.apply", "secure-boot.apply", "sriov.apply", "iommu.apply", "virtual-media.insert", "virtual-media.eject", "bios.apply", "firmware.apply", "storage.volume.apply", "storage.volume.delete"}',
+    '"ipmi": {"power.set", "boot.set"}',
+    '"pxe": {"os.provision", "os.reimage"}',
+):
+    assert marker in operations, marker
+for marker in (
+    'HERMES_INFRASTRUCTURE_EXECUTION_ENABLED',
+    'preconditions.get("executor") != "infrastructure-provider-worker"',
+    'infrastructure state drifted after deterministic preview',
+    'credential_material_returned": False',
+    'arbitrary_cli": False',
+    'arbitrary_shell": False',
+    'execution ticket has already been used',
+    'ComputerSystem.Reset',
+    'BootSourceOverrideTarget',
+    'urllib.request.ProxyHandler({})',
+    'last_reset_time',
+    'boot_progress_time',
+    'VirtualMedia.InsertMedia',
+    'VirtualMedia.EjectMedia',
+    'virtual_media_image_hosts',
+    'WriteProtected',
+    'bios.apply',
+    '@Redfish.Settings',
+    'SettingsObject',
+    'BIOS attribute values must be',
+    'bios_attribute_allowlist',
+    'firmware.apply',
+    'firmware_image_hosts',
+    'firmware_component_allowlist',
+    'storage.volume.apply',
+    'storage.volume.delete',
+    'storage_controller_allowlist',
+    'allow_volume_delete',
+    'Redfish requested physical drive is already bound to another volume',
+    '#UpdateService.SimpleUpdate',
+    'FirmwareInventory',
+    'ImageURI',
+    'HERMES_INFRASTRUCTURE_FIRMWARE_VERIFY_ATTEMPTS',
+    'HERMES_INFRASTRUCTURE_FIRMWARE_VERIFY_DELAY_SECONDS',
+    'HERMES_INFRASTRUCTURE_PLATFORM_VERIFY_ATTEMPTS',
+    'HERMES_INFRASTRUCTURE_PLATFORM_VERIFY_DELAY_SECONDS',
+    'SecureBootCurrentBoot',
+    'SecureBootEnable',
+    'BootOrderPropertySelection',
+    'BootOptionReference',
+    'capabilities.boot_order',
+    'hardware_feature_map',
+    'platform feature runtime lost its exact BIOS settings target',
+    'HERMES_INFRASTRUCTURE_IPMI_TIMEOUT_SECONDS',
+    'ipmi-lanplus',
+    'shutil.which("ipmitool")',
+    'subprocess.run(',
+    'stdin=subprocess.DEVNULL',
+    'shell=False',
+    '"IPMI_PASSWORD": credential["password"]',
+    '"-I", "lanplus"',
+    'IPMI endpoint must use ipmi://host[:port]',
+    'PXE controller must be explicitly bound to the private-offline network scope',
+    'shared-readonly-mirror artifact delivery contract',
+    'PXE artifact supply hash binding mismatch',
+    'artifact escapes the configured mirror root',
+    'PXE completion lacks the required requested-to-complete state history',
+    'bearer-pxe-controller',
+    '"arbitrary_ipxe_script": False',
+    'socket.create_connection',
+):
+    assert marker in infrastructure_runtime, marker
+for forbidden in ('os.system', 'shell=True', 'eval(', 'exec(', 'verify_mode = ssl.CERT_NONE', 'check_hostname = False'):
+    assert forbidden not in infrastructure_runtime, forbidden
+assert '/v1/infrastructure/preview' in provider_agent_main and '/v1/infrastructure/execute' in provider_agent_main
+assert '"/v1/infrastructure/preview"' in cp_main and 'provider_worker.post(' in cp_main
+assert 'provider_worker.post("/v1/infrastructure/execute"' in cp_main
+assert '"proxmox"' in operations and '"vmware-workstation"' in operations
+assert 'Literal["vmware", "vmware-workstation", "proxmox"' in text('control-plane/src/hermes_control_plane/models.py')
+assert 'resolve_pxe_artifact_manifest' in factory
+assert 'pxe_artifact_supply' in factory
+assert 'public_network_required' in factory
+assert 'PXE artifact manifest drifted after planning' in cp_main
+assert 'private-offline network_scope' in cp_main
 
 print("0.5.11-dev.5-source-security: PASS")

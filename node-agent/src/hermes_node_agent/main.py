@@ -8,6 +8,7 @@ from fastapi import FastAPI, Header
 from pydantic import BaseModel, ConfigDict, Field
 
 from . import provider_runtime
+from . import infrastructure_runtime
 
 VERSION = "0.5.11-dev.5"
 app = FastAPI(title="Hermes Node Agent / Cluster Provider Worker", version=VERSION)
@@ -35,7 +36,8 @@ def health() -> dict[str, Any]:
         "node": os.getenv("HERMES_AGENT_NAME", socket.gethostname()),
         "mode": "cluster-provider-worker",
         "execution_enabled": provider_runtime.EXECUTION_ENABLED,
-        "capabilities": ["kubespray", "k3s", "rke2", "cluster-day2", "direct-etcd", "offline-artifact-binding"],
+        "infrastructure_execution_enabled": infrastructure_runtime.EXECUTION_ENABLED,
+        "capabilities": ["kubespray", "k3s", "rke2", "cluster-day2", "direct-etcd", "offline-artifact-binding", "redfish-runtime", "redfish-virtual-media-runtime", "ipmi-lanplus-runtime", "pxe-unattended-runtime"],
         "arbitrary_shell": False,
         "arbitrary_ssh_command": False,
     }
@@ -51,3 +53,15 @@ def provider_preview(payload: ProviderPreviewRequest, authorization: str | None 
 def provider_execute(payload: ProviderExecuteRequest, authorization: str | None = Header(default=None)) -> dict[str, Any]:
     provider_runtime.require_token(authorization)
     return provider_runtime.execute(payload.ticket, payload.signature)
+
+
+@app.post("/v1/infrastructure/preview")
+def infrastructure_preview(payload: ProviderPreviewRequest, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    infrastructure_runtime.require_token(authorization)
+    return infrastructure_runtime.preview(payload.changeset_plan)
+
+
+@app.post("/v1/infrastructure/execute")
+def infrastructure_execute(payload: ProviderExecuteRequest, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    infrastructure_runtime.require_token(authorization)
+    return infrastructure_runtime.execute(payload.ticket, payload.signature)

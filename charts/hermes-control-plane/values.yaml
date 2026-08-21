@@ -75,6 +75,17 @@ nodeAgent:
   executionEnabled: false
   commandTimeout: 1800
   sshProfileSecret: ""
+  infrastructureExecutionEnabled: false
+  infrastructureCredentialSecret: ""
+  infrastructureAllowHttp: false
+  infrastructureRequestTimeoutSeconds: 20
+  infrastructureIpmiTimeoutSeconds: 20
+  infrastructureVerifyAttempts: 5
+  infrastructureVerifyDelaySeconds: 1
+  infrastructureFirmwareVerifyAttempts: 60
+  infrastructureFirmwareVerifyDelaySeconds: 5
+  infrastructurePlatformVerifyAttempts: 90
+  infrastructurePlatformVerifyDelaySeconds: 5
   filesRepoUrl: ""
   aptRepoUrl: ""
   rpmRepoUrl: ""

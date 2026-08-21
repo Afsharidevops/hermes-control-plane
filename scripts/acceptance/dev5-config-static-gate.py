@@ -144,11 +144,27 @@ assert values["controlPlane"]["artifactMirror"]["repositoryMetadataMaxBytes"] ==
 assert services["control-plane"]["environment"]["HERMES_PROVIDER_WORKER_URL"] == "http://node-agent:8810"
 assert "HERMES_PROVIDER_WORKER_TOKEN" in services["control-plane"]["environment"]
 assert services["node-agent"]["environment"]["HERMES_PROVIDER_EXECUTION_ENABLED"] == "${HERMES_PROVIDER_EXECUTION_ENABLED:-false}"
+assert services["node-agent"]["environment"]["HERMES_INFRASTRUCTURE_EXECUTION_ENABLED"] == "${HERMES_INFRASTRUCTURE_EXECUTION_ENABLED:-false}"
+assert services["node-agent"]["environment"]["HERMES_INFRASTRUCTURE_CREDENTIAL_ROOT"] == "/credentials/infrastructure"
+assert services["node-agent"]["environment"]["HERMES_INFRASTRUCTURE_ALLOW_HTTP"] == "${HERMES_INFRASTRUCTURE_ALLOW_HTTP:-false}"
+assert services["node-agent"]["environment"]["HERMES_INFRASTRUCTURE_IPMI_TIMEOUT_SECONDS"] == "${HERMES_INFRASTRUCTURE_IPMI_TIMEOUT_SECONDS:-20}"
+assert services["node-agent"]["environment"]["HERMES_INFRASTRUCTURE_FIRMWARE_VERIFY_ATTEMPTS"] == "${HERMES_INFRASTRUCTURE_FIRMWARE_VERIFY_ATTEMPTS:-60}"
+assert services["node-agent"]["environment"]["HERMES_INFRASTRUCTURE_FIRMWARE_VERIFY_DELAY_SECONDS"] == "${HERMES_INFRASTRUCTURE_FIRMWARE_VERIFY_DELAY_SECONDS:-5}"
+assert services["node-agent"]["environment"]["HERMES_INFRASTRUCTURE_PLATFORM_VERIFY_ATTEMPTS"] == "${HERMES_INFRASTRUCTURE_PLATFORM_VERIFY_ATTEMPTS:-90}"
+assert services["node-agent"]["environment"]["HERMES_INFRASTRUCTURE_PLATFORM_VERIFY_DELAY_SECONDS"] == "${HERMES_INFRASTRUCTURE_PLATFORM_VERIFY_DELAY_SECONDS:-5}"
 assert "HERMES_EXECUTION_HMAC_KEY" in services["node-agent"]["environment"]
 assert "HERMES_PROVIDER_SSH_PROFILE_ROOT" in services["node-agent"]["environment"]
 assert values["nodeAgent"]["enabled"] is False
 assert values["nodeAgent"]["executionEnabled"] is False
 assert values["nodeAgent"]["sshProfileSecret"] == ""
+assert values["nodeAgent"]["infrastructureExecutionEnabled"] is False
+assert values["nodeAgent"]["infrastructureCredentialSecret"] == ""
+assert values["nodeAgent"]["infrastructureAllowHttp"] is False
+assert values["nodeAgent"]["infrastructureIpmiTimeoutSeconds"] == 20
+assert values["nodeAgent"]["infrastructureFirmwareVerifyAttempts"] == 60
+assert values["nodeAgent"]["infrastructureFirmwareVerifyDelaySeconds"] == 5
+assert values["nodeAgent"]["infrastructurePlatformVerifyAttempts"] == 90
+assert values["nodeAgent"]["infrastructurePlatformVerifyDelaySeconds"] == 5
 node_agent_template = (ROOT / "charts/hermes-control-plane/templates/node-agent.yaml").read_text()
 for marker in ("runAsNonRoot: true", "runAsUser: 10022", "runAsGroup: 10022", "fsGroup: 10022", "defaultMode: 0440"):
     assert marker in node_agent_template, marker
@@ -156,6 +172,19 @@ validate_script = (ROOT / "validate.sh").read_text()
 assert 'PYTHONPATH=node-agent/src "$PYTHON_BIN" -m pytest -q node-agent/tests' in validate_script
 assert 'HERMES_PROVIDER_EXECUTION_ENABLED:-false' in (ROOT / "docker-compose.yml").read_text()
 assert 'executionEnabled: false' in (ROOT / "charts/hermes-control-plane/values.yaml").read_text()
+assert 'infrastructureExecutionEnabled: false' in (ROOT / "charts/hermes-control-plane/values.yaml").read_text()
+assert (ROOT / "node-agent/src/hermes_node_agent/infrastructure_runtime.py").is_file()
+node_agent_dockerfile = (ROOT / "node-agent/Dockerfile").read_text()
+assert "openssh-client ca-certificates ipmitool" in node_agent_dockerfile
+node_agent_main = (ROOT / "node-agent/src/hermes_node_agent/main.py").read_text()
+assert "ipmi-lanplus-runtime" in node_agent_main
+assert "pxe-unattended-runtime" in node_agent_main
+assert (ROOT / "node-agent/tests/test_infrastructure_runtime.py").is_file()
+assert (ROOT / "node-agent/tests/test_pxe_runtime.py").is_file()
+assert (ROOT / "control-plane/tests/test_dev5_batch_c_infrastructure_runtime.py").is_file()
+assert (ROOT / "control-plane/tests/test_dev5_batch_c5b_pxe_runtime.py").is_file()
+assert (ROOT / "control-plane/tests/test_dev5_batch_c6_storage_runtime.py").is_file()
+assert (ROOT / "node-agent/tests/test_redfish_storage_runtime.py").is_file()
 
 assert (ROOT / "kubernetes-broker/tests/test_day2_runtime.py").is_file()
 day2_tests = (ROOT / "kubernetes-broker/tests/test_day2_runtime.py").read_text() + (ROOT / "control-plane/tests/test_dev5_day2_runtime.py").read_text()

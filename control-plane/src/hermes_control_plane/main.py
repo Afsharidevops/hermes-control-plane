@@ -374,6 +374,12 @@ def _validate_server_credentials(conn, credential_ref: str, bmc_credential_ref: 
 def _server_snapshot(conn, server_id: str) -> dict[str, Any]:
     row = _get_server(conn, server_id)
     server = _server_dict(row)
+    raw_labels = server.get("labels") if isinstance(server.get("labels"), dict) else {}
+    provisioning_labels = {
+        key: str(raw_labels[key])
+        for key in ("provisioning_mac", "provisioning_nic", "boot_provider_id")
+        if raw_labels.get(key) is not None
+    }
     snapshot = {
         "entity_type": "server",
         "id": server["id"],
@@ -389,6 +395,11 @@ def _server_snapshot(conn, server_id: str) -> dict[str, Any]:
         "status": server["status"],
         "credential_snapshot": _credential_snapshot(conn, server["credential_ref"]),
         "preflight_status": server["preflight_status"],
+        "architecture": server.get("architecture"),
+        "site": server.get("site"),
+        "rack": server.get("rack"),
+        "zone": server.get("zone"),
+        "labels": provisioning_labels,
     }
     snapshot["snapshot_hash"] = sha256_hex(snapshot)
     return snapshot
@@ -3772,6 +3783,21 @@ def _verify_operation_job_authorization(conn, job: Any) -> tuple[Any, dict[str, 
         current = _target_snapshot(conn, target_id)
         if current.get("snapshot_hash") != expected:
             raise HTTPException(status_code=409, detail=f"target drift detected for {target_id}; re-plan and re-approve")
+    provider = typed_plan.get("provider") if isinstance(typed_plan.get("provider"), dict) else {}
+    if provider.get("kind") == "pxe":
+        desired = typed_plan.get("desired_state") if isinstance(typed_plan.get("desired_state"), dict) else {}
+        role_bindings = desired.get("artifacts") if isinstance(desired.get("artifacts"), dict) else {}
+        try:
+            current_manifest = cluster_factory.resolve_pxe_artifact_manifest(
+                role_bindings={str(role): str(artifact_id) for role, artifact_id in role_bindings.items()},
+                artifacts=[_artifact_mirror_item_dict(row) for row in conn.execute("SELECT * FROM artifact_mirror_items ORDER BY id").fetchall()],
+            )
+            current_supply = cluster_factory.pxe_artifact_supply(current_manifest)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=f"PXE artifact manifest drifted or is no longer READY: {exc}") from exc
+        expected_supply = typed_plan.get("artifact_supply") if isinstance(typed_plan.get("artifact_supply"), dict) else {}
+        if current_supply.get("manifest_hash") != expected_supply.get("manifest_hash") or current_supply.get("supply_hash") != expected_supply.get("supply_hash"):
+            raise HTTPException(status_code=409, detail="PXE artifact manifest drifted after planning; re-plan and re-approve")
     approval_ids = _valid_operation_approval_ids(conn, changeset, now=now)
     return changeset, changeset_plan, typed_plan, approval_ids
 
@@ -4087,14 +4113,79 @@ async def plan_operations_intent(payload: OperationsIntentPlanCreate, authorizat
                 raise HTTPException(status_code=422, detail=f"provider kind {provider['kind']} does not match {payload.domain} domain")
             provider_snapshot = _infrastructure_provider_snapshot(conn, payload.provider_id)
             subject_targets: list[dict[str, Any]] = []
-            if payload.target_id:
+            artifact_supply = None
+            if provider["kind"] == "pxe":
+                capabilities = provider.get("capabilities") if isinstance(provider.get("capabilities"), dict) else {}
+                if capabilities.get("network_scope") != "private-offline":
+                    raise HTTPException(status_code=409, detail="PXE controller must declare private-offline network_scope")
+                if capabilities.get("artifact_delivery") != "shared-readonly-mirror":
+                    raise HTTPException(status_code=409, detail="PXE controller must declare shared-readonly-mirror artifact_delivery")
+                if not payload.target_id or not payload.target_id.startswith("srv_"):
+                    raise HTTPException(status_code=422, detail="PXE provisioning requires target_id for a registered server")
+                server_snapshot = _server_snapshot(conn, payload.target_id)
+                labels = server_snapshot.get("labels") if isinstance(server_snapshot.get("labels"), dict) else {}
+                if not server_snapshot.get("provisioning_ip"):
+                    raise HTTPException(status_code=409, detail="PXE target server requires a provisioning_ip")
+                provisioning_mac = str(labels.get("provisioning_mac") or "")
+                provisioning_nic = str(labels.get("provisioning_nic") or "")
+                if not re.fullmatch(r"(?:[0-9a-f]{2}:){5}[0-9a-f]{2}", provisioning_mac):
+                    raise HTTPException(status_code=409, detail="PXE target server requires canonical lowercase provisioning_mac label")
+                if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}", provisioning_nic):
+                    raise HTTPException(status_code=409, detail="PXE target server requires a bounded provisioning_nic label")
+                boot_provider_id = str(labels.get("boot_provider_id") or "")
+                if not boot_provider_id.startswith("ipr_"):
+                    raise HTTPException(status_code=409, detail="PXE target server requires a boot_provider_id label")
+                boot_provider = _infrastructure_provider_dict(_get_infrastructure_provider(conn, boot_provider_id))
+                if boot_provider["kind"] not in {"redfish", "ipmi"} or not operations.infrastructure_runtime_operation_capable(boot_provider["kind"], "boot.set"):
+                    raise HTTPException(status_code=409, detail="PXE boot_provider_id must reference a trusted Redfish/IPMI boot runtime")
+                if boot_provider["status"] != "configured":
+                    raise HTTPException(status_code=409, detail="PXE boot provider is not configured")
+                if payload.operation == "os.reimage" and str(payload.desired_state.get("confirm_server") or "") != server_snapshot["hostname"]:
+                    raise HTTPException(status_code=409, detail="PXE reimage confirmation must exactly match the server hostname")
+                role_bindings = payload.desired_state.get("artifacts") if isinstance(payload.desired_state.get("artifacts"), dict) else {}
+                try:
+                    pxe_manifest = cluster_factory.resolve_pxe_artifact_manifest(
+                        role_bindings={str(role): str(artifact_id) for role, artifact_id in role_bindings.items()},
+                        artifacts=[_artifact_mirror_item_dict(row) for row in conn.execute("SELECT * FROM artifact_mirror_items ORDER BY id").fetchall()],
+                    )
+                    artifact_supply = cluster_factory.pxe_artifact_supply(pxe_manifest)
+                except ValueError as exc:
+                    raise HTTPException(status_code=409, detail=str(exc)) from exc
+                subject_targets.extend([server_snapshot, _infrastructure_provider_snapshot(conn, boot_provider_id)])
+            elif payload.target_id:
                 subject_targets.append(_target_snapshot(conn, payload.target_id))
             try:
-                typed_plan = operations.infrastructure_plan(provider=provider, provider_snapshot=provider_snapshot, operation=payload.operation, subject_targets=subject_targets, desired_state=payload.desired_state)
+                preliminary = operations.infrastructure_plan(
+                    provider=provider, provider_snapshot=provider_snapshot, operation=payload.operation,
+                    subject_targets=subject_targets, desired_state=payload.desired_state, runtime_preview=None,
+                    artifact_supply=artifact_supply,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            runtime_preview = None
+            executor = f"{provider['kind']}-provider-worker"
+            if operations.infrastructure_runtime_operation_capable(provider["kind"], payload.operation):
+                runtime_preview = await provider_worker.post(
+                    "/v1/infrastructure/preview", {"changeset_plan": {"parameters": {"typed_plan": preliminary}}}
+                )
+                _validate_credential_metadata(runtime_preview)
+                if (runtime_preview.get("secret_output_suppressed") is not True
+                        or runtime_preview.get("credential_material_returned") is not False
+                        or runtime_preview.get("arbitrary_cli") is not False
+                        or runtime_preview.get("arbitrary_shell") is not False
+                        or runtime_preview.get("active_probe") is not True):
+                    raise HTTPException(status_code=502, detail="infrastructure provider worker returned an unsafe runtime preview")
+                executor = "infrastructure-provider-worker"
+            try:
+                typed_plan = operations.infrastructure_plan(
+                    provider=provider, provider_snapshot=provider_snapshot, operation=payload.operation,
+                    subject_targets=subject_targets, desired_state=payload.desired_state, runtime_preview=runtime_preview,
+                    artifact_supply=artifact_supply,
+                )
             except ValueError as exc:
                 raise HTTPException(status_code=422, detail=str(exc)) from exc
             adapter = {"cloud": "cloud", "bare-metal": "bare-metal", "network": "network"}[payload.domain]
-            result = _plan_mutation(conn, typed_plan=typed_plan, target_id=payload.provider_id, subject_type="provider", subject_id=payload.provider_id, requested_by=payload.requested_by, source_channel=payload.source_channel, adapter=adapter, ttl_seconds=payload.ttl_seconds, executor=f"{provider['kind']}-provider-worker")
+            result = _plan_mutation(conn, typed_plan=typed_plan, target_id=payload.provider_id, subject_type="provider", subject_id=payload.provider_id, requested_by=payload.requested_by, source_channel=payload.source_channel, adapter=adapter, ttl_seconds=payload.ttl_seconds, executor=executor)
         elif payload.domain == "artifact":
             if not payload.target_id or not payload.target_id.startswith("art_"):
                 raise HTTPException(status_code=422, detail="artifact intent requires target_id for an artifact mirror item")
@@ -4188,7 +4279,7 @@ async def execute_operation_job(job_id: str, payload: OperationJobExecute, autho
             raise HTTPException(status_code=404, detail="operation job not found")
         if job["state"] != "READY":
             raise HTTPException(status_code=409, detail="operation job must be READY before trusted execution")
-        if job["executor"] not in {"kubernetes-broker", "artifact-mirror-worker", "cluster-provider-worker"}:
+        if job["executor"] not in {"kubernetes-broker", "artifact-mirror-worker", "cluster-provider-worker", "infrastructure-provider-worker"}:
             raise HTTPException(status_code=422, detail="operation job does not have a trusted runtime executor")
         changeset, _, typed_plan, current_approval_ids = _verify_operation_job_authorization(conn, job)
         ticket_auth = _verify_operation_job_ticket(conn, job, payload.execution_ticket, payload.signature, require_fresh=True)
@@ -4200,6 +4291,8 @@ async def execute_operation_job(job_id: str, payload: OperationJobExecute, autho
             raise HTTPException(status_code=422, detail="typed operation is not supported by the trusted artifact mirror runtime")
         if job["executor"] == "cluster-provider-worker" and not operations.provider_day2_runtime_capable(str(typed_plan.get("operation") or "")):
             raise HTTPException(status_code=422, detail="typed operation is not supported by the trusted cluster provider runtime")
+        if job["executor"] == "infrastructure-provider-worker" and not operations.infrastructure_runtime_capable(typed_plan):
+            raise HTTPException(status_code=422, detail="typed operation is not supported by the trusted infrastructure provider runtime")
         now = int(time.time())
         if current_approval_ids:
             placeholders = ",".join("?" for _ in current_approval_ids)
@@ -4221,6 +4314,8 @@ async def execute_operation_job(job_id: str, payload: OperationJobExecute, autho
             runtime_result = await kubernetes_broker.post("/v1/day2/execute", {"ticket": payload.execution_ticket, "signature": payload.signature})
         elif executor == "cluster-provider-worker":
             runtime_result = await provider_worker.post("/v1/provider/execute", {"ticket": payload.execution_ticket, "signature": payload.signature})
+        elif executor == "infrastructure-provider-worker":
+            runtime_result = await provider_worker.post("/v1/infrastructure/execute", {"ticket": payload.execution_ticket, "signature": payload.signature})
         else:
             runtime_result = await asyncio.to_thread(artifact_mirror.execute, typed_plan)
         _validate_credential_metadata(runtime_result)
@@ -4262,6 +4357,8 @@ async def execute_operation_job(job_id: str, payload: OperationJobExecute, autho
         response["broker_result"] = runtime_result
     elif executor == "cluster-provider-worker":
         response["provider_worker_result"] = runtime_result
+    elif executor == "infrastructure-provider-worker":
+        response["infrastructure_worker_result"] = runtime_result
     return response
 
 

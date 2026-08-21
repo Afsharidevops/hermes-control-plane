@@ -31,6 +31,17 @@ spec:
             - {name: HERMES_PROVIDER_EXECUTION_ENABLED, value: {{ .Values.nodeAgent.executionEnabled | quote }}}
             - {name: HERMES_PROVIDER_COMMAND_TIMEOUT, value: {{ .Values.nodeAgent.commandTimeout | quote }}}
             - {name: HERMES_PROVIDER_SSH_PROFILE_ROOT, value: /credentials/ssh}
+            - {name: HERMES_INFRASTRUCTURE_EXECUTION_ENABLED, value: {{ .Values.nodeAgent.infrastructureExecutionEnabled | quote }}}
+            - {name: HERMES_INFRASTRUCTURE_CREDENTIAL_ROOT, value: /credentials/infrastructure}
+            - {name: HERMES_INFRASTRUCTURE_ALLOW_HTTP, value: {{ .Values.nodeAgent.infrastructureAllowHttp | quote }}}
+            - {name: HERMES_INFRASTRUCTURE_REQUEST_TIMEOUT_SECONDS, value: {{ .Values.nodeAgent.infrastructureRequestTimeoutSeconds | quote }}}
+            - {name: HERMES_INFRASTRUCTURE_IPMI_TIMEOUT_SECONDS, value: {{ .Values.nodeAgent.infrastructureIpmiTimeoutSeconds | quote }}}
+            - {name: HERMES_INFRASTRUCTURE_VERIFY_ATTEMPTS, value: {{ .Values.nodeAgent.infrastructureVerifyAttempts | quote }}}
+            - {name: HERMES_INFRASTRUCTURE_VERIFY_DELAY_SECONDS, value: {{ .Values.nodeAgent.infrastructureVerifyDelaySeconds | quote }}}
+            - {name: HERMES_INFRASTRUCTURE_FIRMWARE_VERIFY_ATTEMPTS, value: {{ .Values.nodeAgent.infrastructureFirmwareVerifyAttempts | quote }}}
+            - {name: HERMES_INFRASTRUCTURE_FIRMWARE_VERIFY_DELAY_SECONDS, value: {{ .Values.nodeAgent.infrastructureFirmwareVerifyDelaySeconds | quote }}}
+            - {name: HERMES_INFRASTRUCTURE_PLATFORM_VERIFY_ATTEMPTS, value: {{ .Values.nodeAgent.infrastructurePlatformVerifyAttempts | quote }}}
+            - {name: HERMES_INFRASTRUCTURE_PLATFORM_VERIFY_DELAY_SECONDS, value: {{ .Values.nodeAgent.infrastructurePlatformVerifyDelaySeconds | quote }}}
             - {name: HERMES_PROVIDER_WORK_ROOT, value: /var/lib/hermes-provider}
             - {name: HERMES_ARTIFACT_MIRROR_ROOT, value: /data/artifact-mirror}
             - {name: HERMES_PROVIDER_FILES_REPO_URL, value: {{ .Values.nodeAgent.filesRepoUrl | quote }}}
@@ -49,6 +60,9 @@ spec:
             {{- if .Values.nodeAgent.sshProfileSecret }}
             - {name: ssh-profiles, mountPath: /credentials/ssh, readOnly: true}
             {{- end }}
+            {{- if .Values.nodeAgent.infrastructureCredentialSecret }}
+            - {name: infrastructure-credentials, mountPath: /credentials/infrastructure, readOnly: true}
+            {{- end }}
           readinessProbe: {httpGet: {path: /health, port: http}, initialDelaySeconds: 3, periodSeconds: 10}
       volumes:
         - name: work
@@ -62,6 +76,12 @@ spec:
         - name: ssh-profiles
           secret:
             secretName: {{ .Values.nodeAgent.sshProfileSecret | quote }}
+            defaultMode: 0440
+        {{- end }}
+        {{- if .Values.nodeAgent.infrastructureCredentialSecret }}
+        - name: infrastructure-credentials
+          secret:
+            secretName: {{ .Values.nodeAgent.infrastructureCredentialSecret | quote }}
             defaultMode: 0440
         {{- end }}
 ---
