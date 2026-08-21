@@ -400,4 +400,18 @@ This is intentionally **Git release archive synchronization**, not full reposito
 
 Before publication, Hermes opens the gzip tarball without filesystem extraction, rejects absolute/traversal/duplicate paths and link/device members, requires root `MANIFEST.json` and `FILES.json`, binds `collection_info.namespace/name/version` to the approved plan, verifies the MANIFEST -> FILES SHA-256 binding, and verifies every regular file listed in `FILES.json`. Publication remains atomic, independently destination-hashed and idempotent.
 
-This is intentionally exact collection-artifact synchronization, not a Galaxy catalog/server. Standalone role archives, dependency discovery from Galaxy APIs, signatures, apt/yum/dnf/Python repository metadata, and actual Kubespray/K3s/RKE2 provider-worker offline consumption/rewrite remain open. This continuation is not a completed dev.5 slice until it has its own forward-only commit, push and exact-SHA `validate` success.
+This is intentionally exact collection-artifact synchronization, not a Galaxy API/server. Standalone role source archives, where required, are supplied by the bounded exact-tag `git-release` runtime and can be cataloged/bound through existing artifact labels; arbitrary Git history/submodules are not claimed. Collection dependency discovery from Galaxy APIs, signatures, apt/yum/dnf/Python repository metadata, and actual Kubespray/K3s/RKE2 provider-worker offline consumption/rewrite remain separate boundaries. This continuation is not a completed dev.5 slice until it has its own forward-only commit, push and exact-SHA `validate` success.
+
+## 0.5.11-dev.5 Batch A — repository substrate + CI publication efficiency
+
+The Ansible collection slice is committed/pushed and exact-SHA `validate` is green at `26855cbb6f45176ee99029cdbc29b7c847ae79b6` (run `32478857268`).
+
+Batch A is intentionally merged as one larger closure unit. It removes `dev/**` from `publish-images.yml` while preserving `validate.yml` on `dev/**`, so future development pushes keep the exact-SHA branch gate without rebuilding/publishing seven Docker images. Tag/main/manual publication remains available.
+
+The artifact runtime adds typed repository snapshot kinds `apt-repository`, `rpm-repository` and `python-repository`. A repository snapshot is a digest-pinned tar archive containing `HERMES-REPOSITORY-SNAPSHOT.json`; archive paths/links/devices are rejected and the exact file inventory, sizes and SHA-256 values are verified before native repository validation.
+
+APT requires detached GPG verification of `dists/<distribution>/Release.gpg`, SHA-256 binding of supported `Packages` indexes from `Release`, and exact `.deb` size/SHA-256 verification from package stanzas. RPM requires detached GPG verification of `repodata/repomd.xml.asc`, SHA-256 verification of referenced repodata, primary metadata parsing, and exact `.rpm` hash/size verification. Python requires local PEP-503-compatible Simple pages whose distribution links carry exact `#sha256=` fragments; every wheel/sdist in the snapshot must be referenced.
+
+HTTPS credentials and repository keyrings are trusted environment-mounted files below `HERMES_ARTIFACT_AUTH_ROOT`; raw content is never copied into plans, audit or evidence. Publication uses a staging directory plus rollback-safe rename, so partial extraction never becomes the active mirror.
+
+This closes the intended package-repository substrate for Batch A only after its forward-only commit/push/exact-SHA CI. It does not claim that Kubespray/K3s/RKE2 have consumed or rewritten these references yet.

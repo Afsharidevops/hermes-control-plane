@@ -180,7 +180,7 @@ def test_operations_center_contract_covers_compressed_dev4_scope(client: TestCli
     assert set(contract["cloud_virtualization"]) == {"vmware", "openstack", "aws", "azure", "gcp"}
     assert {"redfish", "ipmi", "pxe"}.issubset(contract["bare_metal"])
     assert contract["network"]["network-switch"]["arbitrary_cli"] is False
-    assert set(contract["artifact_kinds"]) == {"oci-image", "helm-chart", "package", "git-release", "ansible-collection"}
+    assert set(contract["artifact_kinds"]) == {"oci-image", "helm-chart", "package", "git-release", "ansible-collection", "apt-repository", "rpm-repository", "python-repository"}
     assert "cluster.worker.replace" in contract["day2_operations"]
     assert "cluster.disaster-recovery" in contract["day2_operations"]
     assert "baseline-security" in contract["verification_checks"]

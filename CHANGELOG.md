@@ -147,3 +147,5 @@
 - dev.5 scope closure: add CRITICAL two-approval explicit-namespace Velero Restore runtime with exact source/restore drift binding, fixed non-destructive Restore CR execution, PV permission gating and active terminal verification.
 
 - dev.5 scope closure: add exact-preview-bound Velero Schedule create/update runtime with bounded hourly-or-slower cron, fixed Backup template fields, namespace authorization, unsupported-field rejection and active validation/spec verification.
+
+- 0.5.11-dev.5 Batch A: stop Docker image publication on normal `dev/**` pushes while retaining exact-SHA `validate`; add typed signed APT/RPM and hash-bound Python repository snapshot runtimes with atomic directory publication, trusted environment-mounted HTTPS auth/keyring delivery, bounded retry/timeout/idempotency and partial-sync rollback.

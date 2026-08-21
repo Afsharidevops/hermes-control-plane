@@ -46,15 +46,26 @@ spec:
             - {name: HERMES_ARTIFACT_SOURCE_ROOT, value: /data/artifact-source}
             - {name: HERMES_ARTIFACT_MIRROR_ROOT, value: /data/artifact-mirror}
             - {name: HERMES_ARTIFACT_HTTPS_HOST_ALLOWLIST, value: {{ .Values.controlPlane.artifactMirror.httpsHostAllowlist | quote }}}
+            - {name: HERMES_ARTIFACT_AUTH_ROOT, value: /run/secrets/hermes-artifact-auth}
+            - {name: HERMES_ARTIFACT_HTTPS_AUTHFILE, value: {{ .Values.controlPlane.artifactMirror.httpsAuthFile | quote }}}
+            - {name: HERMES_ARTIFACT_REPOSITORY_KEYRING, value: {{ .Values.controlPlane.artifactMirror.repositoryKeyringFile | quote }}}
             - {name: HERMES_ARTIFACT_OCI_SOURCE_REGISTRY_ALLOWLIST, value: {{ .Values.controlPlane.artifactMirror.ociSourceRegistryAllowlist | quote }}}
             - {name: HERMES_ARTIFACT_OCI_DESTINATION_REGISTRY_ALLOWLIST, value: {{ .Values.controlPlane.artifactMirror.ociDestinationRegistryAllowlist | quote }}}
+            - {name: HERMES_ARTIFACT_OCI_SOURCE_AUTHFILE, value: {{ .Values.controlPlane.artifactMirror.ociSourceAuthFile | quote }}}
+            - {name: HERMES_ARTIFACT_OCI_DESTINATION_AUTHFILE, value: {{ .Values.controlPlane.artifactMirror.ociDestinationAuthFile | quote }}}
             - {name: HERMES_ARTIFACT_MIRROR_MAX_BYTES, value: {{ .Values.controlPlane.artifactMirror.maxBytes | quote }}}
             - {name: HERMES_ARTIFACT_MIRROR_TIMEOUT_SECONDS, value: {{ .Values.controlPlane.artifactMirror.timeoutSeconds | quote }}}
+            - {name: HERMES_ARTIFACT_REPOSITORY_MAX_EXPANDED_BYTES, value: {{ .Values.controlPlane.artifactMirror.repositoryMaxExpandedBytes | quote }}}
+            - {name: HERMES_ARTIFACT_REPOSITORY_METADATA_MAX_BYTES, value: {{ .Values.controlPlane.artifactMirror.repositoryMetadataMaxBytes | quote }}}
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities: {drop: ["ALL"]}
-          volumeMounts: [{name: data, mountPath: /data}]
+          volumeMounts:
+            - {name: data, mountPath: /data}
+            {{ if .Values.controlPlane.artifactMirror.authSecretName }}
+            - {name: artifact-auth, mountPath: /run/secrets/hermes-artifact-auth, readOnly: true}
+            {{ end }}
           readinessProbe: {httpGet: {path: /health, port: http}, initialDelaySeconds: 3, periodSeconds: 10}
       volumes:
         - name: data
@@ -64,6 +75,11 @@ spec:
           {{- else }}
           emptyDir: {}
           {{- end }}
+        {{ if .Values.controlPlane.artifactMirror.authSecretName }}
+        - name: artifact-auth
+          secret:
+            secretName: {{ .Values.controlPlane.artifactMirror.authSecretName | quote }}
+        {{ end }}
 ---
 apiVersion: v1
 kind: Service

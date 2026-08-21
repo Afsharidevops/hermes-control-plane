@@ -8,12 +8,20 @@ import subprocess
 import tempfile
 import time
 import tarfile
+import shutil
 import urllib.error
 import urllib.request
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO
 from urllib.parse import unquote, urlparse
 import re
+
+from .repository_snapshot import (
+    REPOSITORY_KINDS,
+    RepositorySnapshotError,
+    extract_snapshot_archive,
+    validate_repository_tree,
+)
 
 
 class ArtifactMirrorError(RuntimeError):
@@ -90,6 +98,115 @@ def _authfile_path(*, destination: bool) -> str | None:
     if not resolved.is_file() or resolved.is_symlink():
         raise ArtifactMirrorError(f"{env} must reference a regular non-symlink file")
     return str(resolved)
+
+
+
+def _trusted_secret_file(env: str, *, purpose: str, required: bool = False) -> Path | None:
+    raw = os.getenv(env, "").strip()
+    if not raw:
+        if required:
+            raise ArtifactMirrorError(f"{env} is required for {purpose}")
+        return None
+    auth_root = Path(os.getenv("HERMES_ARTIFACT_AUTH_ROOT", "/run/secrets/hermes-artifact-auth")).expanduser().resolve(strict=False)
+    if not auth_root.is_dir() or auth_root.is_symlink():
+        raise ArtifactMirrorError("HERMES_ARTIFACT_AUTH_ROOT must be an existing non-symlink directory")
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        raise ArtifactMirrorError(f"{env} must be an absolute path")
+    resolved = path.resolve(strict=False)
+    try:
+        resolved.relative_to(auth_root)
+    except ValueError as exc:
+        raise ArtifactMirrorError(f"{env} escapes HERMES_ARTIFACT_AUTH_ROOT") from exc
+    if not resolved.is_file() or resolved.is_symlink():
+        raise ArtifactMirrorError(f"{env} must reference a regular non-symlink file")
+    return resolved
+
+
+def _https_authorization_header(uri: str) -> str | None:
+    path = _trusted_secret_file("HERMES_ARTIFACT_HTTPS_AUTHFILE", purpose="authenticated HTTPS artifact access")
+    if path is None:
+        return None
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ArtifactMirrorError("HERMES_ARTIFACT_HTTPS_AUTHFILE must contain valid JSON") from exc
+    if not isinstance(doc, dict):
+        raise ArtifactMirrorError("HERMES_ARTIFACT_HTTPS_AUTHFILE must contain a host-to-authorization object")
+    parsed = urlparse(uri)
+    hostname = (parsed.hostname or "").lower().rstrip(".")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ArtifactMirrorError("artifact HTTPS source contains an invalid port") from exc
+    host_key = hostname if port is None else f"{hostname}:{port}"
+    value = doc.get(host_key, doc.get(hostname))
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        value = value.get("authorization")
+    if not isinstance(value, str) or not value or len(value) > 8192 or "\r" in value or "\n" in value:
+        raise ArtifactMirrorError("artifact HTTPS authorization entry is invalid")
+    return value
+
+
+def _repository_keyring() -> Path:
+    path = _trusted_secret_file(
+        "HERMES_ARTIFACT_REPOSITORY_KEYRING",
+        purpose="signed repository metadata verification",
+        required=True,
+    )
+    assert path is not None
+    return path
+
+
+def _gpgv_binary() -> str:
+    binary = os.getenv("HERMES_GPGV_BINARY", "gpgv").strip()
+    if not binary or "/" in binary or binary != "gpgv":
+        raise ArtifactMirrorError("HERMES_GPGV_BINARY must be the pinned command name gpgv")
+    return binary
+
+
+def _verify_repository_signature(data_path: Path, signature_path: Path) -> None:
+    command = [_gpgv_binary(), "--keyring", str(_repository_keyring()), str(signature_path), str(data_path)]
+    try:
+        completed = subprocess.run(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=_timeout_seconds(),
+            check=False,
+            env={**os.environ, "LC_ALL": "C", "GNUPGHOME": "/nonexistent"},
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise ArtifactMirrorError("repository signature verification timed out") from exc
+    except OSError as exc:
+        raise ArtifactMirrorError(f"repository signature verifier failed to start: {type(exc).__name__}") from exc
+    if completed.returncode != 0:
+        raise ArtifactMirrorError(f"repository signature verification failed with exit code {completed.returncode}")
+
+
+def _repository_max_expanded_bytes() -> int:
+    raw = os.getenv("HERMES_ARTIFACT_REPOSITORY_MAX_EXPANDED_BYTES", str(4 * 1024 * 1024 * 1024))
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ArtifactMirrorError("HERMES_ARTIFACT_REPOSITORY_MAX_EXPANDED_BYTES must be an integer") from exc
+    if value < 1 or value > 64 * 1024 * 1024 * 1024:
+        raise ArtifactMirrorError("repository snapshot expanded-byte limit must be between 1 and 68719476736")
+    return value
+
+
+def _repository_metadata_limit() -> int:
+    raw = os.getenv("HERMES_ARTIFACT_REPOSITORY_METADATA_MAX_BYTES", str(256 * 1024 * 1024))
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ArtifactMirrorError("HERMES_ARTIFACT_REPOSITORY_METADATA_MAX_BYTES must be an integer") from exc
+    if value < 1024 or value > 1024 * 1024 * 1024:
+        raise ArtifactMirrorError("repository metadata byte limit must be between 1024 and 1073741824")
+    return value
 
 
 def _skopeo_binary() -> str:
@@ -724,6 +841,176 @@ def _execute_ansible_collection(typed_plan: dict[str, Any], artifact: dict[str, 
         return {"schema_version": 1, "artifact_id": artifact_id, "state": "FAILED", "verification": {"observed_at": observed_at, "checks": checks, "evidence": base_evidence}}
 
 
+
+def _repository_marker(destination_path: Path) -> Path:
+    return destination_path / ".hermes-repository-snapshot.json"
+
+
+def _write_repository_marker(destination_path: Path, *, artifact: dict[str, Any], digest: str, evidence: dict[str, Any]) -> None:
+    marker = {
+        "schema_version": 1,
+        "kind": str(artifact.get("kind") or ""),
+        "repository_id": str((artifact.get("labels") or {}).get("repository_id") or ""),
+        "version": str(artifact.get("version") or ""),
+        "source_digest": digest,
+        "snapshot_manifest_sha256": str(evidence.get("snapshot_manifest_sha256") or ""),
+    }
+    _repository_marker(destination_path).write_text(json.dumps(marker, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+
+
+def _read_repository_marker(destination_path: Path) -> dict[str, Any] | None:
+    marker_path = _repository_marker(destination_path)
+    if not marker_path.is_file() or marker_path.is_symlink():
+        return None
+    try:
+        doc = json.loads(marker_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return doc if isinstance(doc, dict) else None
+
+
+def _execute_repository_snapshot(typed_plan: dict[str, Any], artifact: dict[str, Any], expected: str, observed_at: int) -> dict[str, Any]:
+    artifact_id = str(artifact.get("id") or "")
+    source = str(artifact.get("source") or "")
+    destination = str(artifact.get("destination") or "")
+    kind = str(artifact.get("kind") or "")
+    capability = runtime_capability(source, destination, kind=kind)
+    base_evidence: dict[str, Any] = {
+        "source_scheme": capability["source_scheme"],
+        "destination_scheme": capability["destination_scheme"],
+        "artifact_kind": kind,
+        "transport": "signed-repository-snapshot",
+        "arbitrary_shell": False,
+        "raw_credentials_returned": False,
+        "credentials_in_plan": False,
+        "credential_delivery": "trusted-environment-authfile-only",
+        "redirects_followed": False,
+        "network_attempt_limit": 2 if capability["source_scheme"] == "https" else 0,
+        "partial_sync_recovery": "atomic-staging-with-rollback",
+    }
+    try:
+        max_bytes = _max_bytes()
+        metadata_limit = _repository_metadata_limit()
+        expanded_limit = _repository_max_expanded_bytes()
+        source_root = _root("HERMES_ARTIFACT_SOURCE_ROOT", "/data/artifact-source")
+        mirror_root = _root("HERMES_ARTIFACT_MIRROR_ROOT", "/data/artifact-mirror")
+        destination_path = _file_uri_path(destination, root=mirror_root, purpose=f"{kind} destination")
+        destination_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if destination_path.exists():
+            if not destination_path.is_dir() or destination_path.is_symlink():
+                checks = [_failure("destination-tree", "existing repository destination is not a regular directory")]
+                return {"schema_version": 1, "artifact_id": artifact_id, "state": "FAILED", "verification": {"observed_at": observed_at, "checks": checks, "evidence": base_evidence}}
+            marker = _read_repository_marker(destination_path)
+            if marker and marker.get("source_digest") == expected and marker.get("kind") == kind:
+                try:
+                    repository_evidence = validate_repository_tree(
+                        destination_path,
+                        artifact,
+                        verify_signature=_verify_repository_signature,
+                        metadata_limit=metadata_limit,
+                    )
+                except RepositorySnapshotError as exc:
+                    checks = [_failure("destination-tree", f"existing repository snapshot failed validation: {exc}")]
+                    return {"schema_version": 1, "artifact_id": artifact_id, "state": "FAILED", "verification": {"observed_at": observed_at, "checks": checks, "evidence": base_evidence}}
+                checks = [
+                    {"id": "source-digest", "status": "SKIP", "summary": "destination already contains the exact pinned repository snapshot", "evidence": {"reason": "idempotent-hit", "digest": expected}},
+                    {"id": "repository-metadata", "status": "PASS", "summary": "existing repository metadata and package/distribution hashes verify", "evidence": repository_evidence},
+                    {"id": "destination-tree", "status": "PASS", "summary": "existing repository tree is bound to the pinned snapshot digest", "evidence": {"source_digest": expected}},
+                ]
+                return {"schema_version": 1, "artifact_id": artifact_id, "state": "ALREADY_MIRRORED", "digest": expected, "verification": {"observed_at": observed_at, "checks": checks, "evidence": {**base_evidence, **repository_evidence, "idempotent": True, "atomic_replace": False}}}
+            if not bool((typed_plan.get("parameters") or {}).get("replace_existing", False)):
+                checks = [_failure("destination-tree", "existing repository destination is not the approved snapshot and replace_existing is false")]
+                return {"schema_version": 1, "artifact_id": artifact_id, "state": "FAILED", "verification": {"observed_at": observed_at, "checks": checks, "evidence": base_evidence}}
+
+        archive_path: Path | None = None
+        staging_container: Path | None = None
+        backup_path: Path | None = None
+        source_digest = ""
+        source_bytes = 0
+        repository_evidence: dict[str, Any] = {}
+        try:
+            with tempfile.NamedTemporaryFile(prefix=".hermes-repository-source-", suffix=".tar", dir=destination_path.parent, delete=False) as temp:
+                archive_path = Path(temp.name)
+                if capability["source_scheme"] == "file":
+                    source_path = _file_uri_path(source, root=source_root, purpose=f"{kind} source")
+                    if not source_path.is_file():
+                        raise ArtifactMirrorError("repository snapshot source file does not exist")
+                    with source_path.open("rb") as src:
+                        source_digest, source_bytes = _copy_stream(src, temp, max_bytes=max_bytes)
+                else:
+                    with _open_https(source) as src:
+                        source_digest, source_bytes = _copy_stream(src, temp, max_bytes=max_bytes)
+            if source_digest != expected:
+                checks = [_failure("source-digest", "repository snapshot source does not match the pinned SHA-256 digest", evidence={"observed_digest": source_digest, "bytes": source_bytes})]
+                return {"schema_version": 1, "artifact_id": artifact_id, "state": "FAILED", "verification": {"observed_at": observed_at, "checks": checks, "evidence": base_evidence}}
+
+            staging_container = Path(tempfile.mkdtemp(prefix=".hermes-repository-stage-", dir=destination_path.parent))
+            staging_root = staging_container / "snapshot"
+            archive_evidence = extract_snapshot_archive(
+                archive_path,
+                staging_root,
+                artifact,
+                max_expanded_bytes=expanded_limit,
+            )
+            repository_evidence = validate_repository_tree(
+                staging_root,
+                artifact,
+                verify_signature=_verify_repository_signature,
+                metadata_limit=metadata_limit,
+            )
+            repository_evidence = {**archive_evidence, **repository_evidence}
+            _write_repository_marker(staging_root, artifact=artifact, digest=expected, evidence=repository_evidence)
+
+            if destination_path.exists():
+                backup_path = Path(tempfile.mkdtemp(prefix=".hermes-repository-backup-", dir=destination_path.parent))
+                backup_path.rmdir()
+                os.replace(destination_path, backup_path)
+            try:
+                os.replace(staging_root, destination_path)
+            except Exception:
+                if backup_path is not None and backup_path.exists() and not destination_path.exists():
+                    os.replace(backup_path, destination_path)
+                    backup_path = None
+                raise
+            if backup_path is not None and backup_path.exists():
+                shutil.rmtree(backup_path)
+                backup_path = None
+        finally:
+            if archive_path is not None:
+                archive_path.unlink(missing_ok=True)
+            if staging_container is not None and staging_container.exists():
+                shutil.rmtree(staging_container)
+            if backup_path is not None and backup_path.exists():
+                if not destination_path.exists():
+                    os.replace(backup_path, destination_path)
+                else:
+                    shutil.rmtree(backup_path)
+
+        destination_evidence = validate_repository_tree(
+            destination_path,
+            artifact,
+            verify_signature=_verify_repository_signature,
+            metadata_limit=metadata_limit,
+        )
+        marker = _read_repository_marker(destination_path)
+        if not marker or marker.get("source_digest") != expected:
+            checks = [_failure("destination-tree", "published repository snapshot marker does not match the pinned source digest")]
+            return {"schema_version": 1, "artifact_id": artifact_id, "state": "FAILED", "verification": {"observed_at": observed_at, "checks": checks, "evidence": base_evidence}}
+        checks = [
+            {"id": "source-digest", "status": "PASS", "summary": "repository snapshot source archive matches the pinned SHA-256 digest", "evidence": {"digest": source_digest, "bytes": source_bytes}},
+            {"id": "repository-metadata", "status": "PASS", "summary": "repository metadata, signatures/hashes and referenced payloads verify", "evidence": repository_evidence},
+            {"id": "destination-tree", "status": "PASS", "summary": "repository snapshot was published atomically and revalidated from the destination tree", "evidence": {"source_digest": expected, **destination_evidence}},
+        ]
+        return {"schema_version": 1, "artifact_id": artifact_id, "state": "MIRRORED", "bytes": source_bytes, "digest": expected, "verification": {"observed_at": observed_at, "checks": checks, "evidence": {**base_evidence, **destination_evidence, "idempotent": False, "atomic_replace": True}}}
+    except (ArtifactMirrorError, RepositorySnapshotError) as exc:
+        checks = [_failure("artifact-mirror-runtime", str(exc), evidence={"error_type": type(exc).__name__})]
+        return {"schema_version": 1, "artifact_id": artifact_id, "state": "FAILED", "verification": {"observed_at": observed_at, "checks": checks, "evidence": base_evidence}}
+    except OSError as exc:
+        checks = [_failure("artifact-mirror-runtime", f"repository snapshot mirror I/O failed: {type(exc).__name__}", evidence={"error_type": type(exc).__name__})]
+        return {"schema_version": 1, "artifact_id": artifact_id, "state": "FAILED", "verification": {"observed_at": observed_at, "checks": checks, "evidence": base_evidence}}
+
+
 def _max_bytes() -> int:
     raw = os.getenv("HERMES_ARTIFACT_MIRROR_MAX_BYTES", str(512 * 1024 * 1024))
     try:
@@ -832,23 +1119,36 @@ def _copy_stream(source: BinaryIO, destination: BinaryIO, *, max_bytes: int) -> 
 def _open_https(uri: str):  # noqa: ANN202
     _validate_https_source(uri)
     opener = urllib.request.build_opener(_NoRedirect())
-    request = urllib.request.Request(uri, method="GET", headers={"User-Agent": "Hermes-Artifact-Mirror/0.5.11-dev.5"})
-    try:
-        response = opener.open(request, timeout=_timeout_seconds())
-    except ArtifactMirrorError:
-        raise
-    except (urllib.error.URLError, OSError, socket.timeout) as exc:
-        raise ArtifactMirrorError(f"artifact HTTPS fetch failed: {type(exc).__name__}") from exc
-    length = response.headers.get("Content-Length")
-    if length:
+    headers = {"User-Agent": "Hermes-Artifact-Mirror/0.5.11-dev.5"}
+    authorization = _https_authorization_header(uri)
+    if authorization is not None:
+        headers["Authorization"] = authorization
+    request = urllib.request.Request(uri, method="GET", headers=headers)
+    last_error: Exception | None = None
+    for attempt in range(1, 3):
         try:
-            if int(length) > _max_bytes():
-                response.close()
-                raise ArtifactMirrorError("artifact exceeds configured byte limit")
-        except ValueError:
-            response.close()
-            raise ArtifactMirrorError("invalid artifact Content-Length")
-    return response
+            response = opener.open(request, timeout=_timeout_seconds())
+            length = response.headers.get("Content-Length")
+            if length:
+                try:
+                    if int(length) > _max_bytes():
+                        response.close()
+                        raise ArtifactMirrorError("artifact exceeds configured byte limit")
+                except ValueError:
+                    response.close()
+                    raise ArtifactMirrorError("invalid artifact Content-Length")
+            return response
+        except ArtifactMirrorError:
+            raise
+        except urllib.error.HTTPError as exc:
+            last_error = exc
+            if exc.code < 500 or attempt == 2:
+                raise ArtifactMirrorError(f"artifact HTTPS fetch failed: HTTP {exc.code}") from exc
+        except (urllib.error.URLError, OSError, socket.timeout) as exc:
+            last_error = exc
+            if attempt == 2:
+                raise ArtifactMirrorError(f"artifact HTTPS fetch failed: {type(exc).__name__}") from exc
+    raise ArtifactMirrorError(f"artifact HTTPS fetch failed: {type(last_error).__name__ if last_error else 'unknown'}")
 
 
 def runtime_capability(source: str, destination: str, *, kind: str = "") -> dict[str, Any]:
@@ -856,17 +1156,19 @@ def runtime_capability(source: str, destination: str, *, kind: str = "") -> dict
     destination_scheme = urlparse(destination).scheme.lower()
     git_release_capable = kind == "git-release" and source_scheme == "https" and destination_scheme == "file"
     ansible_collection_capable = kind == "ansible-collection" and source_scheme in {"file", "https"} and destination_scheme == "file"
-    blob_capable = source_scheme in {"file", "https"} and destination_scheme == "file" and not git_release_capable and not ansible_collection_capable
+    repository_capable = kind in REPOSITORY_KINDS and source_scheme in {"file", "https"} and destination_scheme == "file"
+    blob_capable = source_scheme in {"file", "https"} and destination_scheme == "file" and not git_release_capable and not ansible_collection_capable and not repository_capable
     oci_capable = kind in {"oci-image", "helm-chart"} and source_scheme == "oci" and destination_scheme == "oci"
-    capable = blob_capable or oci_capable or git_release_capable or ansible_collection_capable
+    capable = blob_capable or oci_capable or git_release_capable or ansible_collection_capable or repository_capable
     return {
         "capable": capable,
         "executor": "artifact-mirror-worker" if capable else "artifact-mirror-contract",
         "source_scheme": source_scheme,
         "destination_scheme": destination_scheme,
-        "credential_delivery": "none-inline; OCI authfiles are trusted environment-mounted files only",
+        "credential_delivery": "none-inline; trusted environment-mounted authfiles/keyrings only",
         "redirects_allowed": False,
         "digest_algorithm": "sha256",
+        "network_attempt_limit": 2 if source_scheme == "https" else 0,
     }
 
 
@@ -902,6 +1204,8 @@ def execute(typed_plan: dict[str, Any]) -> dict[str, Any]:
         return _execute_git_release(typed_plan, artifact, expected, observed_at)
     if str(artifact.get("kind") or "") == "ansible-collection" and capability["source_scheme"] in {"file", "https"} and capability["destination_scheme"] == "file":
         return _execute_ansible_collection(typed_plan, artifact, expected, observed_at)
+    if str(artifact.get("kind") or "") in REPOSITORY_KINDS and capability["source_scheme"] in {"file", "https"} and capability["destination_scheme"] == "file":
+        return _execute_repository_snapshot(typed_plan, artifact, expected, observed_at)
     if capability["source_scheme"] == "oci" and capability["destination_scheme"] == "oci":
         return _execute_oci(typed_plan, artifact, expected, observed_at)
 

@@ -77,6 +77,10 @@ for workflow_path in (".github/workflows/validate.yml", ".github/workflows/publi
     load_yaml(workflow_path)
 validate_workflow = (ROOT / ".github/workflows/validate.yml").read_text()
 assert "0.5.11-dev.5)" in validate_workflow
+assert "'dev/**'" in validate_workflow
+assert "'dev/**'" not in publish
+assert "pull_request:" not in publish
+assert "branches: [main]" in publish
 assert "scripts/acceptance/dev5-source-security-gate.py" in validate_workflow
 assert "scripts/acceptance/dev5-config-static-gate.py" in validate_workflow
 
@@ -98,6 +102,9 @@ assert (ROOT / "control-plane/tests/test_dev5_artifact_mirror_runtime.py").is_fi
 assert (ROOT / "control-plane/src/hermes_control_plane/artifact_mirror.py").is_file()
 assert (ROOT / "control-plane/tests/test_dev5_blueprint_artifact_resolver.py").is_file()
 assert (ROOT / "control-plane/tests/test_dev5_git_release_mirror_runtime.py").is_file()
+assert (ROOT / "control-plane/tests/test_dev5_ansible_collection_mirror_runtime.py").is_file()
+assert (ROOT / "control-plane/tests/test_dev5_repository_snapshot_runtime.py").is_file()
+assert (ROOT / "control-plane/src/hermes_control_plane/repository_snapshot.py").is_file()
 cluster_factory = (ROOT / "control-plane/src/hermes_control_plane/cluster_factory.py").read_text()
 assert "resolve_blueprint_artifact_manifest" in cluster_factory
 assert "credential_material_in_manifest" in cluster_factory
@@ -110,10 +117,21 @@ assert services["control-plane"]["environment"]["HERMES_ARTIFACT_MIRROR_ROOT"] =
 assert "HERMES_ARTIFACT_HTTPS_HOST_ALLOWLIST" in services["control-plane"]["environment"]
 assert "HERMES_ARTIFACT_OCI_SOURCE_REGISTRY_ALLOWLIST" in services["control-plane"]["environment"]
 assert "HERMES_ARTIFACT_OCI_DESTINATION_REGISTRY_ALLOWLIST" in services["control-plane"]["environment"]
+for env_name in (
+    "HERMES_ARTIFACT_AUTH_ROOT", "HERMES_ARTIFACT_HTTPS_AUTHFILE", "HERMES_ARTIFACT_REPOSITORY_KEYRING",
+    "HERMES_ARTIFACT_OCI_SOURCE_AUTHFILE", "HERMES_ARTIFACT_OCI_DESTINATION_AUTHFILE",
+    "HERMES_ARTIFACT_REPOSITORY_MAX_EXPANDED_BYTES", "HERMES_ARTIFACT_REPOSITORY_METADATA_MAX_BYTES",
+):
+    assert env_name in services["control-plane"]["environment"], env_name
+assert values["controlPlane"]["artifactMirror"]["authSecretName"] == ""
+assert values["controlPlane"]["artifactMirror"]["httpsAuthFile"] == ""
+assert values["controlPlane"]["artifactMirror"]["repositoryKeyringFile"] == ""
 assert values["controlPlane"]["artifactMirror"]["ociSourceRegistryAllowlist"] == ""
 assert values["controlPlane"]["artifactMirror"]["ociDestinationRegistryAllowlist"] == ""
 assert values["controlPlane"]["artifactMirror"]["maxBytes"] == 536870912
 assert values["controlPlane"]["artifactMirror"]["timeoutSeconds"] == 60
+assert values["controlPlane"]["artifactMirror"]["repositoryMaxExpandedBytes"] == 4294967296
+assert values["controlPlane"]["artifactMirror"]["repositoryMetadataMaxBytes"] == 268435456
 assert (ROOT / "kubernetes-broker/tests/test_day2_runtime.py").is_file()
 day2_tests = (ROOT / "kubernetes-broker/tests/test_day2_runtime.py").read_text() + (ROOT / "control-plane/tests/test_dev5_day2_runtime.py").read_text()
 assert "cluster.gitops.sync" in day2_tests

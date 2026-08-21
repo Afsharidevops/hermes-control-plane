@@ -505,7 +505,7 @@ class OperationsIntentPlanCreate(StrictModel):
 
 class ArtifactMirrorItemCreate(StrictModel):
     name: str = Field(min_length=1, max_length=160)
-    kind: Literal["oci-image", "helm-chart", "package", "git-release", "ansible-collection"]
+    kind: Literal["oci-image", "helm-chart", "package", "git-release", "ansible-collection", "apt-repository", "rpm-repository", "python-repository"]
     source: str = Field(min_length=1, max_length=1000)
     destination: str = Field(min_length=1, max_length=1000)
     version: str = Field(min_length=1, max_length=160)

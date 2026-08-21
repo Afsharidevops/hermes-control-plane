@@ -18,10 +18,17 @@ controlPlane:
   executionEnabled: false
   artifactMirror:
     httpsHostAllowlist: ""
+    authSecretName: ""
+    httpsAuthFile: ""
+    repositoryKeyringFile: ""
     ociSourceRegistryAllowlist: ""
     ociDestinationRegistryAllowlist: ""
+    ociSourceAuthFile: ""
+    ociDestinationAuthFile: ""
     maxBytes: 536870912
     timeoutSeconds: 60
+    repositoryMaxExpandedBytes: 4294967296
+    repositoryMetadataMaxBytes: 268435456
   service:
     type: ClusterIP
     port: 8800

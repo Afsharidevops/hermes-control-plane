@@ -293,13 +293,19 @@ for forbidden in ("docker push", "docker buildx", "build-push-action", "ghcr.io"
     assert forbidden not in push.lower(), forbidden
 
 workflow = text(".github/workflows/publish-images.yml")
+validate_workflow = text(".github/workflows/validate.yml")
 assert "secrets.DOCKERHUB_USERNAME" in workflow
 assert "secrets.DOCKERHUB_TOKEN" in workflow
 assert "ghcr.io" not in workflow.lower()
 assert "linux/amd64,linux/arm64" in workflow
+assert "branches: [main]" in workflow
+assert "'dev/**'" not in workflow
+assert "pull_request:" not in workflow
+assert "'dev/**'" in validate_workflow
+assert "pull_request:" in validate_workflow
 
 
-# Dev.5 artifact mirror has constrained blob-sync, OCI/Helm registry, exact-tag Git release, and typed Ansible collection archive runtimes without pretending all repository protocols are complete.
+# Dev.5 artifact mirror has constrained blob-sync, OCI/Helm registry, Git/Ansible archives, and typed signed repository snapshot runtimes.
 for marker in (
     'ARTIFACT_RUNTIME_SOURCE_SCHEMES = {"file", "https", "oci"}',
     'ARTIFACT_RUNTIME_DESTINATION_SCHEMES = {"file", "oci"}',
@@ -331,6 +337,11 @@ for marker in (
     'Ansible collection archive contains unsupported link/device members',
     'archive_extracted_to_filesystem',
     'Ansible collection expanded content exceeds the configured byte limit',
+    'HERMES_ARTIFACT_HTTPS_AUTHFILE',
+    'HERMES_ARTIFACT_REPOSITORY_KEYRING',
+    'trusted-environment-authfile-only',
+    'atomic-staging-with-rollback',
+    'repository signature verification failed with exit code',
 ):
     assert marker in artifact_mirror, marker
 for marker in (
@@ -351,12 +362,23 @@ for marker in (
 ):
     assert marker in artifact_mirror, marker
 assert 'archive.extract(' not in artifact_mirror
+repository_snapshot = text('control-plane/src/hermes_control_plane/repository_snapshot.py')
+for marker in (
+    'REPOSITORY_KINDS = frozenset({"apt-repository", "rpm-repository", "python-repository"})',
+    'HERMES-REPOSITORY-SNAPSHOT.json',
+    'APT Release SHA256',
+    'RPM repomd.xml',
+    'Python Simple distribution links must include a sha256 fragment',
+    'repository snapshot archive contains unsupported link/device members',
+):
+    assert marker in repository_snapshot, marker
+assert 'archive.extract(' not in repository_snapshot
 for forbidden in ('os.system', 'shell=True', 'eval(', 'exec('):
     assert forbidden not in artifact_mirror, forbidden
 assert 'artifact-mirror-worker' in cp_main
 assert 'source=executor' in cp_main
 assert 'sync_state' in cp_main
 dockerfile = text('control-plane/Dockerfile')
-assert 'apt-get install -y --no-install-recommends ca-certificates git skopeo' in dockerfile
+assert 'apt-get install -y --no-install-recommends ca-certificates git gpgv skopeo' in dockerfile
 
 print("0.5.11-dev.5-source-security: PASS")
