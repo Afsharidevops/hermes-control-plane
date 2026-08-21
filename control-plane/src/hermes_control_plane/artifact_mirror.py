@@ -7,9 +7,10 @@ import socket
 import subprocess
 import tempfile
 import time
+import tarfile
 import urllib.error
 import urllib.request
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO
 from urllib.parse import unquote, urlparse
 import re
@@ -30,6 +31,10 @@ _HELM_CHART_LAYER_MEDIA_TYPE = "application/vnd.cncf.helm.chart.content.v1.tar+g
 _HELM_PROVENANCE_LAYER_MEDIA_TYPE = "application/vnd.cncf.helm.chart.provenance.v1.prov"
 _GIT_COMMIT_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 _GIT_TAG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,159}$")
+_ANSIBLE_COLLECTION_PART_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_ANSIBLE_COLLECTION_VERSION_RE = re.compile(r"^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$")
+_ANSIBLE_COLLECTION_METADATA_LIMIT = 2 * 1024 * 1024
+_ANSIBLE_COLLECTION_MEMBER_LIMIT = 20000
 
 
 def _oci_registry_allowlisted(host: str, *, destination: bool) -> bool:
@@ -484,6 +489,241 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         raise ArtifactMirrorError("artifact source redirects are forbidden")
 
 
+def _ansible_collection_binding(artifact: dict[str, Any]) -> tuple[str, str, str]:
+    labels = artifact.get("labels") if isinstance(artifact.get("labels"), dict) else {}
+    unknown = sorted(set(labels) - {"ansible_namespace", "ansible_name"})
+    if unknown:
+        raise ArtifactMirrorError(f"ansible-collection labels contain unsupported keys: {', '.join(unknown)}")
+    namespace = str(labels.get("ansible_namespace") or "")
+    name = str(labels.get("ansible_name") or "")
+    version = str(artifact.get("version") or "")
+    if not _ANSIBLE_COLLECTION_PART_RE.fullmatch(namespace):
+        raise ArtifactMirrorError("ansible-collection namespace is invalid")
+    if not _ANSIBLE_COLLECTION_PART_RE.fullmatch(name):
+        raise ArtifactMirrorError("ansible-collection name is invalid")
+    if not _ANSIBLE_COLLECTION_VERSION_RE.fullmatch(version):
+        raise ArtifactMirrorError("ansible-collection version must be semantic-version compatible")
+    return namespace, name, version
+
+
+def _safe_tar_member_name(raw: str) -> str:
+    if not raw or "\\" in raw or raw.startswith("/"):
+        raise ArtifactMirrorError("Ansible collection archive contains an unsafe member path")
+    path = PurePosixPath(raw)
+    if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+        raise ArtifactMirrorError("Ansible collection archive contains an unsafe member path")
+    return path.as_posix()
+
+
+def _read_tar_json(archive: tarfile.TarFile, member: tarfile.TarInfo, *, name: str) -> tuple[dict[str, Any], bytes]:
+    if not member.isfile():
+        raise ArtifactMirrorError(f"Ansible collection {name} must be a regular file")
+    if member.size < 1 or member.size > _ANSIBLE_COLLECTION_METADATA_LIMIT:
+        raise ArtifactMirrorError(f"Ansible collection {name} exceeds the metadata size limit")
+    handle = archive.extractfile(member)
+    if handle is None:
+        raise ArtifactMirrorError(f"Ansible collection {name} could not be read")
+    raw = handle.read(_ANSIBLE_COLLECTION_METADATA_LIMIT + 1)
+    if len(raw) > _ANSIBLE_COLLECTION_METADATA_LIMIT:
+        raise ArtifactMirrorError(f"Ansible collection {name} exceeds the metadata size limit")
+    try:
+        parsed = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ArtifactMirrorError(f"Ansible collection {name} is not valid JSON") from exc
+    if not isinstance(parsed, dict):
+        raise ArtifactMirrorError(f"Ansible collection {name} must contain a JSON object")
+    return parsed, raw
+
+
+def _validate_ansible_collection_archive(path: Path, artifact: dict[str, Any]) -> dict[str, Any]:
+    namespace, name, version = _ansible_collection_binding(artifact)
+    try:
+        archive = tarfile.open(path, mode="r:gz")
+    except (tarfile.TarError, OSError) as exc:
+        raise ArtifactMirrorError("Ansible collection artifact must be a valid gzip-compressed tar archive") from exc
+    with archive:
+        members = archive.getmembers()
+        if not members or len(members) > _ANSIBLE_COLLECTION_MEMBER_LIMIT:
+            raise ArtifactMirrorError("Ansible collection archive has an invalid member count")
+        by_name: dict[str, tarfile.TarInfo] = {}
+        expanded_bytes = 0
+        expanded_limit = _max_bytes()
+        for member in members:
+            member_name = _safe_tar_member_name(member.name)
+            if member_name in by_name:
+                raise ArtifactMirrorError("Ansible collection archive contains duplicate member names")
+            if member.issym() or member.islnk() or member.isdev() or member.isfifo():
+                raise ArtifactMirrorError("Ansible collection archive contains unsupported link/device members")
+            if not (member.isfile() or member.isdir()):
+                raise ArtifactMirrorError("Ansible collection archive contains an unsupported member type")
+            if member.size < 0:
+                raise ArtifactMirrorError("Ansible collection archive contains an invalid member size")
+            if member.isfile():
+                expanded_bytes += member.size
+                if expanded_bytes > expanded_limit:
+                    raise ArtifactMirrorError("Ansible collection expanded content exceeds the configured byte limit")
+            by_name[member_name] = member
+
+        manifest_member = by_name.get("MANIFEST.json")
+        files_member = by_name.get("FILES.json")
+        if manifest_member is None or files_member is None:
+            raise ArtifactMirrorError("Ansible collection artifact must contain root MANIFEST.json and FILES.json")
+        manifest, _ = _read_tar_json(archive, manifest_member, name="MANIFEST.json")
+        files_manifest, files_raw = _read_tar_json(archive, files_member, name="FILES.json")
+
+        if manifest.get("format") != 1:
+            raise ArtifactMirrorError("Ansible collection MANIFEST.json format must be 1")
+        info = manifest.get("collection_info")
+        if not isinstance(info, dict):
+            raise ArtifactMirrorError("Ansible collection MANIFEST.json is missing collection_info")
+        observed = (str(info.get("namespace") or ""), str(info.get("name") or ""), str(info.get("version") or ""))
+        if observed != (namespace, name, version):
+            raise ArtifactMirrorError("Ansible collection MANIFEST.json identity/version does not match the approved artifact plan")
+
+        file_manifest_file = manifest.get("file_manifest_file")
+        if not isinstance(file_manifest_file, dict) or file_manifest_file.get("name") != "FILES.json":
+            raise ArtifactMirrorError("Ansible collection MANIFEST.json must bind FILES.json")
+        if str(file_manifest_file.get("chksum_type") or "").lower() != "sha256":
+            raise ArtifactMirrorError("Ansible collection FILES.json checksum type must be sha256")
+        expected_files_digest = str(file_manifest_file.get("chksum_sha256") or "").lower()
+        observed_files_digest = hashlib.sha256(files_raw).hexdigest()
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_files_digest) or observed_files_digest != expected_files_digest:
+            raise ArtifactMirrorError("Ansible collection FILES.json checksum does not match MANIFEST.json")
+
+        if files_manifest.get("format") != 1 or not isinstance(files_manifest.get("files"), list):
+            raise ArtifactMirrorError("Ansible collection FILES.json format is invalid")
+        verified_files = 0
+        seen_declared: set[str] = set()
+        for entry in files_manifest["files"]:
+            if not isinstance(entry, dict):
+                raise ArtifactMirrorError("Ansible collection FILES.json contains an invalid file entry")
+            entry_name = _safe_tar_member_name(str(entry.get("name") or ""))
+            if entry_name in seen_declared:
+                raise ArtifactMirrorError("Ansible collection FILES.json contains duplicate file entries")
+            seen_declared.add(entry_name)
+            ftype = str(entry.get("ftype") or "")
+            if ftype == "dir":
+                continue
+            if ftype != "file":
+                raise ArtifactMirrorError("Ansible collection FILES.json contains an unsupported file type")
+            member = by_name.get(entry_name)
+            if member is None or not member.isfile():
+                raise ArtifactMirrorError("Ansible collection FILES.json references a missing regular file")
+            if str(entry.get("chksum_type") or "").lower() != "sha256":
+                raise ArtifactMirrorError("Ansible collection file checksum type must be sha256")
+            expected_digest = str(entry.get("chksum_sha256") or "").lower()
+            if not re.fullmatch(r"[0-9a-f]{64}", expected_digest):
+                raise ArtifactMirrorError("Ansible collection file checksum is invalid")
+            handle = archive.extractfile(member)
+            if handle is None:
+                raise ArtifactMirrorError("Ansible collection file could not be read")
+            digest = hashlib.sha256()
+            remaining = member.size
+            while remaining > 0:
+                chunk = handle.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+                digest.update(chunk)
+            if remaining != 0 or digest.hexdigest() != expected_digest:
+                raise ArtifactMirrorError("Ansible collection file checksum does not match FILES.json")
+            verified_files += 1
+
+    return {
+        "ansible_namespace": namespace,
+        "ansible_name": name,
+        "ansible_version": version,
+        "files_manifest_sha256": observed_files_digest,
+        "verified_regular_files": verified_files,
+        "archive_members": len(members),
+        "expanded_bytes": expanded_bytes,
+    }
+
+
+def _execute_ansible_collection(typed_plan: dict[str, Any], artifact: dict[str, Any], expected: str, observed_at: int) -> dict[str, Any]:
+    artifact_id = str(artifact.get("id") or "")
+    source = str(artifact.get("source") or "")
+    destination = str(artifact.get("destination") or "")
+    capability = runtime_capability(source, destination, kind="ansible-collection")
+    base_evidence: dict[str, Any] = {
+        "source_scheme": capability["source_scheme"],
+        "destination_scheme": capability["destination_scheme"],
+        "artifact_kind": "ansible-collection",
+        "archive_format": "ansible-galaxy-collection-tar.gz",
+        "arbitrary_shell": False,
+        "raw_credentials_returned": False,
+        "redirects_followed": False,
+        "archive_extracted_to_filesystem": False,
+        "symlink_members_allowed": False,
+    }
+    try:
+        namespace, name, version = _ansible_collection_binding(artifact)
+        base_evidence.update({"ansible_namespace": namespace, "ansible_name": name, "ansible_version": version})
+        max_bytes = _max_bytes()
+        source_root = _root("HERMES_ARTIFACT_SOURCE_ROOT", "/data/artifact-source")
+        mirror_root = _root("HERMES_ARTIFACT_MIRROR_ROOT", "/data/artifact-mirror")
+        destination_path = _file_uri_path(destination, root=mirror_root, purpose="Ansible collection destination")
+        destination_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if destination_path.exists():
+            destination_digest, destination_bytes = _sha256_path(destination_path, max_bytes=max_bytes)
+            if destination_digest == expected:
+                archive_evidence = _validate_ansible_collection_archive(destination_path, artifact)
+                checks = [
+                    {"id": "collection-identity", "status": "PASS", "summary": "existing Ansible collection archive matches the approved namespace/name/version and internal file manifest", "evidence": archive_evidence},
+                    {"id": "destination-digest", "status": "PASS", "summary": "existing Ansible collection archive matches the pinned SHA-256 digest", "evidence": {"digest": destination_digest, "bytes": destination_bytes}},
+                ]
+                return {"schema_version": 1, "artifact_id": artifact_id, "state": "ALREADY_MIRRORED", "bytes": destination_bytes, "digest": destination_digest, "verification": {"observed_at": observed_at, "checks": checks, "evidence": {**base_evidence, **archive_evidence, "idempotent": True, "atomic_replace": False}}}
+            if not bool((typed_plan.get("parameters") or {}).get("replace_existing", False)):
+                checks = [_failure("destination-digest", "existing Ansible collection archive differs from the pinned digest and replace_existing is false", evidence={"observed_digest": destination_digest})]
+                return {"schema_version": 1, "artifact_id": artifact_id, "state": "FAILED", "verification": {"observed_at": observed_at, "checks": checks, "evidence": base_evidence}}
+
+        temp_path: Path | None = None
+        source_digest = ""
+        byte_count = 0
+        archive_evidence: dict[str, Any] = {}
+        try:
+            with tempfile.NamedTemporaryFile(prefix=".hermes-ansible-collection-", suffix=".tar.gz", dir=destination_path.parent, delete=False) as temp:
+                temp_path = Path(temp.name)
+                if capability["source_scheme"] == "file":
+                    source_path = _file_uri_path(source, root=source_root, purpose="Ansible collection source")
+                    if not source_path.is_file():
+                        raise ArtifactMirrorError("Ansible collection source file does not exist")
+                    with source_path.open("rb") as src:
+                        source_digest, byte_count = _copy_stream(src, temp, max_bytes=max_bytes)
+                else:
+                    with _open_https(source) as src:
+                        source_digest, byte_count = _copy_stream(src, temp, max_bytes=max_bytes)
+            if source_digest != expected:
+                temp_path.unlink(missing_ok=True)
+                checks = [_failure("source-digest", "fetched Ansible collection archive does not match the pinned digest", evidence={"observed_digest": source_digest, "bytes": byte_count})]
+                return {"schema_version": 1, "artifact_id": artifact_id, "state": "FAILED", "verification": {"observed_at": observed_at, "checks": checks, "evidence": base_evidence}}
+            archive_evidence = _validate_ansible_collection_archive(temp_path, artifact)
+            os.replace(temp_path, destination_path)
+            temp_path = None
+        finally:
+            if temp_path is not None:
+                temp_path.unlink(missing_ok=True)
+
+        destination_digest, destination_bytes = _sha256_path(destination_path, max_bytes=max_bytes)
+        if destination_digest != expected:
+            checks = [_failure("destination-digest", "mirrored Ansible collection archive does not match the pinned digest", evidence={"observed_digest": destination_digest})]
+            return {"schema_version": 1, "artifact_id": artifact_id, "state": "FAILED", "verification": {"observed_at": observed_at, "checks": checks, "evidence": base_evidence}}
+        destination_evidence = _validate_ansible_collection_archive(destination_path, artifact)
+        checks = [
+            {"id": "source-digest", "status": "PASS", "summary": "Ansible collection source archive matches the pinned SHA-256 digest", "evidence": {"digest": expected, "bytes": byte_count}},
+            {"id": "collection-identity", "status": "PASS", "summary": "Ansible collection archive identity and internal file checksums match the approved plan", "evidence": archive_evidence},
+            {"id": "destination-digest", "status": "PASS", "summary": "mirrored Ansible collection archive matches the pinned SHA-256 digest", "evidence": {"digest": destination_digest, "bytes": destination_bytes}},
+        ]
+        return {"schema_version": 1, "artifact_id": artifact_id, "state": "MIRRORED", "bytes": destination_bytes, "digest": destination_digest, "verification": {"observed_at": observed_at, "checks": checks, "evidence": {**base_evidence, **destination_evidence, "idempotent": False, "atomic_replace": True}}}
+    except ArtifactMirrorError as exc:
+        checks = [_failure("artifact-mirror-runtime", str(exc), evidence={"error_type": type(exc).__name__})]
+        return {"schema_version": 1, "artifact_id": artifact_id, "state": "FAILED", "verification": {"observed_at": observed_at, "checks": checks, "evidence": base_evidence}}
+    except (OSError, tarfile.TarError) as exc:
+        checks = [_failure("artifact-mirror-runtime", f"Ansible collection mirror I/O/archive validation failed: {type(exc).__name__}", evidence={"error_type": type(exc).__name__})]
+        return {"schema_version": 1, "artifact_id": artifact_id, "state": "FAILED", "verification": {"observed_at": observed_at, "checks": checks, "evidence": base_evidence}}
+
+
 def _max_bytes() -> int:
     raw = os.getenv("HERMES_ARTIFACT_MIRROR_MAX_BYTES", str(512 * 1024 * 1024))
     try:
@@ -615,9 +855,10 @@ def runtime_capability(source: str, destination: str, *, kind: str = "") -> dict
     source_scheme = urlparse(source).scheme.lower()
     destination_scheme = urlparse(destination).scheme.lower()
     git_release_capable = kind == "git-release" and source_scheme == "https" and destination_scheme == "file"
-    blob_capable = source_scheme in {"file", "https"} and destination_scheme == "file" and not git_release_capable
+    ansible_collection_capable = kind == "ansible-collection" and source_scheme in {"file", "https"} and destination_scheme == "file"
+    blob_capable = source_scheme in {"file", "https"} and destination_scheme == "file" and not git_release_capable and not ansible_collection_capable
     oci_capable = kind in {"oci-image", "helm-chart"} and source_scheme == "oci" and destination_scheme == "oci"
-    capable = blob_capable or oci_capable or git_release_capable
+    capable = blob_capable or oci_capable or git_release_capable or ansible_collection_capable
     return {
         "capable": capable,
         "executor": "artifact-mirror-worker" if capable else "artifact-mirror-contract",
@@ -659,6 +900,8 @@ def execute(typed_plan: dict[str, Any]) -> dict[str, Any]:
         return {"schema_version": 1, "artifact_id": artifact_id, "state": "FAILED", "verification": {"observed_at": observed_at, "checks": checks, "evidence": base_evidence}}
     if str(artifact.get("kind") or "") == "git-release" and capability["source_scheme"] == "https" and capability["destination_scheme"] == "file":
         return _execute_git_release(typed_plan, artifact, expected, observed_at)
+    if str(artifact.get("kind") or "") == "ansible-collection" and capability["source_scheme"] in {"file", "https"} and capability["destination_scheme"] == "file":
+        return _execute_ansible_collection(typed_plan, artifact, expected, observed_at)
     if capability["source_scheme"] == "oci" and capability["destination_scheme"] == "oci":
         return _execute_oci(typed_plan, artifact, expected, observed_at)
 

@@ -304,7 +304,7 @@ Runtime/security properties:
 - an already-correct destination is idempotent; a mismatched destination tag fails unless the exact approved plan included `replace_existing=true`
 - returned evidence identifies the typed Helm OCI path and media types without returning raw credentials or stderr
 
-This remains **partial air-gap closure**. apt/yum/dnf repository metadata and packages, Python indexes/wheels/sdists, Ansible/Git-release mirroring where required, generalized authenticated repository delivery, broader signature/provenance policy, and provisioner-side offline reference rewriting remain open. A subsequent slice now adds deterministic ClusterBlueprint artifact binding, verified destination selection and dependency DAG ordering/resume evidence.
+This remains **partial air-gap closure**. apt/yum/dnf repository metadata and packages, Python indexes/wheels/sdists, broader Ansible Galaxy catalog/role handling where required, generalized authenticated repository delivery, broader signature/provenance policy, and provisioner-side offline reference rewriting remain open. A subsequent slice now adds deterministic ClusterBlueprint artifact binding, verified destination selection and dependency DAG ordering/resume evidence.
 
 
 ## Slice 14 — Deterministic ClusterBlueprint artifact dependency resolution
@@ -315,7 +315,7 @@ ClusterBlueprints now persist an explicit bounded list of artifact mirror item I
 
 Optional `depends_on` labels contain bound artifact IDs only. Hermes rejects self edges, unbound edges, duplicate dependency keys and graph cycles, then emits a deterministic topological `dependency_order`. If any bound artifact is unverified or otherwise invalid, the manifest is `BLOCKED` and includes `resume_from_artifact_id` for deterministic partial-sync continuation. The entire manifest is exact-hashed.
 
-This closes the deterministic ClusterBlueprint-to-artifact selection/ordering layer and graph-level resume evidence. It does **not** yet mutate Kubespray/K3s/RKE2 inputs to consume the selected offline references, and it does not claim apt/yum/dnf or Python repository-metadata synchronization, Ansible/Git catalog closure, generalized repository credentials or broader signature/provenance policy.
+This closes the deterministic ClusterBlueprint-to-artifact selection/ordering layer and graph-level resume evidence. It does **not** yet mutate Kubespray/K3s/RKE2 inputs to consume the selected offline references, and it does not claim apt/yum/dnf or Python repository-metadata synchronization, broader Ansible Galaxy catalog/role closure, generalized repository credentials or broader signature/provenance policy.
 
 ## Slice 15 — READY artifact manifest binding into provisioning plans
 
@@ -325,13 +325,22 @@ The provisioning plan copies only bounded resolver output: artifact ID, componen
 
 Before a provider job can be authorized, Hermes re-resolves the current blueprint manifest and requires the same exact `READY` manifest hash. Mirror verification or dependency drift after approval therefore fails closed rather than silently changing the artifact supply. Existing online blueprints with no artifact dependency binding remain backward-compatible.
 
-This closes the resolver-to-provisioning-plan consumption boundary only. `provisioner_rewrite_applied` remains false: trusted Kubespray/K3s/RKE2 provider workers still need to consume these bounded references and deterministically rewrite/install from offline mirrors. apt/yum/dnf and Python repository metadata synchronization, broader Ansible/Git catalogs, generalized authenticated repository delivery, and broader signature/provenance policy remain open.
+This closes the resolver-to-provisioning-plan consumption boundary only. `provisioner_rewrite_applied` remains false: trusted Kubespray/K3s/RKE2 provider workers still need to consume these bounded references and deterministically rewrite/install from offline mirrors. apt/yum/dnf and Python repository metadata synchronization, broader Ansible Galaxy catalog/role handling, generalized authenticated repository delivery, and broader signature/provenance policy remain open.
 
 
-## Current continuation — bounded exact-tag Git release archive mirror
+## Slice 16 — bounded exact-tag Git release archive mirror
 
 `git-release` artifacts now have a bounded candidate runtime for allowlisted public HTTPS Git repositories. The ChangeSet-bound artifact plan carries only the exact immutable tag reference (`refs/tags/...`) and exact commit object ID needed by the worker. The worker disables credential helpers/prompts and all non-HTTPS Git protocols, disables HTTP redirects, uses fixed Git command vectors only, resolves the source tag before fetch, performs a depth-one exact-ref fetch, rejects repositories containing `.gitmodules`, and produces a canonical tar archive with `git archive`.
 
 The canonical archive SHA-256 must equal the artifact's pinned digest before atomic publication. The destination is independently rehashed, an already-correct destination is idempotent, mismatched existing output is fail-closed unless the exact approved plan included replacement, network calls have a fixed two-attempt bound, and no raw Git stderr or credential material is returned.
 
-This slice does **not** claim full Git repository mirroring, arbitrary ref/history preservation, submodule synchronization, or signed tag/commit provenance verification. It is a deterministic release-source prerequisite that can later supply a pinned Kubespray source archive; actual trusted Kubespray worker extraction/rewrite/install and apt/yum/dnf/Python/Ansible repository closure remain open. This continuation is not a completed dev.5 slice until it has its own forward-only commit, push, and exact-SHA `validate` success.
+This slice does **not** claim full Git repository mirroring, arbitrary ref/history preservation, submodule synchronization, or signed tag/commit provenance verification. It is a deterministic release-source prerequisite that can later supply a pinned Kubespray source archive; actual trusted Kubespray worker extraction/rewrite/install and apt/yum/dnf/Python/Ansible repository closure remain open. The slice is committed/pushed and exact-SHA `validate` is green at `395059d63d86316d3056cd28790941726c7e42dd` (run `32477791912`).
+
+
+## Current continuation — typed Ansible Galaxy collection archive mirror
+
+`ansible-collection` artifacts use the bounded local-file/allowlisted-HTTPS -> controlled-file mirror transport but are not treated as arbitrary blobs. The exact approved plan carries only `ansible_namespace`, `ansible_name`, semantic version and SHA-256 identity.
+
+Before atomic publication, Hermes validates the gzip tarball in-memory/streamed without extracting archive paths to disk. It rejects absolute/traversal/duplicate member names, symbolic/hard links and device/FIFO members; requires root `MANIFEST.json` and `FILES.json`; binds `collection_info.namespace`, `name` and `version` to the approved artifact; verifies the MANIFEST-declared SHA-256 of `FILES.json`; and verifies every regular file checksum declared in the file manifest. Existing destinations are accepted idempotently only after both outer digest and internal collection validation pass.
+
+This continuation closes only exact Galaxy collection artifact validation/synchronization after its own forward-only commit/push/exact-SHA CI. It does **not** provide a Galaxy API/catalog/server, standalone role archive semantics, dependency discovery, GPG/signature verification, apt/yum/dnf/Python repository metadata synchronization, generalized repository credentials, or the trusted Kubespray/K3s/RKE2 provider-worker that consumes/re-writes offline references.

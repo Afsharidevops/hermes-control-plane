@@ -79,7 +79,7 @@ NETWORK_PROVIDER_CONTRACTS: dict[str, dict[str, Any]] = {
     }
 }
 
-ARTIFACT_KINDS = ("oci-image", "helm-chart", "package", "git-release")
+ARTIFACT_KINDS = ("oci-image", "helm-chart", "package", "git-release", "ansible-collection")
 
 DAY2_OPERATIONS: dict[str, dict[str, Any]] = {
     "cluster.worker.add": {"kind": "WorkerLifecyclePlan", "stages": ["preflight", "snapshot", "join", "verify"]},
@@ -441,9 +441,10 @@ def artifact_mirror_runtime_capable(plan: dict[str, Any]) -> bool:
     source_scheme = urlparse(str(artifact.get("source") or "")).scheme.lower()
     destination_scheme = urlparse(str(artifact.get("destination") or "")).scheme.lower()
     git_release_runtime = artifact.get("kind") == "git-release" and source_scheme == "https" and destination_scheme == "file"
-    blob_runtime = source_scheme in {"file", "https"} and destination_scheme == "file" and not git_release_runtime
+    ansible_collection_runtime = artifact.get("kind") == "ansible-collection" and source_scheme in {"file", "https"} and destination_scheme == "file"
+    blob_runtime = source_scheme in {"file", "https"} and destination_scheme == "file" and not git_release_runtime and not ansible_collection_runtime
     oci_runtime = artifact.get("kind") in {"oci-image", "helm-chart"} and source_scheme == "oci" and destination_scheme == "oci"
-    return plan.get("operation") == "artifact.mirror.apply" and (blob_runtime or oci_runtime or git_release_runtime)
+    return plan.get("operation") == "artifact.mirror.apply" and (blob_runtime or oci_runtime or git_release_runtime or ansible_collection_runtime)
 
 
 def artifact_mirror_plan(*, artifact_snapshot: dict[str, Any], parameters: dict[str, Any]) -> dict[str, Any]:
@@ -451,10 +452,10 @@ def artifact_mirror_plan(*, artifact_snapshot: dict[str, Any], parameters: dict[
     source_scheme = urlparse(str(artifact_snapshot["source"])).scheme.lower()
     destination_scheme = urlparse(str(artifact_snapshot["destination"])).scheme.lower()
     git_release_runtime = artifact_snapshot.get("kind") == "git-release" and source_scheme == "https" and destination_scheme == "file"
-    runtime_capable = (
-        (source_scheme in {"file", "https"} and destination_scheme == "file")
-        or (artifact_snapshot.get("kind") in {"oci-image", "helm-chart"} and source_scheme == "oci" and destination_scheme == "oci")
-    )
+    ansible_collection_runtime = artifact_snapshot.get("kind") == "ansible-collection" and source_scheme in {"file", "https"} and destination_scheme == "file"
+    blob_runtime = source_scheme in {"file", "https"} and destination_scheme == "file" and not git_release_runtime and not ansible_collection_runtime
+    oci_runtime = artifact_snapshot.get("kind") in {"oci-image", "helm-chart"} and source_scheme == "oci" and destination_scheme == "oci"
+    runtime_capable = blob_runtime or git_release_runtime or ansible_collection_runtime or oci_runtime
     return _finish({
         "schema_version": 4,
         "kind": "ArtifactMirrorPlan",
@@ -467,12 +468,16 @@ def artifact_mirror_plan(*, artifact_snapshot: dict[str, Any], parameters: dict[
             "destination": artifact_snapshot["destination"],
             "version": artifact_snapshot["version"],
             "digest": artifact_snapshot["digest"],
-            "labels": ({key: artifact_snapshot.get("labels", {}).get(key) for key in ("git_ref", "git_commit") if artifact_snapshot.get("labels", {}).get(key) is not None} if artifact_snapshot.get("kind") == "git-release" else {}),
+            "labels": (
+                {key: artifact_snapshot.get("labels", {}).get(key) for key in ("git_ref", "git_commit") if artifact_snapshot.get("labels", {}).get(key) is not None}
+                if artifact_snapshot.get("kind") == "git-release"
+                else ({key: artifact_snapshot.get("labels", {}).get(key) for key in ("ansible_namespace", "ansible_name") if artifact_snapshot.get("labels", {}).get(key) is not None} if artifact_snapshot.get("kind") == "ansible-collection" else {})
+            ),
         },
         "parameters": {"verify_destination": True, "replace_existing": bool(parameters.get("replace_existing", False))},
         "runtime": {
             "state": "RUNTIME_CAPABLE" if runtime_capable else "CONTRACT_ONLY",
-            "mode": "git-release-exact-tag-archive" if git_release_runtime else ("oci-registry" if source_scheme == "oci" else "digest-pinned-blob"),
+            "mode": "git-release-exact-tag-archive" if git_release_runtime else ("ansible-collection-archive" if ansible_collection_runtime else ("oci-registry" if source_scheme == "oci" else "digest-pinned-blob")),
             "executor": "artifact-mirror-worker" if runtime_capable else "artifact-mirror-contract",
             "source_scheme": source_scheme,
             "destination_scheme": destination_scheme,

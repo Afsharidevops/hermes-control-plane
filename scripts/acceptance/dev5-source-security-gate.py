@@ -299,7 +299,7 @@ assert "ghcr.io" not in workflow.lower()
 assert "linux/amd64,linux/arm64" in workflow
 
 
-# Dev.5 artifact mirror has constrained blob-sync, OCI/Helm registry, and exact-tag Git release archive runtimes without pretending all repository protocols are complete.
+# Dev.5 artifact mirror has constrained blob-sync, OCI/Helm registry, exact-tag Git release, and typed Ansible collection archive runtimes without pretending all repository protocols are complete.
 for marker in (
     'ARTIFACT_RUNTIME_SOURCE_SCHEMES = {"file", "https", "oci"}',
     'ARTIFACT_RUNTIME_DESTINATION_SCHEMES = {"file", "oci"}',
@@ -325,6 +325,12 @@ for marker in (
     'http.followRedirects=false',
     'protocol.https.allow=always',
     'git-release repositories containing .gitmodules are unsupported',
+    'ansible-collection namespace is invalid',
+    'Ansible collection artifact must contain root MANIFEST.json and FILES.json',
+    'Ansible collection FILES.json checksum does not match MANIFEST.json',
+    'Ansible collection archive contains unsupported link/device members',
+    'archive_extracted_to_filesystem',
+    'Ansible collection expanded content exceeds the configured byte limit',
 ):
     assert marker in artifact_mirror, marker
 for marker in (
@@ -344,6 +350,7 @@ for marker in (
     'authfiles_from_environment_only',
 ):
     assert marker in artifact_mirror, marker
+assert 'archive.extract(' not in artifact_mirror
 for forbidden in ('os.system', 'shell=True', 'eval(', 'exec('):
     assert forbidden not in artifact_mirror, forbidden
 assert 'artifact-mirror-worker' in cp_main
