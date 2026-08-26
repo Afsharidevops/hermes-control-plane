@@ -42,6 +42,10 @@ spec:
             - {name: HERMES_INFRASTRUCTURE_FIRMWARE_VERIFY_DELAY_SECONDS, value: {{ .Values.nodeAgent.infrastructureFirmwareVerifyDelaySeconds | quote }}}
             - {name: HERMES_INFRASTRUCTURE_PLATFORM_VERIFY_ATTEMPTS, value: {{ .Values.nodeAgent.infrastructurePlatformVerifyAttempts | quote }}}
             - {name: HERMES_INFRASTRUCTURE_PLATFORM_VERIFY_DELAY_SECONDS, value: {{ .Values.nodeAgent.infrastructurePlatformVerifyDelaySeconds | quote }}}
+            - {name: HERMES_CAPACITY_COLLECTION_ENABLED, value: {{ .Values.nodeAgent.capacityCollectionEnabled | quote }}}
+            - {name: HERMES_CAPACITY_REQUEST_TIMEOUT_SECONDS, value: {{ .Values.nodeAgent.capacityRequestTimeoutSeconds | quote }}}
+            - {name: HERMES_CAPACITY_MAX_RESPONSE_BYTES, value: {{ .Values.nodeAgent.capacityMaxResponseBytes | quote }}}
+            - {name: HERMES_CAPACITY_MAX_REQUESTS, value: {{ .Values.nodeAgent.capacityMaxRequests | quote }}}
             - {name: HERMES_PROVIDER_WORK_ROOT, value: /var/lib/hermes-provider}
             - {name: HERMES_ARTIFACT_MIRROR_ROOT, value: /data/artifact-mirror}
             - {name: HERMES_PROVIDER_FILES_REPO_URL, value: {{ .Values.nodeAgent.filesRepoUrl | quote }}}

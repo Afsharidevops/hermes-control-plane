@@ -92,6 +92,11 @@ nodeAgent:
   infrastructureFirmwareVerifyDelaySeconds: 5
   infrastructurePlatformVerifyAttempts: 90
   infrastructurePlatformVerifyDelaySeconds: 5
+  capacityCollectionEnabled: false
+  capacityRequestTimeoutSeconds: 20
+  capacityMaxResponseBytes: 1048576
+  capacityMaxRequests: 8
+  capacityWorkerTimeoutSeconds: 60
   filesRepoUrl: ""
   aptRepoUrl: ""
   rpmRepoUrl: ""

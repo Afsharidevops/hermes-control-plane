@@ -152,6 +152,11 @@ assert services["node-agent"]["environment"]["HERMES_INFRASTRUCTURE_FIRMWARE_VER
 assert services["node-agent"]["environment"]["HERMES_INFRASTRUCTURE_FIRMWARE_VERIFY_DELAY_SECONDS"] == "${HERMES_INFRASTRUCTURE_FIRMWARE_VERIFY_DELAY_SECONDS:-5}"
 assert services["node-agent"]["environment"]["HERMES_INFRASTRUCTURE_PLATFORM_VERIFY_ATTEMPTS"] == "${HERMES_INFRASTRUCTURE_PLATFORM_VERIFY_ATTEMPTS:-90}"
 assert services["node-agent"]["environment"]["HERMES_INFRASTRUCTURE_PLATFORM_VERIFY_DELAY_SECONDS"] == "${HERMES_INFRASTRUCTURE_PLATFORM_VERIFY_DELAY_SECONDS:-5}"
+assert services["node-agent"]["environment"]["HERMES_CAPACITY_COLLECTION_ENABLED"] == "${HERMES_CAPACITY_COLLECTION_ENABLED:-false}"
+assert services["node-agent"]["environment"]["HERMES_CAPACITY_REQUEST_TIMEOUT_SECONDS"] == "${HERMES_CAPACITY_REQUEST_TIMEOUT_SECONDS:-20}"
+assert services["node-agent"]["environment"]["HERMES_CAPACITY_MAX_RESPONSE_BYTES"] == "${HERMES_CAPACITY_MAX_RESPONSE_BYTES:-1048576}"
+assert services["node-agent"]["environment"]["HERMES_CAPACITY_MAX_REQUESTS"] == "${HERMES_CAPACITY_MAX_REQUESTS:-8}"
+assert services["control-plane"]["environment"]["HERMES_CAPACITY_WORKER_TIMEOUT_SECONDS"] == "${HERMES_CAPACITY_WORKER_TIMEOUT_SECONDS:-60}"
 assert "HERMES_EXECUTION_HMAC_KEY" in services["node-agent"]["environment"]
 assert "HERMES_PROVIDER_SSH_PROFILE_ROOT" in services["node-agent"]["environment"]
 assert values["nodeAgent"]["enabled"] is False
@@ -165,15 +170,38 @@ assert values["nodeAgent"]["infrastructureFirmwareVerifyAttempts"] == 60
 assert values["nodeAgent"]["infrastructureFirmwareVerifyDelaySeconds"] == 5
 assert values["nodeAgent"]["infrastructurePlatformVerifyAttempts"] == 90
 assert values["nodeAgent"]["infrastructurePlatformVerifyDelaySeconds"] == 5
+assert values["nodeAgent"]["capacityCollectionEnabled"] is False
+assert values["nodeAgent"]["capacityRequestTimeoutSeconds"] == 20
+assert values["nodeAgent"]["capacityMaxResponseBytes"] == 1048576
+assert values["nodeAgent"]["capacityMaxRequests"] == 8
+assert values["nodeAgent"]["capacityWorkerTimeoutSeconds"] == 60
 node_agent_template = (ROOT / "charts/hermes-control-plane/templates/node-agent.yaml").read_text()
 for marker in ("runAsNonRoot: true", "runAsUser: 10022", "runAsGroup: 10022", "fsGroup: 10022", "defaultMode: 0440"):
     assert marker in node_agent_template, marker
+for marker in (
+    "HERMES_CAPACITY_COLLECTION_ENABLED", "HERMES_CAPACITY_REQUEST_TIMEOUT_SECONDS",
+    "HERMES_CAPACITY_MAX_RESPONSE_BYTES", "HERMES_CAPACITY_MAX_REQUESTS",
+):
+    assert marker in node_agent_template, marker
+control_plane_template = (ROOT / "charts/hermes-control-plane/templates/control-plane.yaml").read_text()
+assert "HERMES_CAPACITY_WORKER_TIMEOUT_SECONDS" in control_plane_template
+for marker in (
+    "HERMES_CAPACITY_COLLECTION_ENABLED=false", "HERMES_CAPACITY_REQUEST_TIMEOUT_SECONDS=20",
+    "HERMES_CAPACITY_MAX_RESPONSE_BYTES=1048576", "HERMES_CAPACITY_MAX_REQUESTS=8",
+    "HERMES_CAPACITY_WORKER_TIMEOUT_SECONDS=60",
+):
+    assert marker in (ROOT / ".env.example").read_text(), marker
 validate_script = (ROOT / "validate.sh").read_text()
 assert 'PYTHONPATH=node-agent/src "$PYTHON_BIN" -m pytest -q node-agent/tests' in validate_script
 assert 'HERMES_PROVIDER_EXECUTION_ENABLED:-false' in (ROOT / "docker-compose.yml").read_text()
+assert 'HERMES_CAPACITY_COLLECTION_ENABLED=false' in (ROOT / ".env.example").read_text()
+assert 'capacityCollectionEnabled: false' in (ROOT / "charts/hermes-control-plane/values.yaml").read_text()
 assert 'executionEnabled: false' in (ROOT / "charts/hermes-control-plane/values.yaml").read_text()
 assert 'infrastructureExecutionEnabled: false' in (ROOT / "charts/hermes-control-plane/values.yaml").read_text()
 assert (ROOT / "node-agent/src/hermes_node_agent/infrastructure_runtime.py").is_file()
+assert (ROOT / "node-agent/src/hermes_node_agent/capacity_runtime.py").is_file()
+assert (ROOT / "node-agent/tests/test_capacity_runtime.py").is_file()
+assert (ROOT / "control-plane/tests/test_dev5_capacity_refresh.py").is_file()
 node_agent_dockerfile = (ROOT / "node-agent/Dockerfile").read_text()
 assert "openssh-client ca-certificates ipmitool" in node_agent_dockerfile
 node_agent_main = (ROOT / "node-agent/src/hermes_node_agent/main.py").read_text()

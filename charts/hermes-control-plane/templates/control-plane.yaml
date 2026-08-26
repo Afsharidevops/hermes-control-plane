@@ -44,6 +44,7 @@ spec:
             - name: HERMES_PROVIDER_WORKER_TOKEN
               valueFrom: {secretKeyRef: {name: {{ include "hermes.secretName" . }}, key: provider-worker-token}}
             - {name: HERMES_PROVIDER_WORKER_TIMEOUT_SECONDS, value: {{ .Values.nodeAgent.commandTimeout | quote }}}
+            - {name: HERMES_CAPACITY_WORKER_TIMEOUT_SECONDS, value: {{ .Values.nodeAgent.capacityWorkerTimeoutSeconds | quote }}}
             - {name: HERMES_HOST_OBSERVER_URL, value: http://{{ include "hermes.fullname" . }}-host-observer:{{ .Values.hostObserver.service.port }} }
             - name: HERMES_HOST_OBSERVER_TOKEN
               valueFrom: {secretKeyRef: {name: {{ include "hermes.secretName" . }}, key: host-observer-token}}

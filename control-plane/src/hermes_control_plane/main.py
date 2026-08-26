@@ -6,6 +6,7 @@ import hmac
 import ipaddress
 import re
 import json
+import math
 import os
 import secrets
 import time
@@ -4157,6 +4158,87 @@ def list_operation_jobs(authorization: str | None = Header(default=None)) -> lis
     return [_operation_job_dict(row) for row in rows]
 
 
+CAPACITY_FORBIDDEN_EVIDENCE_KEYS = _SECRET_METADATA_KEYS | {"url", "endpoint", "profile", "path", "headers", "body", "response", "credential_ref"}
+CAPACITY_RESOURCE_KEYS = {"scope_id", "resource", "unit", "limit", "used", "reserved", "headroom", "semantics"}
+CAPACITY_RESULT_KEYS = {
+    "schema_version", "operation", "observation_state", "provider", "observed_at", "capacity_kind", "coverage",
+    "scope", "resources", "source", "credential_material_returned", "mutation_commands_executed", "arbitrary_cli",
+    "arbitrary_shell", "observation_hash",
+}
+CAPACITY_SCOPE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+
+
+def _validate_capacity_payload(value: Any, *, depth: int = 0) -> None:
+    if depth > 6:
+        raise HTTPException(status_code=502, detail="capacity worker result is nested too deeply")
+    if isinstance(value, dict):
+        if len(value) > 128:
+            raise HTTPException(status_code=502, detail="capacity worker result object is too large")
+        for key, child in value.items():
+            normalized = re.sub(r"[^a-z0-9]", "", str(key).lower())
+            if normalized in {re.sub(r"[^a-z0-9]", "", item.lower()) for item in CAPACITY_FORBIDDEN_EVIDENCE_KEYS}:
+                raise HTTPException(status_code=502, detail="capacity worker result contains a forbidden sensitive field")
+            _validate_capacity_payload(child, depth=depth + 1)
+    elif isinstance(value, list):
+        if len(value) > 128:
+            raise HTTPException(status_code=502, detail="capacity worker result list is too large")
+        for child in value:
+            _validate_capacity_payload(child, depth=depth + 1)
+    elif isinstance(value, str) and len(value.encode("utf-8", errors="replace")) > 512:
+        raise HTTPException(status_code=502, detail="capacity worker result string is too large")
+
+
+def _validate_capacity_result(value: dict[str, Any], provider: dict[str, Any]) -> None:
+    if set(value) != CAPACITY_RESULT_KEYS:
+        raise HTTPException(status_code=502, detail="capacity worker returned an unsupported result schema")
+    if value.get("schema_version") != 1 or value.get("operation") != "capacity.refresh" or value.get("observation_state") != "LIVE":
+        raise HTTPException(status_code=502, detail="capacity worker did not return a live capacity observation")
+    returned_provider = value.get("provider")
+    if not isinstance(returned_provider, dict) or returned_provider != {
+        "id": provider["id"], "kind": provider["kind"], "api_version": provider["api_version"],
+        "implementation_version": provider["implementation_version"], "snapshot_hash": provider["snapshot_hash"],
+    }:
+        raise HTTPException(status_code=502, detail="capacity worker result does not match the provider snapshot")
+    if any(value.get(key) is not False for key in ("credential_material_returned", "mutation_commands_executed", "arbitrary_cli", "arbitrary_shell")):
+        raise HTTPException(status_code=502, detail="capacity worker returned unsafe execution assertions")
+    observed_at = value.get("observed_at")
+    if isinstance(observed_at, bool) or not isinstance(observed_at, int) or abs(int(time.time()) - observed_at) > 90:
+        raise HTTPException(status_code=502, detail="capacity worker observation is stale or invalid")
+    if value.get("capacity_kind") != "host_utilization" or value.get("coverage") != "allowlisted_nodes":
+        raise HTTPException(status_code=502, detail="capacity worker returned unsupported capacity semantics")
+    scope = value.get("scope")
+    if not isinstance(scope, dict) or set(scope) != {"node_count"} or isinstance(scope.get("node_count"), bool) or not isinstance(scope.get("node_count"), int) or not 1 <= scope["node_count"] <= 32:
+        raise HTTPException(status_code=502, detail="capacity worker result scope is invalid")
+    resources = value.get("resources")
+    if not isinstance(resources, list) or len(resources) != scope["node_count"] * 2 or len(resources) > 64:
+        raise HTTPException(status_code=502, detail="capacity worker resources are invalid")
+    seen: set[tuple[str, str]] = set()
+    for resource in resources:
+        if not isinstance(resource, dict) or set(resource) != CAPACITY_RESOURCE_KEYS:
+            raise HTTPException(status_code=502, detail="capacity worker resource schema is invalid")
+        scope_id = resource.get("scope_id")
+        if not isinstance(scope_id, str) or not CAPACITY_SCOPE_ID_RE.fullmatch(scope_id):
+            raise HTTPException(status_code=502, detail="capacity worker resource scope is invalid")
+        if resource.get("resource") not in {"cpu", "memory"} or resource.get("unit") not in {"cores", "bytes"} or resource.get("semantics") != "host_utilization":
+            raise HTTPException(status_code=502, detail="capacity worker resource semantics are invalid")
+        if (scope_id, resource["resource"]) in seen:
+            raise HTTPException(status_code=502, detail="capacity worker returned duplicate resources")
+        seen.add((scope_id, resource["resource"]))
+        values = {key: resource.get(key) for key in ("limit", "used", "headroom")}
+        if any(isinstance(number, bool) or not isinstance(number, (int, float)) or not math.isfinite(float(number)) or number < 0 for number in values.values()):
+            raise HTTPException(status_code=502, detail="capacity worker resource number is invalid")
+        if resource.get("reserved") is not None or not math.isclose(float(values["limit"]), float(values["used"]) + float(values["headroom"]), rel_tol=0.0, abs_tol=1e-6):
+            raise HTTPException(status_code=502, detail="capacity worker resource arithmetic is invalid")
+    source = value.get("source")
+    if source != {"adapter": "proxmox-api-token-v1", "endpoint_profile": "pve-8.2", "request_count": 1}:
+        raise HTTPException(status_code=502, detail="capacity worker source metadata is invalid")
+    _validate_capacity_payload(value)
+    unsigned = dict(value)
+    observation_hash = unsigned.pop("observation_hash")
+    if not isinstance(observation_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", observation_hash) or observation_hash != sha256_hex(unsigned):
+        raise HTTPException(status_code=502, detail="capacity worker observation hash is invalid")
+
+
 @app.post("/v1/operations-center/intents/plan", status_code=201)
 async def plan_operations_intent(payload: OperationsIntentPlanCreate, authorization: str | None = Header(default=None)) -> dict[str, Any]:
     selector = payload.selector.model_dump()
@@ -4164,6 +4246,24 @@ async def plan_operations_intent(payload: OperationsIntentPlanCreate, authorizat
     _validate_credential_metadata(payload.desired_state)
     if payload.domain == "read":
         _require_admin(authorization)
+        if payload.operation == "capacity.refresh":
+            if payload.target_id is not None or payload.parameters or payload.desired_state or not payload.provider_id or not payload.provider_id.startswith("ipr_"):
+                raise HTTPException(status_code=422, detail="capacity.refresh requires only an infrastructure provider_id")
+            with closing(db.connect()) as conn:
+                provider = _infrastructure_provider_snapshot(conn, payload.provider_id)
+                try:
+                    query_plan = operations.capacity_query_plan(provider_snapshot=provider)
+                except ValueError as exc:
+                    raise HTTPException(status_code=422, detail=str(exc)) from exc
+                result = await provider_worker.capacity_refresh(provider)
+                _validate_capacity_result(result, provider)
+                db.audit(conn, "provider.capacity.refreshed", "admin", "infrastructure_provider", provider["id"], {
+                    "provider_kind": provider["kind"], "observation_state": result["observation_state"],
+                    "observed_at": result["observed_at"], "request_count": result["source"]["request_count"],
+                    "observation_hash": result["observation_hash"],
+                })
+                conn.commit()
+            return {"mode": "read", "query_plan": query_plan, "observation": result, "changeset": None, "operation_job": None}
         try:
             query_plan = operations.read_query_plan(operation=payload.operation, selector=selector, parameters=payload.parameters)
         except ValueError as exc:

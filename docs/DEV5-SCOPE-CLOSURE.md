@@ -422,7 +422,7 @@ Local integration now includes trusted Redfish `secure-boot.apply`, `sriov.apply
 
 Immediate/reboot activation is provider-fixed for mapped features and boot order; reboot paths require the system to be powered on, use only a fixed approved Redfish reset type, and poll active state with a bounded restart-specific verification window. Transient BMC unavailability is tolerated only during that bounded reboot verification window. No arbitrary BIOS attribute, Redfish body, shell or CLI surface is introduced.
 
-This remains local/mock integration evidence. Management/provisioning network state, switch/network mutation, cloud/virtualization capacity workers, capacity-backed decommission/scale/cloning/provider-recreation DR and matching real-target collectors remain open. Proxmox VE and VMware Workstation are explicitly added to the provider plan as CONTRACT-ONLY targets; they are not runtime-complete.
+This remains local/mock integration evidence. Management/provisioning network state, switch/network mutation, capacity-backed decommission/scale/cloning/provider-recreation DR and matching real-target collectors remain open. Proxmox VE is now capacity-runtime-complete (read-only, disabled-by-default); VMware Workstation remains contract-only for capacity — its API does not provide verifiable free host capacity.
 
 ### Batch C9 — constrained OpenConfig RESTCONF switch runtime
 
@@ -433,6 +433,23 @@ Provider registration and planning require an HTTPS IP-literal endpoint at the e
 Planning binds a sanitized deterministic current-state snapshot and hash into the approved typed plan. Execution re-reads the same bounded state, rejects drift, uses ETag `If-Match` for fixed mutations when supplied by the device, and actively re-collects until exact VLAN/port convergence. LLDP performs collection and re-collection without mutation. Returned evidence keeps only bounded identifiers, ETags, and sanitized neighbor names/ports; it suppresses management addresses, chassis identifiers, free-form descriptions/capabilities, raw device configuration, and credentials.
 
 This is local/mock integration evidence only. Execution is disabled by default. Disposable real-switch validation remains required for the exact profile, including TLS behavior, ETag behavior, preview drift rejection, idempotence, convergence, replay rejection, and redaction. NETCONF, generic RESTCONF, hostname endpoints, BGP, bonds, attach/detach, other vendor/model profiles, management/provisioning-network execution, and switch-capacity lifecycle remain open.
+
+### C10/C11 — read-only Proxmox capacity collector
+
+A read-only Proxmox capacity collector is now implemented locally, disabled by default (`HERMES_CAPACITY_COLLECTION_ENABLED=false`). It is a truthful, authenticated-only provider capacity feature: a `LIVE` observation state means every required authenticated PVE API call succeeded. No deterministic local answer, fixture, cache, or synthetic calculation is labeled as live evidence.
+
+Security/runtime properties:
+
+- The collector accepts only a canonical provider snapshot with matching `snapshot_hash`, validates the Proxmox kind against `PROVIDER_PINS`, and reads worker-mounted credentials from `<credential-ref>/profile.json` using strict containment and symlink rejection.
+- HTTP transport uses stdlib with TLS verification, `urllib.request.ProxyHandler({})` (no ambient proxy), `_NoRedirect`, and a fixed 20-second per-request timeout. The only permitted URL is `https://host:8006/api2/json/cluster/resources?type=node`.
+- The response is bounded to 1 MiB, and a maximum of 8 requests total are issued. Auth failure, transport failure, policy violation, upstream schema mismatch, response limit, or pagination limit all produce a generic bounded error with no result body.
+- Normalized resources contain only `{scope_id, resource, unit, limit, used, reserved, headroom, semantics}` per allowlisted node. Secret-shaped field names, raw PVE response bodies, endpoint URLs, credential paths, and token material are excluded from the returned evidence.
+- The envelope includes `credential_material_returned=False`, `mutation_commands_executed=False`, `arbitrary_cli=False`, `arbitrary_shell=False`, and an `observation_hash` computed over the canonical JSON of the complete envelope.
+- The Control Plane validates the result against a strict schema: exact key set, `observation_state=LIVE`, matching provider identity, bounded resource count/values, and matching observation hash. Non-compliant results are rejected before audit.
+
+VMware Workstation remains contract-only for capacity. Its deployed REST API/version must first be verified to provide a documented authenticated inventory endpoint with unambiguous allocation fields and reliable physical host free capacity before an adapter can be added. VMware vSphere, OpenStack, AWS, Azure, and GCP capacity collectors also remain contract-only.
+
+All C10/C11 VM/cloud mutation operations remain `CONTRACT_ONLY` and are not listed in any runtime operation map. The capacity collector adds no mutation path, no cloud SDK dependency, and no change to the existing mutation governance.
 
 ### Trusted host observation for unified verification
 

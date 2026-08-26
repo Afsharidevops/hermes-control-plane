@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 from typing import Any
@@ -18,6 +19,11 @@ def _headers() -> dict[str, str]:
     return {"Authorization": f"Bearer {TOKEN}"}
 
 
+CAPACITY_TIMEOUT = float(os.getenv("HERMES_CAPACITY_WORKER_TIMEOUT_SECONDS", "60"))
+CAPACITY_MAX_TIMEOUT = 60.0
+CAPACITY_MAX_RESPONSE_BYTES = 1_048_576
+
+
 async def post(path: str, payload: dict[str, Any]) -> dict[str, Any]:
     try:
         async with httpx.AsyncClient(timeout=TIMEOUT) as client:
@@ -33,6 +39,40 @@ async def post(path: str, payload: dict[str, Any]) -> dict[str, Any]:
         raise HTTPException(status_code=response.status_code, detail=detail or "provider worker request failed")
     if not isinstance(body, dict):
         raise HTTPException(status_code=502, detail="provider worker returned invalid response")
+    return body
+
+
+async def capacity_refresh(provider_snapshot: dict[str, Any]) -> dict[str, Any]:
+    if not 0 < CAPACITY_TIMEOUT <= CAPACITY_MAX_TIMEOUT:
+        raise HTTPException(status_code=503, detail="capacity worker timeout is outside the fixed bound")
+    try:
+        async with httpx.AsyncClient(timeout=CAPACITY_TIMEOUT, follow_redirects=False) as client:
+            async with client.stream(
+                "POST",
+                f"{BASE_URL}/v1/capacity/refresh",
+                headers=_headers(),
+                json={"provider_snapshot": provider_snapshot},
+            ) as response:
+                chunks: list[bytes] = []
+                size = 0
+                async for chunk in response.aiter_bytes():
+                    size += len(chunk)
+                    if size > CAPACITY_MAX_RESPONSE_BYTES:
+                        raise HTTPException(status_code=502, detail="capacity worker response exceeds the bounded limit")
+                    chunks.append(chunk)
+                raw = b"".join(chunks)
+    except HTTPException:
+        raise
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"capacity worker unavailable: {type(exc).__name__}") from exc
+    try:
+        body = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise HTTPException(status_code=502, detail="capacity worker returned non-JSON response") from exc
+    if response.status_code >= 400:
+        raise HTTPException(status_code=502, detail="capacity worker collection failed")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=502, detail="capacity worker returned invalid response")
     return body
 
 

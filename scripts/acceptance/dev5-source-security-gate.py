@@ -556,4 +556,77 @@ assert 'public_network_required' in factory
 assert 'PXE artifact manifest drifted after planning' in cp_main
 assert 'private-offline network_scope' in cp_main
 
+# Dev.5 C10/C11 capacity refresh is a read-only, disabled-by-default Proxmox-only live collector.
+# It never fabricates LIVE evidence, returns credentials, or executes mutation commands.
+capacity_runtime = text("node-agent/src/hermes_node_agent/capacity_runtime.py")
+for marker in (
+    'COLLECTION_ENABLED = os.getenv("HERMES_CAPACITY_COLLECTION_ENABLED", "false").lower() == "true"',
+    'REQUEST_TIMEOUT = float(os.getenv("HERMES_CAPACITY_REQUEST_TIMEOUT_SECONDS", "20"))',
+    'MAX_RESPONSE_BYTES = int(os.getenv("HERMES_CAPACITY_MAX_RESPONSE_BYTES", "1048576"))',
+    'MAX_REQUESTS = int(os.getenv("HERMES_CAPACITY_MAX_REQUESTS", "8"))',
+    'PROVIDER_PINS = {"proxmox": ("pve-8.2", "pve-capacity-v1")}',
+    'def canonical_json(value: Any) -> str:',
+    'def sha256_hex(value: Any) -> str:',
+    'def _safe_child(directory: Path, name: str) -> Path:',
+    'def _secret(directory: Path, profile: dict[str, Any], field: str) -> str:',
+    'def _url(base: str, path: str, query: dict[str, str]) -> str:',
+    'def _request(url: str, *, authorization: str, ca_file: Path | None, requests: list[int]) -> dict[str, Any]:',
+    'def _proxmox(snapshot: dict[str, Any], caps: dict[str, Any], directory: Path, profile: dict[str, Any], requests: list[int]) -> list[dict[str, Any]]:',
+    'def collect(provider_snapshot: dict[str, Any]) -> dict[str, Any]:',
+    'observation_state": "LIVE"',
+    'credential_material_returned": False',
+    'mutation_commands_executed": False',
+    'arbitrary_cli": False',
+    'arbitrary_shell": False',
+    'observation_hash": sha256_hex(result)',
+    'urllib.request.ProxyHandler({})',
+    'PVEAPIToken=',
+    '"/cluster/resources"',
+    'POLICY_DENIED',
+    'AUTH_FAILED',
+    'UPSTREAM_UNAVAILABLE',
+    'UPSTREAM_SCHEMA_INVALID',
+    'RESPONSE_LIMIT',
+    'snapshot.get("snapshot_hash")',
+    '_safe_child(directory, "profile.json")',
+    'candidate.is_symlink()',
+):
+    assert marker in capacity_runtime, marker
+for forbidden in (
+    'os.system', 'shell=True', 'subprocess', 'boto3', 'google-cloud', 'azure-identity',
+    'openstacksdk', 'pyvmomi',
+):
+    assert forbidden not in capacity_runtime, forbidden
+assert 'capacity.refresh' in operations
+assert 'capacity_query_plan' in operations
+assert 'validate_capacity_provider' in operations
+assert 'ProviderCapacityQuery' in operations
+assert 'CAPACITY_PROVIDER_KINDS = {"proxmox"}' in operations
+assert 'live_upstream_required": True' in operations
+assert 'mutation_runtime": "CONTRACT_ONLY"' in operations
+assert '@app.post("/v1/capacity/refresh")' in provider_agent_main
+assert 'capacity_runtime.collect(payload.provider_snapshot)' in provider_agent_main
+assert 'proxmox-capacity-collector-v1' in provider_agent_main
+assert 'proxmox-capacity-collector-disabled' in provider_agent_main
+assert '"proxmox"' in operations and '"vmware-workstation"' in operations
+assert '_validate_capacity_payload' in cp_main
+assert '_validate_capacity_result' in cp_main
+assert 'CAPACITY_FORBIDDEN_EVIDENCE_KEYS' in cp_main
+assert 'CAPACITY_RESOURCE_KEYS' in cp_main
+assert 'CAPACITY_RESULT_KEYS' in cp_main
+assert 'provider.capacity.refreshed' in cp_main
+assert 'provider_worker.capacity_refresh(provider)' in cp_main
+assert '"vmware-workstation"' in operations
+assert 'vmware-workstation-contract-only' in provider_agent_main
+assert 'vmware-contract-only' in provider_agent_main
+assert 'openstack-contract-only' in provider_agent_main
+assert 'aws-contract-only' in provider_agent_main
+assert 'azure-contract-only' in provider_agent_main
+assert 'gcp-contract-only' in provider_agent_main
+assert 'proxmox-contract-only' in provider_agent_main
+# C10/C11 mutation operations must remain CONTRACT_ONLY — none enter INFRASTRUCTURE_RUNTIME_OPERATIONS.
+infra_runtime = operations.split('INFRASTRUCTURE_RUNTIME_OPERATIONS: dict[str, set[str]] = {', 1)[1].split('\n}\n', 1)[0]
+for forbidden in ('"proxmox"', '"vmware-workstation"', '"vmware"', '"openstack"', '"aws"', '"azure"', '"gcp"'):
+    assert forbidden not in infra_runtime, f'{forbidden} must not be in INFRASTRUCTURE_RUNTIME_OPERATIONS'
+
 print("0.5.11-dev.5-source-security: PASS")
