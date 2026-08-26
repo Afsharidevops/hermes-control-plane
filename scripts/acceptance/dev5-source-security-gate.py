@@ -464,6 +464,9 @@ for marker in (
     '"redfish": {"inventory.refresh", "power.set", "boot.set", "boot-order.apply", "secure-boot.apply", "sriov.apply", "iommu.apply", "virtual-media.insert", "virtual-media.eject", "bios.apply", "firmware.apply", "storage.volume.apply", "storage.volume.delete"}',
     '"ipmi": {"power.set", "boot.set"}',
     '"pxe": {"os.provision", "os.reimage"}',
+    '"network-switch": {"vlan.ensure", "port.configure", "lldp.observe"}',
+    'SWITCH_RESTCONF_PROFILE = "openconfig-restconf-v1"',
+    'validate_network_switch_provider',
 ):
     assert marker in operations, marker
 for marker in (
@@ -527,8 +530,19 @@ for marker in (
     'bearer-pxe-controller',
     '"arbitrary_ipxe_script": False',
     'socket.create_connection',
+    '"network-switch": {"vlan.ensure", "port.configure", "lldp.observe"}',
+    'SWITCH_RESTCONF_PROFILE = "openconfig-restconf-v1"',
+    'network-switch endpoint must use an IP literal, not a hostname',
+    'network-switch endpoint must use the fixed /restconf/data root',
+    'urllib.request.ProxyHandler({})',
+    'network-switch redirect rejected',
+    'network-switch response exceeded the bounded JSON limit',
+    'f"{kind}-active-verify"',
 ):
     assert marker in infrastructure_runtime, marker
+assert '"openconfig-restconf-v1-vlan-port-lldp-runtime"' in provider_agent_main
+assert '"network-switch-runtime"' not in provider_agent_main
+assert 'network-switch' in operations and 'bgp.configure' in operations
 for forbidden in ('os.system', 'shell=True', 'eval(', 'exec(', 'verify_mode = ssl.CERT_NONE', 'check_hostname = False'):
     assert forbidden not in infrastructure_runtime, forbidden
 assert '/v1/infrastructure/preview' in provider_agent_main and '/v1/infrastructure/execute' in provider_agent_main

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 import re
 from typing import Any
 from urllib.parse import urlparse
@@ -110,6 +111,7 @@ INFRASTRUCTURE_RUNTIME_OPERATIONS: dict[str, set[str]] = {
     # here. Listing a kind makes the control plane dispatch to the infrastructure worker
     # instead of emitting a CONTRACT_ONLY plan, so C9/C10 kinds stay out until they land.
     "host-network": {"interface.configure", "interface.bond", "vlan.configure", "mtu.configure", "address.configure", "network.discover"},
+    "network-switch": {"vlan.ensure", "port.configure", "lldp.observe"},
 }
 REDFISH_POWER_STATES = {"on", "force-off", "graceful-shutdown", "restart", "graceful-restart", "power-cycle"}
 REDFISH_BOOT_TARGETS = {"pxe", "disk", "cd", "none"}
@@ -133,6 +135,11 @@ PXE_REQUIRED_ARTIFACT_ROLES = {"kernel", "initrd", "unattended"}
 PXE_REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{2,119}$")
 PXE_ARTIFACT_ID_RE = re.compile(r"^art_[A-Za-z0-9]{8,64}$")
 PXE_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+SWITCH_RESTCONF_PROFILE = "openconfig-restconf-v1"
+SWITCH_RESTCONF_API_VERSION = "openconfig-restconf-1.0"
+SWITCH_RESTCONF_IMPLEMENTATION_VERSION = "openconfig-restconf-v1"
+SWITCH_PORT_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]{0,63}$")
+SWITCH_VLAN_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_. -]{0,63}$")
 
 ARTIFACT_KINDS = ("oci-image", "helm-chart", "package", "git-release", "ansible-collection", "apt-repository", "rpm-repository", "python-repository")
 
@@ -678,7 +685,48 @@ def validate_infrastructure_desired_state(provider_kind: str, operation: str, de
             return
         return
     if provider_kind == "network-switch":
-        return
+        if operation == "lldp.observe":
+            if desired_state:
+                raise ValueError("network-switch lldp.observe does not accept desired_state fields")
+            return
+        if operation == "vlan.ensure":
+            if set(desired_state) != {"vlan_id", "name"}:
+                raise ValueError("network-switch vlan.ensure requires only vlan_id and name")
+            vlan_id = desired_state.get("vlan_id")
+            if not isinstance(vlan_id, int) or isinstance(vlan_id, bool) or not 1 <= vlan_id <= 4094:
+                raise ValueError("network-switch vlan_id must be an integer between 1 and 4094")
+            name = str(desired_state.get("name") or "")
+            if not SWITCH_VLAN_NAME_RE.fullmatch(name):
+                raise ValueError("network-switch VLAN name is unsafe")
+            return
+        if operation == "port.configure":
+            allowed = {"port", "mode", "access_vlan", "trunk_vlans"}
+            unknown = sorted(set(desired_state) - allowed)
+            if unknown:
+                raise ValueError("unsupported network-switch port.configure field(s): " + ", ".join(unknown))
+            port = str(desired_state.get("port") or "")
+            mode = str(desired_state.get("mode") or "").lower()
+            if not SWITCH_PORT_RE.fullmatch(port):
+                raise ValueError("network-switch port identifier is unsafe")
+            if mode == "access":
+                if set(desired_state) != {"port", "mode", "access_vlan"}:
+                    raise ValueError("network-switch access port requires only port, mode and access_vlan")
+                vlan_id = desired_state.get("access_vlan")
+                if not isinstance(vlan_id, int) or isinstance(vlan_id, bool) or not 1 <= vlan_id <= 4094:
+                    raise ValueError("network-switch access_vlan must be an integer between 1 and 4094")
+                return
+            if mode == "trunk":
+                if set(desired_state) != {"port", "mode", "trunk_vlans"}:
+                    raise ValueError("network-switch trunk port requires only port, mode and trunk_vlans")
+                vlan_ids = desired_state.get("trunk_vlans")
+                if not isinstance(vlan_ids, list) or not 1 <= len(vlan_ids) <= 64:
+                    raise ValueError("network-switch trunk_vlans must contain between 1 and 64 VLAN IDs")
+                if any(not isinstance(item, int) or isinstance(item, bool) or not 1 <= item <= 4094 for item in vlan_ids):
+                    raise ValueError("network-switch trunk_vlans must contain VLAN IDs between 1 and 4094")
+                if len(set(vlan_ids)) != len(vlan_ids):
+                    raise ValueError("network-switch trunk_vlans must be unique")
+                return
+            raise ValueError("network-switch port mode must be access or trunk")
     if provider_kind in {"proxmox", "vmware-workstation", "vmware", "openstack", "aws", "azure", "gcp"}:
         return
     if provider_kind != "redfish":
@@ -821,6 +869,64 @@ def validate_infrastructure_desired_state(provider_kind: str, operation: str, de
         raise ValueError("unsupported Redfish boot mode")
 
 
+def validate_network_switch_provider(provider: dict[str, Any], desired_state: dict[str, Any] | None = None, operation: str | None = None) -> None:
+    endpoint = str(provider.get("endpoint") or "")
+    parsed = urlparse(endpoint)
+    if parsed.scheme != "https" or not parsed.hostname or parsed.username is not None or parsed.password is not None or parsed.query or parsed.fragment:
+        raise ValueError("network-switch endpoint must be credential-free HTTPS")
+    try:
+        ipaddress.ip_address(parsed.hostname)
+    except ValueError as exc:
+        raise ValueError("network-switch endpoint must use an IP literal, not a hostname") from exc
+    if parsed.path.rstrip("/") != "/restconf/data":
+        raise ValueError("network-switch endpoint must use the fixed /restconf/data root")
+    if str(provider.get("api_version") or "") != SWITCH_RESTCONF_API_VERSION:
+        raise ValueError("network-switch api_version does not match the supported RESTCONF profile")
+    if str(provider.get("implementation_version") or "") != SWITCH_RESTCONF_IMPLEMENTATION_VERSION:
+        raise ValueError("network-switch implementation_version does not match the supported RESTCONF profile")
+    capabilities = provider.get("capabilities") if isinstance(provider.get("capabilities"), dict) else {}
+    if set(capabilities) - {"profile", "model", "port_allowlist", "vlan_allowlist", "port_modes"}:
+        raise ValueError("network-switch capabilities contain unsupported fields")
+    if capabilities.get("profile") != SWITCH_RESTCONF_PROFILE:
+        raise ValueError("network-switch requires the supported pinned RESTCONF profile")
+    model = str(capabilities.get("model") or "")
+    if not SWITCH_VLAN_NAME_RE.fullmatch(model):
+        raise ValueError("network-switch model pin is invalid")
+    ports = capabilities.get("port_allowlist")
+    vlans = capabilities.get("vlan_allowlist")
+    if not isinstance(ports, list) or not 1 <= len(ports) <= 128:
+        raise ValueError("network-switch requires a bounded non-empty port_allowlist")
+    if not isinstance(vlans, list) or not 1 <= len(vlans) <= 256:
+        raise ValueError("network-switch requires a bounded non-empty vlan_allowlist")
+    normalized_ports = [str(item) for item in ports]
+    normalized_vlans = list(vlans)
+    if any(not SWITCH_PORT_RE.fullmatch(item) for item in normalized_ports) or len(set(normalized_ports)) != len(normalized_ports):
+        raise ValueError("network-switch port_allowlist contains unsafe or duplicate entries")
+    if any(not isinstance(item, int) or isinstance(item, bool) or not 1 <= item <= 4094 for item in normalized_vlans) or len(set(normalized_vlans)) != len(normalized_vlans):
+        raise ValueError("network-switch vlan_allowlist contains invalid or duplicate VLAN IDs")
+    mode_policy = capabilities.get("port_modes", {})
+    if not isinstance(mode_policy, dict) or set(mode_policy) - set(normalized_ports):
+        raise ValueError("network-switch port_modes must only reference allowlisted ports")
+    for port, modes in mode_policy.items():
+        if not isinstance(modes, list) or not modes or len(modes) > 2 or set(modes) - {"access", "trunk"}:
+            raise ValueError("network-switch port_modes must contain access and/or trunk")
+    if desired_state is None or operation is None:
+        return
+    if operation == "vlan.ensure" and desired_state["vlan_id"] not in set(normalized_vlans):
+        raise ValueError("network-switch VLAN is not allowlisted by provider capabilities")
+    if operation == "port.configure":
+        port = desired_state["port"]
+        if port not in set(normalized_ports):
+            raise ValueError("network-switch port is not allowlisted by provider capabilities")
+        mode = desired_state["mode"]
+        if mode_policy.get(port) and mode not in set(mode_policy[port]):
+            raise ValueError("network-switch port mode is not permitted by provider capabilities")
+        vlan_ids = [desired_state["access_vlan"]] if mode == "access" else desired_state["trunk_vlans"]
+        denied = sorted(set(vlan_ids) - set(normalized_vlans))
+        if denied:
+            raise ValueError("network-switch VLAN is not allowlisted by provider capabilities: " + ", ".join(str(item) for item in denied))
+
+
 def infrastructure_runtime_capable(plan: dict[str, Any]) -> bool:
     provider = plan.get("provider") if isinstance(plan.get("provider"), dict) else {}
     preview = plan.get("runtime_preview") if isinstance(plan.get("runtime_preview"), dict) else {}
@@ -868,6 +974,8 @@ def infrastructure_plan(
     if operation not in contract["actions"]:
         raise ValueError(f"operation {operation} is not supported by {provider_kind}")
     validate_infrastructure_desired_state(provider_kind, operation, desired_state)
+    if provider_kind == "network-switch":
+        validate_network_switch_provider(provider, desired_state, operation)
     runtime_operation = infrastructure_runtime_operation_capable(provider_kind, operation)
     if runtime_preview is not None:
         if not runtime_operation:

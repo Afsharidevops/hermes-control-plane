@@ -3918,6 +3918,11 @@ def create_infrastructure_provider(payload: InfrastructureProviderCreate, author
     _require_admin(authorization)
     _validate_credential_metadata(payload.capabilities)
     _reject_embedded_url_credentials(payload.endpoint, "provider endpoint")
+    if payload.kind == "network-switch":
+        try:
+            operations.validate_network_switch_provider(payload.model_dump())
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
     provider_id = f"ipr_{uuid.uuid4().hex[:16]}"
     now = int(time.time())
     with closing(db.connect()) as conn:

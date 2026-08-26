@@ -15,6 +15,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from urllib.parse import quote
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin, urlparse
@@ -45,6 +46,7 @@ RUNTIME_PROVIDER_OPERATIONS = {
     "ipmi": {"power.set", "boot.set"},
     "pxe": {"os.provision", "os.reimage"},
     "host-network": {"interface.configure", "interface.bond", "vlan.configure", "mtu.configure", "address.configure", "network.discover"},
+    "network-switch": {"vlan.ensure", "port.configure", "lldp.observe"},
 }
 POWER_RESET_TYPES = {
     "on": "On",
@@ -96,6 +98,11 @@ PXE_MAC_RE = re.compile(r"^(?:[0-9a-f]{2}:){5}[0-9a-f]{2}$")
 PXE_NIC_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$")
 PXE_PACKAGE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9+._:@/-]{0,159}$")
 PXE_PROFILE_OS = {"ubuntu", "debian", "rhel", "rocky", "alma", "sles"}
+SWITCH_RESTCONF_PROFILE = "openconfig-restconf-v1"
+SWITCH_RESTCONF_API_VERSION = "openconfig-restconf-1.0"
+SWITCH_RESTCONF_IMPLEMENTATION_VERSION = "openconfig-restconf-v1"
+SWITCH_PORT_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]{0,63}$")
+SWITCH_VLAN_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_. -]{0,63}$")
 
 
 def canonical_json(value: Any) -> str:
@@ -365,7 +372,48 @@ def _validate_desired_state(kind: str, operation: str, desired: dict[str, Any]) 
             return result_h
         raise HTTPException(422, "unsupported host-network runtime operation")
     if kind == "network-switch":
-        return desired
+        if operation == "lldp.observe":
+            if desired:
+                raise HTTPException(422, "network-switch lldp.observe does not accept desired_state fields")
+            return {}
+        if operation == "vlan.ensure":
+            if set(desired) != {"vlan_id", "name"}:
+                raise HTTPException(422, "network-switch vlan.ensure requires only vlan_id and name")
+            vlan_id = desired.get("vlan_id")
+            name = str(desired.get("name") or "")
+            if not isinstance(vlan_id, int) or isinstance(vlan_id, bool) or not 1 <= vlan_id <= 4094:
+                raise HTTPException(422, "network-switch vlan_id must be an integer between 1 and 4094")
+            if not SWITCH_VLAN_NAME_RE.fullmatch(name):
+                raise HTTPException(422, "network-switch VLAN name is unsafe")
+            return {"vlan_id": vlan_id, "name": name}
+        if operation == "port.configure":
+            allowed = {"port", "mode", "access_vlan", "trunk_vlans"}
+            unknown = sorted(set(desired) - allowed)
+            if unknown:
+                raise HTTPException(422, "unsupported network-switch port.configure field(s): " + ", ".join(unknown))
+            port = str(desired.get("port") or "")
+            mode = str(desired.get("mode") or "").lower()
+            if not SWITCH_PORT_RE.fullmatch(port):
+                raise HTTPException(422, "network-switch port identifier is unsafe")
+            if mode == "access":
+                if set(desired) != {"port", "mode", "access_vlan"}:
+                    raise HTTPException(422, "network-switch access port requires only port, mode and access_vlan")
+                vlan_id = desired.get("access_vlan")
+                if not isinstance(vlan_id, int) or isinstance(vlan_id, bool) or not 1 <= vlan_id <= 4094:
+                    raise HTTPException(422, "network-switch access_vlan must be an integer between 1 and 4094")
+                return {"port": port, "mode": mode, "access_vlan": vlan_id}
+            if mode == "trunk":
+                if set(desired) != {"port", "mode", "trunk_vlans"}:
+                    raise HTTPException(422, "network-switch trunk port requires only port, mode and trunk_vlans")
+                vlan_ids = desired.get("trunk_vlans")
+                if not isinstance(vlan_ids, list) or not 1 <= len(vlan_ids) <= 64:
+                    raise HTTPException(422, "network-switch trunk_vlans must contain between 1 and 64 VLAN IDs")
+                if any(not isinstance(item, int) or isinstance(item, bool) or not 1 <= item <= 4094 for item in vlan_ids):
+                    raise HTTPException(422, "network-switch trunk_vlans must contain VLAN IDs between 1 and 4094")
+                if len(set(vlan_ids)) != len(vlan_ids):
+                    raise HTTPException(422, "network-switch trunk_vlans must be unique")
+                return {"port": port, "mode": mode, "trunk_vlans": sorted(vlan_ids)}
+            raise HTTPException(422, "network-switch port mode must be access or trunk")
     if kind in {"proxmox", "vmware-workstation", "vmware", "openstack", "aws", "azure", "gcp"}:
         return desired
     if kind != "redfish":
@@ -583,6 +631,222 @@ def _credential_profile(credential_ref: str) -> dict[str, Any]:
     if profile.get("ca_file"):
         ca_file = _safe_child(directory, str(profile["ca_file"]))
     return {"username": username, "password": password, "ca_file": ca_file}
+
+
+def _switch_endpoint(provider: dict[str, Any]) -> str:
+    raw = str(provider.get("endpoint") or "").rstrip("/")
+    parsed = urlparse(raw)
+    if parsed.scheme != "https" or not parsed.hostname or parsed.username is not None or parsed.password is not None or parsed.query or parsed.fragment:
+        raise HTTPException(422, "network-switch endpoint must be credential-free HTTPS")
+    try:
+        ipaddress.ip_address(parsed.hostname)
+    except ValueError as exc:
+        raise HTTPException(422, "network-switch endpoint must use an IP literal, not a hostname") from exc
+    if parsed.path != "/restconf/data":
+        raise HTTPException(422, "network-switch endpoint must use the fixed /restconf/data root")
+    return raw
+
+
+def _switch_policy(provider: dict[str, Any], desired: dict[str, Any] | None = None, operation: str | None = None) -> dict[str, Any]:
+    if str(provider.get("api_version") or "") != SWITCH_RESTCONF_API_VERSION or str(provider.get("implementation_version") or "") != SWITCH_RESTCONF_IMPLEMENTATION_VERSION:
+        raise HTTPException(422, "network-switch provider versions do not match the supported RESTCONF profile")
+    caps = provider.get("capabilities") if isinstance(provider.get("capabilities"), dict) else {}
+    if set(caps) - {"profile", "model", "port_allowlist", "vlan_allowlist", "port_modes"} or caps.get("profile") != SWITCH_RESTCONF_PROFILE:
+        raise HTTPException(422, "network-switch requires the supported pinned RESTCONF profile")
+    model = str(caps.get("model") or "")
+    ports = caps.get("port_allowlist")
+    vlans = caps.get("vlan_allowlist")
+    if not SWITCH_VLAN_NAME_RE.fullmatch(model) or not isinstance(ports, list) or not 1 <= len(ports) <= 128 or not isinstance(vlans, list) or not 1 <= len(vlans) <= 256:
+        raise HTTPException(422, "network-switch capability policy is incomplete")
+    port_set = {str(item) for item in ports}
+    vlan_set = set(vlans)
+    if len(port_set) != len(ports) or any(not SWITCH_PORT_RE.fullmatch(port) for port in port_set):
+        raise HTTPException(422, "network-switch port allowlist contains unsafe or duplicate entries")
+    if len(vlan_set) != len(vlans) or any(not isinstance(vlan, int) or isinstance(vlan, bool) or not 1 <= vlan <= 4094 for vlan in vlan_set):
+        raise HTTPException(422, "network-switch VLAN allowlist contains invalid or duplicate entries")
+    raw_modes = caps.get("port_modes", {})
+    if not isinstance(raw_modes, dict) or set(raw_modes) - port_set:
+        raise HTTPException(422, "network-switch port mode policy is invalid")
+    modes: dict[str, set[str]] = {}
+    for port, values in raw_modes.items():
+        if not isinstance(values, list) or not values or len(values) > 2 or set(values) - {"access", "trunk"}:
+            raise HTTPException(422, "network-switch port mode policy is invalid")
+        modes[str(port)] = set(values)
+    if desired is not None and operation == "vlan.ensure" and desired["vlan_id"] not in vlan_set:
+        raise HTTPException(422, "network-switch VLAN is not allowlisted by provider capabilities")
+    if desired is not None and operation == "port.configure":
+        if desired["port"] not in port_set:
+            raise HTTPException(422, "network-switch port is not allowlisted by provider capabilities")
+        if modes.get(desired["port"]) and desired["mode"] not in modes[desired["port"]]:
+            raise HTTPException(422, "network-switch port mode is not permitted by provider capabilities")
+        ids = [desired["access_vlan"]] if desired["mode"] == "access" else desired["trunk_vlans"]
+        if set(ids) - vlan_set:
+            raise HTTPException(422, "network-switch VLAN is not allowlisted by provider capabilities")
+    return {"ports": sorted(port_set), "vlans": sorted(vlan_set), "modes": modes}
+
+
+def _switch_credential_profile(credential_ref: str) -> dict[str, Any]:
+    credential = _credential_profile(credential_ref)
+    return credential
+
+
+def _switch_request_json(method: str, url: str, *, credential: dict[str, Any], body: dict[str, Any] | None = None, etag: str = "", allow_not_found: bool = False) -> tuple[dict[str, Any] | None, str]:
+    auth = base64.b64encode(f"{credential['username']}:{credential['password']}".encode()).decode()
+    headers = {"Accept": "application/yang-data+json", "Authorization": f"Basic {auth}"}
+    if etag:
+        headers["If-Match"] = etag
+    payload = None
+    if body is not None:
+        payload = canonical_json(body).encode()
+        if len(payload) > 1024 * 1024:
+            raise HTTPException(422, "network-switch request exceeds the bounded JSON limit")
+        headers["Content-Type"] = "application/yang-data+json"
+    request = urllib.request.Request(url, data=payload, headers=headers, method=method)
+    try:
+        context = ssl.create_default_context(cafile=str(credential["ca_file"]) if credential.get("ca_file") else None)
+    except (OSError, ssl.SSLError) as exc:
+        raise HTTPException(503, "network-switch credential CA bundle is invalid") from exc
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect(), urllib.request.HTTPSHandler(context=context))
+    try:
+        with opener.open(request, timeout=REQUEST_TIMEOUT) as response:
+            data = response.read(1024 * 1024 + 1)
+            if len(data) > 1024 * 1024:
+                raise HTTPException(502, "network-switch response exceeded the bounded JSON limit")
+            if not data:
+                return {}, str(response.headers.get("ETag") or "")[:256]
+            decoded = json.loads(data.decode("utf-8"))
+            response_etag = str(response.headers.get("ETag") or "")[:256]
+    except urllib.error.HTTPError as exc:
+        if allow_not_found and exc.code == 404:
+            return None, ""
+        if 300 <= exc.code < 400:
+            raise HTTPException(502, f"network-switch redirect rejected with HTTP {exc.code}") from exc
+        raise HTTPException(502, f"network-switch request failed with HTTP {exc.code}") from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise HTTPException(502, f"network-switch request failed: {type(exc).__name__}") from exc
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise HTTPException(502, "network-switch returned invalid JSON") from exc
+    if not isinstance(decoded, dict):
+        raise HTTPException(502, "network-switch returned a non-object JSON response")
+    return decoded, response_etag
+
+
+def _switch_url(provider: dict[str, Any], path: str) -> str:
+    return _switch_endpoint(provider) + path
+
+
+def _switch_vlan_url(provider: dict[str, Any], vlan_id: int) -> str:
+    return _switch_url(provider, "/openconfig-network-instance:network-instances/network-instance=default/vlans/vlan=" + str(vlan_id))
+
+
+def _switch_port_url(provider: dict[str, Any], port: str) -> str:
+    if not SWITCH_PORT_RE.fullmatch(port):
+        raise HTTPException(422, "network-switch port identifier is unsafe")
+    return _switch_url(provider, "/openconfig-interfaces:interfaces/interface=" + quote(port, safe=""))
+
+
+def _switch_lldp_url(provider: dict[str, Any], port: str) -> str:
+    return _switch_url(provider, "/openconfig-lldp:lldp/interfaces/interface=" + quote(port, safe="") + "/neighbors")
+
+
+def _switch_vlan_snapshot(raw: dict[str, Any] | None, vlan_id: int, etag: str) -> dict[str, Any]:
+    if raw is None:
+        return {"vlan_id": vlan_id, "present": False, "name": "", "etag": ""}
+    vlan = raw.get("openconfig-network-instance:vlan") if isinstance(raw.get("openconfig-network-instance:vlan"), dict) else raw
+    config = vlan.get("config") if isinstance(vlan.get("config"), dict) else {}
+    observed_id = config.get("vlan-id", vlan.get("vlan-id"))
+    if observed_id != vlan_id:
+        raise HTTPException(502, "network-switch VLAN response did not match requested VLAN")
+    name = str(config.get("name", vlan.get("name", "")) or "")
+    if name and not SWITCH_VLAN_NAME_RE.fullmatch(name):
+        raise HTTPException(502, "network-switch returned an unsafe VLAN name")
+    return {"vlan_id": vlan_id, "present": True, "name": name, "etag": etag}
+
+
+def _switch_port_snapshot(raw: dict[str, Any], port: str, etag: str) -> dict[str, Any]:
+    interface = raw.get("openconfig-interfaces:interface") if isinstance(raw.get("openconfig-interfaces:interface"), dict) else raw
+    config = interface.get("config") if isinstance(interface.get("config"), dict) else {}
+    observed_port = str(config.get("name", interface.get("name", "")) or "")
+    if observed_port != port:
+        raise HTTPException(502, "network-switch port response did not match requested port")
+    vlan = interface.get("switched-vlan") if isinstance(interface.get("switched-vlan"), dict) else {}
+    vlan_config = vlan.get("config") if isinstance(vlan.get("config"), dict) else {}
+    mode = str(vlan_config.get("interface-mode") or "").lower()
+    access = vlan_config.get("access-vlan")
+    trunks = vlan_config.get("trunk-vlans") or []
+    if mode not in {"access", "trunk", ""} or (access is not None and (not isinstance(access, int) or isinstance(access, bool) or not 1 <= access <= 4094)) or not isinstance(trunks, list) or len(trunks) > 64 or any(not isinstance(item, int) or isinstance(item, bool) or not 1 <= item <= 4094 for item in trunks):
+        raise HTTPException(502, "network-switch port response is invalid")
+    return {"port": port, "mode": mode, "access_vlan": access if isinstance(access, int) else None, "trunk_vlans": sorted(trunks), "etag": etag}
+
+
+def _switch_lldp_snapshot(raw: dict[str, Any], port: str, etag: str) -> dict[str, Any]:
+    neighbors = raw.get("openconfig-lldp:neighbors") if isinstance(raw.get("openconfig-lldp:neighbors"), dict) else raw
+    entries = neighbors.get("neighbor") if isinstance(neighbors.get("neighbor"), list) else []
+    if len(entries) > 64:
+        raise HTTPException(502, "network-switch LLDP response exceeds the bounded neighbor limit")
+    safe: list[dict[str, str]] = []
+    for entry in entries:
+        state = entry.get("state") if isinstance(entry, dict) and isinstance(entry.get("state"), dict) else {}
+        remote_port = str(state.get("port-id") or "")[:128]
+        remote_system = str(state.get("system-name") or "")[:128]
+        if remote_port and any(ord(char) < 32 for char in remote_port):
+            raise HTTPException(502, "network-switch LLDP response contains unsafe neighbor data")
+        if remote_system and any(ord(char) < 32 for char in remote_system):
+            raise HTTPException(502, "network-switch LLDP response contains unsafe neighbor data")
+        safe.append({"port": remote_port, "system_name": remote_system})
+    return {"port": port, "neighbors": sorted(safe, key=lambda item: (item["port"], item["system_name"])), "etag": etag}
+
+
+def _switch_current(provider: dict[str, Any], credential: dict[str, Any], operation: str, desired: dict[str, Any]) -> tuple[str, dict[str, Any], dict[str, Any]]:
+    policy = _switch_policy(provider, desired, operation)
+    if operation == "vlan.ensure":
+        url = _switch_vlan_url(provider, desired["vlan_id"])
+        raw, etag = _switch_request_json("GET", url, credential=credential, allow_not_found=True)
+        return url, {"etag": etag}, _switch_vlan_snapshot(raw, desired["vlan_id"], etag)
+    if operation == "port.configure":
+        url = _switch_port_url(provider, desired["port"])
+        raw, etag = _switch_request_json("GET", url, credential=credential)
+        if raw is None:
+            raise HTTPException(409, "network-switch allowlisted port is not present")
+        return url, {"etag": etag}, _switch_port_snapshot(raw, desired["port"], etag)
+    observations: list[dict[str, Any]] = []
+    for port in policy["ports"]:
+        raw, etag = _switch_request_json("GET", _switch_lldp_url(provider, port), credential=credential)
+        if raw is None:
+            raise HTTPException(502, "network-switch LLDP collector returned an empty response")
+        observations.append(_switch_lldp_snapshot(raw, port, etag))
+    return _switch_endpoint(provider), {}, {"ports": observations}
+
+
+def _switch_diff(operation: str, current: dict[str, Any], desired: dict[str, Any]) -> list[dict[str, Any]]:
+    if operation == "lldp.observe":
+        return []
+    if operation == "vlan.ensure":
+        return [] if current.get("present") and current.get("name") == desired["name"] else [{"field": f"vlan.{desired['vlan_id']}", "from": {"present": current.get("present"), "name": current.get("name")}, "to": {"name": desired["name"]}}]
+    if desired["mode"] == "access":
+        exact = current.get("mode") == "access" and current.get("access_vlan") == desired["access_vlan"] and not current.get("trunk_vlans")
+        target: dict[str, Any] = {"mode": "access", "access_vlan": desired["access_vlan"]}
+    else:
+        exact = current.get("mode") == "trunk" and current.get("trunk_vlans") == desired["trunk_vlans"] and current.get("access_vlan") is None
+        target = {"mode": "trunk", "trunk_vlans": desired["trunk_vlans"]}
+    return [] if exact else [{"field": f"port.{desired['port']}.switched_vlan", "from": {"mode": current.get("mode"), "access_vlan": current.get("access_vlan"), "trunk_vlans": current.get("trunk_vlans")}, "to": target}]
+
+
+def _apply_switch(operation: str, provider: dict[str, Any], resource_url: str, resource: dict[str, Any], desired: dict[str, Any], credential: dict[str, Any]) -> None:
+    if operation == "lldp.observe":
+        return
+    etag = str(resource.get("etag") or "")
+    if operation == "vlan.ensure":
+        body = {"openconfig-network-instance:vlan": {"vlan-id": desired["vlan_id"], "config": {"vlan-id": desired["vlan_id"], "name": desired["name"]}}}
+    elif desired["mode"] == "access":
+        body = {"openconfig-interfaces:interface": {"name": desired["port"], "config": {"name": desired["port"]}, "switched-vlan": {"config": {"interface-mode": "ACCESS", "access-vlan": desired["access_vlan"]}}}}
+    else:
+        body = {"openconfig-interfaces:interface": {"name": desired["port"], "config": {"name": desired["port"]}, "switched-vlan": {"config": {"interface-mode": "TRUNK", "trunk-vlans": desired["trunk_vlans"]}}}}
+    _switch_request_json("PUT", resource_url, credential=credential, body=body, etag=etag)
+
+
+def _switch_verify(operation: str, current: dict[str, Any], desired: dict[str, Any]) -> bool:
+    return bool(current.get("ports")) if operation == "lldp.observe" else not _switch_diff(operation, current, desired)
 
 
 def _ipmi_credential_profile(credential_ref: str) -> dict[str, str]:
@@ -2168,11 +2432,16 @@ def _load_runtime_context(typed: dict[str, Any]) -> tuple[str, str, dict[str, An
         _firmware_request_allowed(provider, desired)
     if operation.startswith("storage.volume."):
         _storage_request_allowed(provider, desired, operation)
+    if kind == "network-switch":
+        _switch_endpoint(provider)
+        _switch_policy(provider, desired, operation)
     credential_ref = str(provider.get("credential_ref") or "")
     if kind == "ipmi":
         credential = _ipmi_credential_profile(credential_ref)
     elif kind == "pxe":
         credential = _pxe_credential_profile(credential_ref)
+    elif kind == "network-switch":
+        credential = _switch_credential_profile(credential_ref)
     else:
         credential = _credential_profile(credential_ref)
     return kind, operation, provider, desired, credential
@@ -2500,11 +2769,16 @@ def _host_network_verify(operation: str, current: dict[str, Any], desired: dict[
         _firmware_request_allowed(provider, desired)
     if operation.startswith("storage.volume."):
         _storage_request_allowed(provider, desired, operation)
+    if kind == "network-switch":
+        _switch_endpoint(provider)
+        _switch_policy(provider, desired, operation)
     credential_ref = str(provider.get("credential_ref") or "")
     if kind == "ipmi":
         credential = _ipmi_credential_profile(credential_ref)
     elif kind == "pxe":
         credential = _pxe_credential_profile(credential_ref)
+    elif kind == "network-switch":
+        credential = _switch_credential_profile(credential_ref)
     else:
         credential = _credential_profile(credential_ref)
     return kind, operation, provider, desired, credential
@@ -2594,12 +2868,11 @@ def preview(changeset_plan: dict[str, Any]) -> dict[str, Any]:
         current["boot_provider"]["provider_kind"] = str(_pxe_boot_provider_target(typed, server).get("kind") or "")
     elif kind == "host-network":
         _, _, current = _host_network_current(provider, credential, operation, desired)
-    elif kind in {"network-switch", "proxmox", "vmware-workstation", "vmware", "openstack", "aws", "azure", "gcp"}:
-        # Preview: return current capabilities/state — trusted runtime will be implemented per-provider
-        current = {"provider_kind": kind, "operation": operation, "note": "provider contract accepted, runtime integration pending", "supported": True}
+    elif kind == "network-switch":
+        _, _, current = _switch_current(provider, credential, operation, desired)
     else:
         raise HTTPException(422, "trusted runtime preview is not available for this infrastructure provider")
-    diff = _pxe_desired_diff(current, desired, server, supply) if kind == "pxe" else _desired_host_network_diff(current, desired, operation) if kind == "host-network" else _desired_diff(operation, current, desired)
+    diff = _pxe_desired_diff(current, desired, server, supply) if kind == "pxe" else _desired_host_network_diff(current, desired, operation) if kind == "host-network" else _switch_diff(operation, current, desired) if kind == "network-switch" else _desired_diff(operation, current, desired)
     return {
         "kind": "InfrastructureRuntimePreview",
         "provider_kind": kind,
@@ -2789,18 +3062,22 @@ def execute(ticket: dict[str, Any], signature: str) -> dict[str, Any]:
         resource_url, resource, before = _ipmi_current(provider, credential, operation)
     elif kind == "host-network":
         resource_url, resource, before = _host_network_current(provider, credential, operation, desired)
-    elif kind in {"network-switch", "proxmox", "vmware-workstation", "vmware", "openstack", "aws", "azure", "gcp"}:
+    elif kind == "network-switch":
+        resource_url, resource, before = _switch_current(provider, credential, operation, desired)
+    elif kind in {"proxmox", "vmware-workstation", "vmware", "openstack", "aws", "azure", "gcp"}:
         raise HTTPException(501, f"trusted {kind} runtime is not implemented; provider remains CONTRACT_ONLY")
     else:
         raise HTTPException(422, "trusted infrastructure runtime is unavailable for this provider kind")
     if sha256_hex(before) != str(runtime_preview.get("current_hash") or ""):
         raise HTTPException(409, "infrastructure state drifted after deterministic preview; re-plan and re-approve")
-    mutation_applied = bool(_desired_host_network_diff(before, desired, operation) if kind == "host-network" else _desired_diff(operation, before, desired))
+    mutation_applied = bool(_desired_host_network_diff(before, desired, operation) if kind == "host-network" else _switch_diff(operation, before, desired) if kind == "network-switch" else _desired_diff(operation, before, desired))
     if mutation_applied:
         if kind == "redfish":
             _apply_redfish(operation, resource_url, resource, desired, credential)
         elif kind == "host-network":
             _apply_host_network(operation, resource_url, resource, desired, credential)
+        elif kind == "network-switch":
+            _apply_switch(operation, provider, resource_url, resource, desired, credential)
         else:
             _apply_ipmi(operation, provider, desired, credential)
 
@@ -2826,6 +3103,8 @@ def execute(ticket: dict[str, Any], signature: str) -> dict[str, Any]:
                     _, _, after = _redfish_current(provider, credential, operation)
             elif kind == "host-network":
                 _, _, after = _host_network_current(provider, credential, operation, desired)
+            elif kind == "network-switch":
+                _, _, after = _switch_current(provider, credential, operation, desired)
             else:
                 _, _, after = _ipmi_current(provider, credential, operation)
             last_probe_error = ""
@@ -2836,7 +3115,8 @@ def execute(ticket: dict[str, Any], signature: str) -> dict[str, Any]:
                     time.sleep(delay_seconds)
                     continue
             raise
-        if _host_network_verify(operation, after, desired) if kind == "host-network" else _verification_matches(operation, after, desired, before=before):
+        matches = _host_network_verify(operation, after, desired) if kind == "host-network" else _switch_verify(operation, after, desired) if kind == "network-switch" else _verification_matches(operation, after, desired, before=before)
+        if matches:
             verified = True
             break
         if attempt + 1 < attempts:

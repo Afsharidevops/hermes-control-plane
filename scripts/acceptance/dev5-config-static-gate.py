@@ -179,7 +179,10 @@ assert "openssh-client ca-certificates ipmitool" in node_agent_dockerfile
 node_agent_main = (ROOT / "node-agent/src/hermes_node_agent/main.py").read_text()
 assert "ipmi-lanplus-runtime" in node_agent_main
 assert "pxe-unattended-runtime" in node_agent_main
-assert (ROOT / "node-agent/tests/test_infrastructure_runtime.py").is_file()
+assert (ROOT / "control-plane/tests/test_dev5_batch_c9_switch_network_runtime.py").is_file()
+assert (ROOT / "node-agent/tests/test_network_switch_runtime.py").is_file()
+assert (ROOT / "node-agent/requirements-dev.txt").is_file()
+assert 'Test Node Agent' in validate_workflow
 assert (ROOT / "node-agent/tests/test_pxe_runtime.py").is_file()
 assert (ROOT / "control-plane/tests/test_dev5_batch_c_infrastructure_runtime.py").is_file()
 assert (ROOT / "control-plane/tests/test_dev5_batch_c5b_pxe_runtime.py").is_file()

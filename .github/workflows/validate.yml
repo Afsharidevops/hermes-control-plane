@@ -51,6 +51,12 @@ jobs:
           /tmp/hermes-smart-router-tests/bin/python -m pip install --upgrade pip
           /tmp/hermes-smart-router-tests/bin/pip install -r smart-router/requirements-dev.txt
           PYTHONPATH=smart-router/src /tmp/hermes-smart-router-tests/bin/pytest -q smart-router/tests
+      - name: Test Node Agent infrastructure runtime
+        run: |
+          python -m venv /tmp/hermes-node-agent-tests
+          /tmp/hermes-node-agent-tests/bin/python -m pip install --upgrade pip
+          /tmp/hermes-node-agent-tests/bin/pip install -r node-agent/requirements-dev.txt
+          PYTHONPATH=node-agent/src /tmp/hermes-node-agent-tests/bin/pytest -q node-agent/tests
 
       - name: Validate Compose and bot wiring
         run: |
