@@ -317,7 +317,7 @@ def _validate_desired_state(kind: str, operation: str, desired: dict[str, Any]) 
             interface = str(desired.get("interface") or "")
             if not NETWORK_INTERFACE_RE.fullmatch(interface):
                 raise HTTPException(422, "host-network vlan interface name is invalid")
-            if not NETWORK_VLAN_RE.fullmatch(vlan_id):
+            if not NETWORK_VLAN_RE.fullmatch(vlan_id) or not 1 <= int(vlan_id) <= 4094:
                 raise HTTPException(422, "host-network vlan_id must be a valid VLAN ID (1-4094)")
             return {"interface": interface, "vlan_id": int(vlan_id)}
         if operation == "mtu.configure":
@@ -2436,7 +2436,9 @@ def _load_runtime_context(typed: dict[str, Any]) -> tuple[str, str, dict[str, An
         _switch_endpoint(provider)
         _switch_policy(provider, desired, operation)
     credential_ref = str(provider.get("credential_ref") or "")
-    if kind == "ipmi":
+    if kind == "host-network":
+        credential = {}
+    elif kind == "ipmi":
         credential = _ipmi_credential_profile(credential_ref)
     elif kind == "pxe":
         credential = _pxe_credential_profile(credential_ref)
@@ -2536,44 +2538,41 @@ def _host_network_vlan_info() -> list[dict[str, Any]]:
 
 
 def _host_network_address_info() -> dict[str, list[dict[str, Any]]]:
-    """Read IP addresses from /sys/class/net/*/address or via /proc/net/fib_trie (limited)."""
+    """Read local addresses from kernel interface tables without shelling out."""
     interfaces: dict[str, list[dict[str, Any]]] = {}
-    import socket as _socket
-    import struct as _struct
     try:
-        import fcntl as _fcntl
+        import ctypes
+        import fcntl
+        import struct
     except ImportError:
-        _fcntl = None
-    # Use SIOCGIFCONF for available addrs
-    if _fcntl:
+        return interfaces
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
-            SIOCGIFCONF = 0x8912
-            sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
-            buf = _fcntl.ioctl(sock.fileno(), SIOCGIFCONF, b'\x00' * 4096)
-            # Extract addresses similarly to `ifconfig` output
-            for i in range(0, len(buf), 40):
-                ifname = buf[i:i+16].rstrip(b'\x00').decode('utf-8', errors='replace').strip('\x00')
-                addr = _socket.inet_ntoa(buf[i+20:i+24])
-                if ifname and addr != '0.0.0.0':
-                    interfaces.setdefault(ifname, []).append({"address": addr, "family": "inet"})
-        except OSError:
-            pass
-        try:
-            sock6 = _socket.socket(_socket.AF_INET6, _socket.SOCK_DGRAM)
-            # read /proc/net/if_inet6 for IPv6
-            inet6_path = Path("/proc/net/if_inet6")
-            if inet6_path.exists():
-                for line in inet6_path.read_text(encoding="utf-8").strip().splitlines():
-                    parts = line.strip().split()
-                    if len(parts) >= 5:
-                        addr_hex = parts[0]
-                        ifname = parts[4]
-                        if len(addr_hex) == 32:
-                            addr = ':'.join(addr_hex[i:i+4] for i in range(0, 32, 4))
-                            addr = _socket.inet_ntop(_socket.AF_INET6, _socket.inet_pton(_socket.AF_INET6, addr))
-                            interfaces.setdefault(ifname, []).append({"address": addr, "family": "inet6"})
-        except (OSError, ValueError):
-            pass
+            buf = ctypes.create_string_buffer(4096)
+            ifconf = struct.pack("iP", len(buf), ctypes.addressof(buf))
+            result = fcntl.ioctl(sock.fileno(), 0x8912, ifconf)
+            byte_count = struct.unpack("iP", result)[0]
+            for index in range(0, min(byte_count, len(buf)), 40):
+                record = buf.raw[index:index + 40]
+                ifname = record[:16].split(b"\x00", 1)[0].decode("utf-8", errors="replace")
+                address = socket.inet_ntoa(record[20:24])
+                if ifname and address != "0.0.0.0":
+                    interfaces.setdefault(ifname, []).append({"address": address, "family": "inet"})
+        finally:
+            sock.close()
+    except (OSError, ValueError, struct.error):
+        pass
+    try:
+        inet6_path = Path("/proc/net/if_inet6")
+        if inet6_path.exists():
+            for line in inet6_path.read_text(encoding="utf-8").strip().splitlines():
+                parts = line.strip().split()
+                if len(parts) >= 6 and len(parts[0]) == 32:
+                    address = socket.inet_ntop(socket.AF_INET6, bytes.fromhex(parts[0]))
+                    interfaces.setdefault(parts[5], []).append({"address": address, "family": "inet6"})
+    except (OSError, ValueError):
+        pass
     return interfaces
 
 
@@ -2583,7 +2582,8 @@ def _host_network_current(provider: dict[str, Any], credential: dict[str, Any], 
         interfaces = _host_network_interface_names()
         bonds = _host_network_bond_info()
         vlans = _host_network_vlan_info()
-        addrs = _host_network_address_info()
+        raw_addrs = _host_network_address_info()
+        addrs = raw_addrs if isinstance(raw_addrs, dict) else {}
         for iface in interfaces:
             iface["addresses"] = addrs.get(iface["name"], [])
         current = {"interfaces": interfaces, "bonds": bonds, "vlans": vlans}
@@ -2593,7 +2593,8 @@ def _host_network_current(provider: dict[str, Any], credential: dict[str, Any], 
     iface = next((i for i in interfaces if i["name"] == iface_name), None)
     if not iface and iface_name:
         iface = {"name": iface_name, "mac": "", "state": "unknown", "mtu": 1500, "addresses": []}
-    addrs = _host_network_address_info()
+    raw_addrs = _host_network_address_info()
+    addrs = raw_addrs if isinstance(raw_addrs, dict) else {}
     if iface:
         iface["addresses"] = addrs.get(iface["name"], [])
     bonds = _host_network_bond_info()
@@ -2611,11 +2612,11 @@ def _desired_host_network_diff(current: dict[str, Any], desired: dict[str, Any],
         iface = current.get("interface") if isinstance(current.get("interface"), dict) else {}
         changes: list[dict[str, Any]] = []
         if "state" in desired and iface.get("state") != desired["state"]:
-            changes.append({"field": f"interface.{desired['interface']}.state", "from": iface.get("state"), "to": desired["state"]})
+            changes.append({"field": "host.interface.state", "from": iface.get("state"), "to": desired["state"]})
         if "mtu" in desired and iface.get("mtu") != desired["mtu"]:
-            changes.append({"field": f"interface.{desired['interface']}.mtu", "from": iface.get("mtu"), "to": desired["mtu"]})
+            changes.append({"field": "host.interface.mtu", "from": iface.get("mtu"), "to": desired["mtu"]})
         if "mac" in desired and iface.get("mac") != desired["mac"]:
-            changes.append({"field": f"interface.{desired['interface']}.mac", "from": iface.get("mac"), "to": desired["mac"]})
+            changes.append({"field": "host.interface.mac", "from": iface.get("mac"), "to": desired["mac"]})
         return changes
     if operation == "interface.bond":
         bond = current.get("bond") if isinstance(current.get("bond"), dict) else {}
@@ -2634,8 +2635,15 @@ def _desired_host_network_diff(current: dict[str, Any], desired: dict[str, Any],
     if operation == "address.configure":
         iface = current.get("interface") if isinstance(current.get("interface"), dict) else {}
         addrs = iface.get("addresses") or []
-        has_addr = any(a.get("address") == desired["address"] for a in addrs)
-        return [] if has_addr else [{"field": f"address.{desired['interface']}", "from": [a.get("address") for a in addrs], "to": desired["address"]}]
+        current_addresses = [a.get("address") for a in addrs]
+        changes = []
+        if desired["address"] not in current_addresses:
+            changes.append({"field": "host.address.address", "from": current_addresses, "to": desired["address"]})
+        if "prefix" in desired:
+            changes.append({"field": "host.address.prefix", "from": None, "to": desired["prefix"]})
+        if "gateway" in desired:
+            changes.append({"field": "host.address.gateway", "from": None, "to": desired["gateway"]})
+        return changes
     return []
 
 
