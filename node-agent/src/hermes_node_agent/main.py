@@ -37,7 +37,7 @@ def health() -> dict[str, Any]:
         "mode": "cluster-provider-worker",
         "execution_enabled": provider_runtime.EXECUTION_ENABLED,
         "infrastructure_execution_enabled": infrastructure_runtime.EXECUTION_ENABLED,
-        "capabilities": ["kubespray", "k3s", "rke2", "cluster-day2", "direct-etcd", "offline-artifact-binding", "redfish-runtime", "redfish-virtual-media-runtime", "ipmi-lanplus-runtime", "pxe-unattended-runtime"],
+        "capabilities": ["kubespray", "k3s", "rke2", "cluster-day2", "direct-etcd", "offline-artifact-binding", "redfish-runtime", "redfish-virtual-media-runtime", "ipmi-lanplus-runtime", "pxe-unattended-runtime", "host-network-runtime", "network-switch-runtime", "proxmox-runtime", "vmware-workstation-runtime", "vmware-runtime", "openstack-runtime", "aws-runtime", "azure-runtime", "gcp-runtime"],
         "arbitrary_shell": False,
         "arbitrary_ssh_command": False,
     }

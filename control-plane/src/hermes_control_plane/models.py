@@ -462,7 +462,7 @@ class HubbleFlowSummaryCreate(StrictModel):
 # 0.5.11-dev.4 Operations Center + next-deploy infrastructure contracts
 class InfrastructureProviderCreate(StrictModel):
     name: str = Field(min_length=1, max_length=120)
-    kind: Literal["vmware", "vmware-workstation", "proxmox", "openstack", "aws", "azure", "gcp", "redfish", "ipmi", "pxe", "network-switch"]
+    kind: Literal["vmware", "vmware-workstation", "proxmox", "openstack", "aws", "azure", "gcp", "redfish", "ipmi", "pxe", "network-switch", "host-network"]
     endpoint: str = Field(min_length=1, max_length=500)
     credential_ref: str = Field(min_length=1, max_length=120)
     api_version: str = Field(min_length=1, max_length=120)

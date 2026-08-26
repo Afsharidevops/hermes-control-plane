@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
 import re
@@ -43,6 +44,7 @@ RUNTIME_PROVIDER_OPERATIONS = {
     "redfish": {"inventory.refresh", "power.set", "boot.set", "boot-order.apply", "secure-boot.apply", "sriov.apply", "iommu.apply", "virtual-media.insert", "virtual-media.eject", "bios.apply", "firmware.apply", "storage.volume.apply", "storage.volume.delete"},
     "ipmi": {"power.set", "boot.set"},
     "pxe": {"os.provision", "os.reimage"},
+    "host-network": {"interface.configure", "interface.bond", "vlan.configure", "mtu.configure", "address.configure", "network.discover"},
 }
 POWER_RESET_TYPES = {
     "on": "On",
@@ -236,6 +238,136 @@ def _validate_desired_state(kind: str, operation: str, desired: dict[str, Any]) 
         if confirm:
             result["confirm_server"] = confirm
         return result
+    if kind == "host-network":
+        NETWORK_INTERFACE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$")
+        NETWORK_MAC_RE = re.compile(r"^(?:[0-9a-f]{2}:){5}[0-9a-f]{2}$")
+        NETWORK_VLAN_RE = re.compile(r"^[1-9][0-9]{0,3}$|^[1-5][0-9]{4}$|^6[0-4][0-9]{3}$|^65[0-4][0-9][0-9]$|^655[0-2][0-9]$|^6553[0-5]$")
+        NETWORK_MTU_RE = re.compile(r"^(?:[6-9][0-9]{2,3}|1[0-8][0-9]{2}|19[0-9]{2}|20[0-9]{2}|21[0-9]{2}|22[0-9]{2}|9[0-9]{3}|[1-8][0-9]{4})$")
+        if operation == "network.discover":
+            if desired:
+                raise HTTPException(422, "host-network network.discover does not accept desired_state fields")
+            return {}
+        if operation == "interface.configure":
+            allowed = {"interface", "mac", "state", "mtu"}
+            unknown = sorted(set(desired) - allowed)
+            if unknown:
+                raise HTTPException(422, "unsupported host-network interface.configure field(s): " + ", ".join(unknown))
+            interface = str(desired.get("interface") or "")
+            if not NETWORK_INTERFACE_RE.fullmatch(interface):
+                raise HTTPException(422, "host-network interface name is invalid")
+            result_h: dict[str, Any] = {"interface": interface}
+            if "mac" in desired:
+                mac = str(desired["mac"] or "").lower()
+                if not NETWORK_MAC_RE.fullmatch(mac):
+                    raise HTTPException(422, "host-network MAC address is invalid")
+                result_h["mac"] = mac
+            if "state" in desired:
+                state = str(desired["state"] or "").lower()
+                if state not in {"up", "down"}:
+                    raise HTTPException(422, "host-network interface state must be up or down")
+                result_h["state"] = state
+            if "mtu" in desired:
+                mtu = str(desired["mtu"] or "")
+                if not NETWORK_MTU_RE.fullmatch(mtu):
+                    raise HTTPException(422, "host-network MTU is invalid")
+                result_h["mtu"] = int(mtu)
+            return result_h
+        if operation == "interface.bond":
+            allowed = {"bond_interface", "mode", "slaves", "miimon", "lacp_rate"}
+            unknown = sorted(set(desired) - allowed)
+            if unknown:
+                raise HTTPException(422, "unsupported host-network interface.bond field(s): " + ", ".join(unknown))
+            bond = str(desired.get("bond_interface") or "")
+            if not NETWORK_INTERFACE_RE.fullmatch(bond) or not bond.startswith("bond"):
+                raise HTTPException(422, "host-network bond interface name must start with 'bond'")
+            mode = str(desired.get("mode") or "802.3ad").lower()
+            if mode not in {"802.3ad", "active-backup", "balance-tlb", "balance-alb", "balance-rr", "balance-xor", "broadcast"}:
+                raise HTTPException(422, "host-network bond mode must be a supported bonding mode")
+            slaves = desired.get("slaves")
+            if not isinstance(slaves, list) or not 1 <= len(slaves) <= 16:
+                raise HTTPException(422, "host-network bond requires between 1 and 16 slave interfaces")
+            for slave in slaves:
+                if not NETWORK_INTERFACE_RE.fullmatch(str(slave or "")):
+                    raise HTTPException(422, "host-network bond slave interface name is invalid")
+            result_h = {"bond_interface": bond, "mode": mode, "slaves": [str(s) for s in slaves]}
+            if "miimon" in desired:
+                miimon = desired["miimon"]
+                if not isinstance(miimon, int) or isinstance(miimon, bool) or miimon < 0 or miimon > 1000:
+                    raise HTTPException(422, "host-network bond miimon must be 0-1000")
+                result_h["miimon"] = miimon
+            if "lacp_rate" in desired:
+                lacp = desired["lacp_rate"]
+                if lacp not in {"slow", "fast"}:
+                    raise HTTPException(422, "host-network bond lacp_rate must be slow or fast")
+                result_h["lacp_rate"] = lacp
+            return result_h
+        if operation == "vlan.configure":
+            allowed = {"interface", "vlan_id"}
+            unknown = sorted(set(desired) - allowed)
+            if unknown:
+                raise HTTPException(422, "unsupported host-network vlan.configure field(s): " + ", ".join(unknown))
+            vlan_id = str(desired.get("vlan_id") or "")
+            interface = str(desired.get("interface") or "")
+            if not NETWORK_INTERFACE_RE.fullmatch(interface):
+                raise HTTPException(422, "host-network vlan interface name is invalid")
+            if not NETWORK_VLAN_RE.fullmatch(vlan_id):
+                raise HTTPException(422, "host-network vlan_id must be a valid VLAN ID (1-4094)")
+            return {"interface": interface, "vlan_id": int(vlan_id)}
+        if operation == "mtu.configure":
+            allowed = {"interface", "mtu"}
+            unknown = sorted(set(desired) - allowed)
+            if unknown:
+                raise HTTPException(422, "unsupported host-network mtu.configure field(s): " + ", ".join(unknown))
+            mtu = str(desired.get("mtu") or "")
+            interface = str(desired.get("interface") or "")
+            if not NETWORK_INTERFACE_RE.fullmatch(interface):
+                raise HTTPException(422, "host-network mtu interface name is invalid")
+            if not NETWORK_MTU_RE.fullmatch(mtu):
+                raise HTTPException(422, "host-network MTU is invalid")
+            return {"interface": interface, "mtu": int(mtu)}
+        if operation == "address.configure":
+            allowed = {"interface", "address", "prefix", "gateway", "dns"}
+            unknown = sorted(set(desired) - allowed)
+            if unknown:
+                raise HTTPException(422, "unsupported host-network address.configure field(s): " + ", ".join(unknown))
+            address = str(desired.get("address") or "")
+            prefix = desired.get("prefix")
+            interface = str(desired.get("interface") or "")
+            if not NETWORK_INTERFACE_RE.fullmatch(interface):
+                raise HTTPException(422, "host-network address interface name is invalid")
+            try:
+                ipaddress.ip_address(address)
+            except ValueError as exc:
+                raise HTTPException(422, "host-network address is not a valid IP address") from exc
+            if prefix is not None:
+                if not isinstance(prefix, int) or isinstance(prefix, bool) or not 1 <= prefix <= 128:
+                    raise HTTPException(422, "host-network prefix must be between 1 and 128")
+            result_h = {"interface": interface, "address": address}
+            if prefix is not None:
+                result_h["prefix"] = prefix
+            if "gateway" in desired:
+                gw = str(desired["gateway"] or "")
+                try:
+                    ipaddress.ip_address(gw)
+                except ValueError as exc:
+                    raise HTTPException(422, "host-network gateway is not a valid IP address") from exc
+                result_h["gateway"] = gw
+            if "dns" in desired:
+                dns = desired["dns"]
+                if not isinstance(dns, list) or len(dns) > 4:
+                    raise HTTPException(422, "host-network dns must be a list of up to 4 addresses")
+                for dns_entry in dns:
+                    try:
+                        ipaddress.ip_address(str(dns_entry or ""))
+                    except ValueError as exc:
+                        raise HTTPException(422, "host-network dns entry is not a valid IP address") from exc
+                result_h["dns"] = [str(d) for d in dns]
+            return result_h
+        raise HTTPException(422, "unsupported host-network runtime operation")
+    if kind == "network-switch":
+        return desired
+    if kind in {"proxmox", "vmware-workstation", "vmware", "openstack", "aws", "azure", "gcp"}:
+        return desired
     if kind != "redfish":
         raise HTTPException(422, f"trusted runtime is not implemented for provider kind {kind!r}")
     if operation == "inventory.refresh":
@@ -2046,6 +2178,338 @@ def _load_runtime_context(typed: dict[str, Any]) -> tuple[str, str, dict[str, An
     return kind, operation, provider, desired, credential
 
 
+def _host_network_interface_names() -> list[dict[str, Any]]:
+    """Read host network interfaces via /sys/class/net — no arbitrary SSH/script surface."""
+    SYS_NET = Path("/sys/class/net")
+    interfaces: list[dict[str, Any]] = []
+    try:
+        if not SYS_NET.is_dir():
+            return interfaces
+        entries = sorted(SYS_NET.iterdir())
+    except OSError:
+        return interfaces
+    for entry in entries:
+        if not entry.is_dir() or entry.name == "lo":
+            continue
+        try:
+            if entry.is_symlink():
+                continue
+            addr_path = entry / "address"
+            oper_path = entry / "operstate"
+            mtu_path = entry / "mtu"
+            if not addr_path.exists() or not oper_path.exists() or not mtu_path.exists():
+                continue
+            mac = addr_path.read_text(encoding="utf-8").strip().lower()
+            state = oper_path.read_text(encoding="utf-8").strip().lower()
+            mtu_val = mtu_path.read_text(encoding="utf-8").strip()
+            if not PXE_MAC_RE.fullmatch(mac):
+                continue
+            if state not in {"up", "down", "unknown"}:
+                state = "unknown"
+            mtu_int = int(mtu_val) if mtu_val.isdigit() else 1500
+            interfaces.append({"name": entry.name, "mac": mac, "state": state, "mtu": mtu_int})
+        except (OSError, ValueError):
+            continue
+    return interfaces
+
+
+def _host_network_bond_info() -> list[dict[str, Any]]:
+    """Read bond master info from /sys/class/net/bond*/bonding."""
+    SYS_NET = Path("/sys/class/net")
+    bonds: list[dict[str, Any]] = []
+    try:
+        if not SYS_NET.is_dir():
+            return bonds
+        for entry in sorted(SYS_NET.iterdir()):
+            if not entry.name.startswith("bond") or not entry.is_dir():
+                continue
+            bond_dir = entry / "bonding"
+            if not bond_dir.is_dir():
+                continue
+            try:
+                mode_path = bond_dir / "mode"
+                slaves_path = bond_dir / "slaves"
+                mii_path = bond_dir / "miimon"
+                lacp_path = bond_dir / "lacp_rate"
+                mode = mode_path.read_text(encoding="utf-8").strip().split(None, 1)[0] if mode_path.exists() else ""
+                slaves_str = slaves_path.read_text(encoding="utf-8").strip() if slaves_path.exists() else ""
+                slaves_list = [s.strip() for s in slaves_str.split() if s.strip()] if slaves_str else []
+                miimon = int(mii_path.read_text(encoding="utf-8").strip()) if mii_path.exists() else 0
+                lacp = lacp_path.read_text(encoding="utf-8").strip() if lacp_path.exists() else ""
+                bonds.append({
+                    "name": entry.name, "mode": mode, "slaves": slaves_list,
+                    "miimon": miimon, "lacp_rate": lacp,
+                })
+            except (OSError, ValueError):
+                continue
+    except OSError:
+        pass
+    return bonds
+
+
+def _host_network_vlan_info() -> list[dict[str, Any]]:
+    """Read VLAN interfaces from /proc/net/vlan/config."""
+    vlan_path = Path("/proc/net/vlan/config")
+    vlans: list[dict[str, Any]] = []
+    try:
+        if not vlan_path.exists():
+            return vlans
+        for line in vlan_path.read_text(encoding="utf-8").strip().splitlines():
+            parts = line.strip().split()
+            if len(parts) >= 3 and parts[2] == "|":
+                # VLAN-ID | interface-name | parent-interface
+                vlan_id = parts[0]
+                parent = parts[1]
+                vlans.append({"vlan_id": int(vlan_id), "parent": parent, "interface": f"{parent}.{vlan_id}"})
+    except (OSError, ValueError):
+        pass
+    return vlans
+
+
+def _host_network_address_info() -> dict[str, list[dict[str, Any]]]:
+    """Read IP addresses from /sys/class/net/*/address or via /proc/net/fib_trie (limited)."""
+    interfaces: dict[str, list[dict[str, Any]]] = {}
+    import socket as _socket
+    import struct as _struct
+    try:
+        import fcntl as _fcntl
+    except ImportError:
+        _fcntl = None
+    # Use SIOCGIFCONF for available addrs
+    if _fcntl:
+        try:
+            SIOCGIFCONF = 0x8912
+            sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+            buf = _fcntl.ioctl(sock.fileno(), SIOCGIFCONF, b'\x00' * 4096)
+            # Extract addresses similarly to `ifconfig` output
+            for i in range(0, len(buf), 40):
+                ifname = buf[i:i+16].rstrip(b'\x00').decode('utf-8', errors='replace').strip('\x00')
+                addr = _socket.inet_ntoa(buf[i+20:i+24])
+                if ifname and addr != '0.0.0.0':
+                    interfaces.setdefault(ifname, []).append({"address": addr, "family": "inet"})
+        except OSError:
+            pass
+        try:
+            sock6 = _socket.socket(_socket.AF_INET6, _socket.SOCK_DGRAM)
+            # read /proc/net/if_inet6 for IPv6
+            inet6_path = Path("/proc/net/if_inet6")
+            if inet6_path.exists():
+                for line in inet6_path.read_text(encoding="utf-8").strip().splitlines():
+                    parts = line.strip().split()
+                    if len(parts) >= 5:
+                        addr_hex = parts[0]
+                        ifname = parts[4]
+                        if len(addr_hex) == 32:
+                            addr = ':'.join(addr_hex[i:i+4] for i in range(0, 32, 4))
+                            addr = _socket.inet_ntop(_socket.AF_INET6, _socket.inet_pton(_socket.AF_INET6, addr))
+                            interfaces.setdefault(ifname, []).append({"address": addr, "family": "inet6"})
+        except (OSError, ValueError):
+            pass
+    return interfaces
+
+
+def _host_network_current(provider: dict[str, Any], credential: dict[str, Any], operation: str, desired: dict[str, Any] | None = None) -> tuple[str, dict[str, Any], dict[str, Any]]:
+    """Read host network state from local /sys and /proc files — no SSH/scripts."""
+    if operation == "network.discover":
+        interfaces = _host_network_interface_names()
+        bonds = _host_network_bond_info()
+        vlans = _host_network_vlan_info()
+        addrs = _host_network_address_info()
+        for iface in interfaces:
+            iface["addresses"] = addrs.get(iface["name"], [])
+        current = {"interfaces": interfaces, "bonds": bonds, "vlans": vlans}
+        return "local", {}, current
+    iface_name = str(desired.get("interface") or "") if desired else ""
+    interfaces = _host_network_interface_names()
+    iface = next((i for i in interfaces if i["name"] == iface_name), None)
+    if not iface and iface_name:
+        iface = {"name": iface_name, "mac": "", "state": "unknown", "mtu": 1500, "addresses": []}
+    addrs = _host_network_address_info()
+    if iface:
+        iface["addresses"] = addrs.get(iface["name"], [])
+    bonds = _host_network_bond_info()
+    bond = next((b for b in bonds if b["name"] == iface_name), None)
+    vlans = _host_network_vlan_info()
+    vlan = next((v for v in vlans if v["interface"] == iface_name), None)
+    current = {"interface": iface, "bond": bond, "vlan": vlan, "interfaces": interfaces, "bonds": bonds, "vlans": vlans}
+    return "local", {}, current
+
+
+def _desired_host_network_diff(current: dict[str, Any], desired: dict[str, Any], operation: str) -> list[dict[str, Any]]:
+    if operation == "network.discover":
+        return []
+    if operation == "interface.configure":
+        iface = current.get("interface") if isinstance(current.get("interface"), dict) else {}
+        changes: list[dict[str, Any]] = []
+        if "state" in desired and iface.get("state") != desired["state"]:
+            changes.append({"field": f"interface.{desired['interface']}.state", "from": iface.get("state"), "to": desired["state"]})
+        if "mtu" in desired and iface.get("mtu") != desired["mtu"]:
+            changes.append({"field": f"interface.{desired['interface']}.mtu", "from": iface.get("mtu"), "to": desired["mtu"]})
+        if "mac" in desired and iface.get("mac") != desired["mac"]:
+            changes.append({"field": f"interface.{desired['interface']}.mac", "from": iface.get("mac"), "to": desired["mac"]})
+        return changes
+    if operation == "interface.bond":
+        bond = current.get("bond") if isinstance(current.get("bond"), dict) else {}
+        changes = []
+        if bond.get("mode") != desired["mode"]:
+            changes.append({"field": f"bond.{desired['bond_interface']}.mode", "from": bond.get("mode"), "to": desired["mode"]})
+        if sorted(bond.get("slaves") or []) != sorted(desired["slaves"]):
+            changes.append({"field": f"bond.{desired['bond_interface']}.slaves", "from": bond.get("slaves") or [], "to": desired["slaves"]})
+        return changes
+    if operation == "vlan.configure":
+        vlan = current.get("vlan") if isinstance(current.get("vlan"), dict) else {}
+        return [] if vlan and vlan.get("vlan_id") == desired["vlan_id"] else [{"field": f"vlan.{desired['interface']}.id", "from": vlan.get("vlan_id") if vlan else None, "to": desired["vlan_id"]}]
+    if operation == "mtu.configure":
+        iface = current.get("interface") if isinstance(current.get("interface"), dict) else {}
+        return [] if iface.get("mtu") == desired["mtu"] else [{"field": f"mtu.{desired['interface']}", "from": iface.get("mtu"), "to": desired["mtu"]}]
+    if operation == "address.configure":
+        iface = current.get("interface") if isinstance(current.get("interface"), dict) else {}
+        addrs = iface.get("addresses") or []
+        has_addr = any(a.get("address") == desired["address"] for a in addrs)
+        return [] if has_addr else [{"field": f"address.{desired['interface']}", "from": [a.get("address") for a in addrs], "to": desired["address"]}]
+    return []
+
+
+def _apply_host_network(operation: str, resource_url: str, resource: dict[str, Any], desired: dict[str, Any], credential: dict[str, Any]) -> None:
+    """Apply host network configuration via typed netlink/pyroute2 calls — no arbitrary scripts."""
+    import pyroute2  # type: ignore[import-untyped]
+    ip = pyroute2.IPRoute()
+    try:
+        if operation == "interface.configure":
+            idx = ip.link_lookup(ifname=desired["interface"])
+            if not idx:
+                raise HTTPException(409, f"host-network interface {desired['interface']} not found")
+            kwargs: dict[str, Any] = {}
+            if "state" in desired:
+                kwargs["state"] = desired["state"]
+            if "mtu" in desired:
+                kwargs["mtu"] = desired["mtu"]
+            if kwargs:
+                ip.link("set", index=idx[0], **kwargs)
+        elif operation == "interface.bond":
+            # Create bond if not exists
+            idx = ip.link_lookup(ifname=desired["bond_interface"])
+            if not idx:
+                ip.link("add", ifname=desired["bond_interface"], kind="bond")
+                idx = ip.link_lookup(ifname=desired["bond_interface"])
+            if not idx:
+                raise HTTPException(502, "host-network bond interface could not be created")
+            # Set bond mode via sysfs
+            bond_dir = Path("/sys/class/net") / desired["bond_interface"] / "bonding"
+            if bond_dir.is_dir():
+                mode_path = bond_dir / "mode"
+                if mode_path.exists():
+                    mode_map = {
+                        "802.3ad": "4", "active-backup": "1", "balance-tlb": "5",
+                        "balance-alb": "6", "balance-rr": "0", "balance-xor": "2", "broadcast": "3",
+                    }
+                    mode_val = mode_map.get(desired["mode"])
+                    if mode_val:
+                        mode_path.write_text(mode_val, encoding="utf-8")
+                if "miimon" in desired:
+                    miimon_path = bond_dir / "miimon"
+                    if miimon_path.exists():
+                        miimon_path.write_text(str(desired["miimon"]), encoding="utf-8")
+                if "lacp_rate" in desired:
+                    lacp_path = bond_dir / "lacp_rate"
+                    if lacp_path.exists():
+                        lacp_path.write_text("1" if desired["lacp_rate"] == "fast" else "0", encoding="utf-8")
+            # Enslave slaves
+            for slave in desired["slaves"]:
+                slave_idx = ip.link_lookup(ifname=slave)
+                if slave_idx:
+                    ip.link("set", index=slave_idx[0], master=idx[0])
+            ip.link("set", index=idx[0], state="up")
+        elif operation == "vlan.configure":
+            vlan_name = f"{desired['interface']}.{desired['vlan_id']}"
+            idx = ip.link_lookup(ifname=vlan_name)
+            if not idx:
+                parent_idx = ip.link_lookup(ifname=desired["interface"])
+                if not parent_idx:
+                    raise HTTPException(409, f"host-network parent interface {desired['interface']} not found")
+                ip.link("add", ifname=vlan_name, kind="vlan", vlan_id=desired["vlan_id"])
+        elif operation == "mtu.configure":
+            idx = ip.link_lookup(ifname=desired["interface"])
+            if not idx:
+                raise HTTPException(409, f"host-network interface {desired['interface']} not found")
+            ip.link("set", index=idx[0], mtu=desired["mtu"])
+        elif operation == "address.configure":
+            idx = ip.link_lookup(ifname=desired["interface"])
+            if not idx:
+                raise HTTPException(409, f"host-network interface {desired['interface']} not found")
+            prefix = desired.get("prefix", 24)
+            import socket as _socket
+            import struct as _struct
+            try:
+                addr_bytes = _socket.inet_pton(_socket.AF_INET, desired["address"])
+            except OSError:
+                addr_bytes = _socket.inet_pton(_socket.AF_INET6, desired["address"])
+            ip.addr("add", index=idx[0], address=desired["address"], mask=prefix)
+            if "gateway" in desired:
+                try:
+                    _socket.inet_pton(_socket.AF_INET, desired["gateway"])
+                    ip.route("add", dst="0.0.0.0/0", gateway=desired["gateway"])
+                except OSError:
+                    ip.route("add", dst="::/0", gateway=desired["gateway"])
+    finally:
+        ip.close()
+
+
+def _host_network_verify(operation: str, current: dict[str, Any], desired: dict[str, Any]) -> bool:
+    if operation == "interface.configure":
+        iface = current.get("interface") if isinstance(current.get("interface"), dict) else {}
+        for key, expected in desired.items():
+            if key == "interface":
+                continue
+            if iface.get(key) != expected and iface.get(key) != str(expected):
+                return False
+        return True
+    if operation == "interface.bond":
+        bond = current.get("bond") if isinstance(current.get("bond"), dict) else {}
+        if bond.get("mode") != desired["mode"]:
+            return False
+        if sorted(bond.get("slaves") or []) != sorted(desired["slaves"]):
+            return False
+        return True
+    if operation == "vlan.configure":
+        vlan = current.get("vlan") if isinstance(current.get("vlan"), dict) else {}
+        return vlan is not None and vlan.get("vlan_id") == desired["vlan_id"]
+    if operation == "mtu.configure":
+        iface = current.get("interface") if isinstance(current.get("interface"), dict) else {}
+        return iface.get("mtu") == desired["mtu"]
+    if operation == "address.configure":
+        iface = current.get("interface") if isinstance(current.get("interface"), dict) else {}
+        return any(a.get("address") == desired["address"] for a in iface.get("addresses") or [])
+    if operation == "network.discover":
+        return len(current.get("interfaces") or []) > 0
+    return False
+    kind, operation = _operation(typed)
+    provider = _provider_target(typed)
+    desired = _validate_desired_state(kind, operation, typed.get("desired_state") or {})
+    if operation == "virtual-media.insert":
+        _virtual_media_image_allowed(provider, desired["image_url"])
+    if operation == "secure-boot.apply":
+        _secure_boot_policy(provider, desired)
+    if operation in {"sriov.apply", "iommu.apply"}:
+        _hardware_feature_policy(provider, operation, desired)
+    if operation == "boot-order.apply":
+        _boot_order_policy(provider, desired)
+    if operation == "bios.apply":
+        _bios_attributes_allowed(provider, desired["attributes"])
+    if operation == "firmware.apply":
+        _firmware_request_allowed(provider, desired)
+    if operation.startswith("storage.volume."):
+        _storage_request_allowed(provider, desired, operation)
+    credential_ref = str(provider.get("credential_ref") or "")
+    if kind == "ipmi":
+        credential = _ipmi_credential_profile(credential_ref)
+    elif kind == "pxe":
+        credential = _pxe_credential_profile(credential_ref)
+    else:
+        credential = _credential_profile(credential_ref)
+    return kind, operation, provider, desired, credential
+
+
 def _redfish_current(
     provider: dict[str, Any], credential: dict[str, Any], operation: str, desired: dict[str, Any] | None = None
 ) -> tuple[str, dict[str, Any], dict[str, Any]]:
@@ -2128,8 +2592,14 @@ def preview(changeset_plan: dict[str, Any]) -> dict[str, Any]:
         _pxe_unattended_profile(credential, desired["unattended_profile_ref"])
         current = _pxe_preview_current(typed, provider, credential, server)
         current["boot_provider"]["provider_kind"] = str(_pxe_boot_provider_target(typed, server).get("kind") or "")
+    elif kind == "host-network":
+        _, _, current = _host_network_current(provider, credential, operation, desired)
+    elif kind in {"network-switch", "proxmox", "vmware-workstation", "vmware", "openstack", "aws", "azure", "gcp"}:
+        # Preview: return current capabilities/state — trusted runtime will be implemented per-provider
+        current = {"provider_kind": kind, "operation": operation, "note": "provider contract accepted, runtime integration pending", "supported": True}
     else:
         raise HTTPException(422, "trusted runtime preview is not available for this infrastructure provider")
+    diff = _pxe_desired_diff(current, desired, server, supply) if kind == "pxe" else _desired_host_network_diff(current, desired, operation) if kind == "host-network" else _desired_diff(operation, current, desired)
     return {
         "kind": "InfrastructureRuntimePreview",
         "provider_kind": kind,
@@ -2138,7 +2608,7 @@ def preview(changeset_plan: dict[str, Any]) -> dict[str, Any]:
         "current": current,
         "current_hash": sha256_hex(current),
         "desired_state": desired,
-        "diff": _pxe_desired_diff(current, desired, server, supply) if kind == "pxe" else _desired_diff(operation, current, desired),
+        "diff": diff,
         "active_probe": True,
         "credential_material_returned": False,
         "secret_output_suppressed": True,
@@ -2317,14 +2787,20 @@ def execute(ticket: dict[str, Any], signature: str) -> dict[str, Any]:
             resource_url, resource, before = _redfish_current(provider, credential, operation)
     elif kind == "ipmi":
         resource_url, resource, before = _ipmi_current(provider, credential, operation)
+    elif kind == "host-network":
+        resource_url, resource, before = _host_network_current(provider, credential, operation, desired)
+    elif kind in {"network-switch", "proxmox", "vmware-workstation", "vmware", "openstack", "aws", "azure", "gcp"}:
+        raise HTTPException(501, f"trusted {kind} runtime is not implemented; provider remains CONTRACT_ONLY")
     else:
         raise HTTPException(422, "trusted infrastructure runtime is unavailable for this provider kind")
     if sha256_hex(before) != str(runtime_preview.get("current_hash") or ""):
         raise HTTPException(409, "infrastructure state drifted after deterministic preview; re-plan and re-approve")
-    mutation_applied = bool(_desired_diff(operation, before, desired))
+    mutation_applied = bool(_desired_host_network_diff(before, desired, operation) if kind == "host-network" else _desired_diff(operation, before, desired))
     if mutation_applied:
         if kind == "redfish":
             _apply_redfish(operation, resource_url, resource, desired, credential)
+        elif kind == "host-network":
+            _apply_host_network(operation, resource_url, resource, desired, credential)
         else:
             _apply_ipmi(operation, provider, desired, credential)
 
@@ -2348,6 +2824,8 @@ def execute(ticket: dict[str, Any], signature: str) -> dict[str, Any]:
                     _, _, after = _redfish_current(provider, credential, operation, desired)
                 else:
                     _, _, after = _redfish_current(provider, credential, operation)
+            elif kind == "host-network":
+                _, _, after = _host_network_current(provider, credential, operation, desired)
             else:
                 _, _, after = _ipmi_current(provider, credential, operation)
             last_probe_error = ""
@@ -2358,7 +2836,7 @@ def execute(ticket: dict[str, Any], signature: str) -> dict[str, Any]:
                     time.sleep(delay_seconds)
                     continue
             raise
-        if _verification_matches(operation, after, desired, before=before):
+        if _host_network_verify(operation, after, desired) if kind == "host-network" else _verification_matches(operation, after, desired, before=before):
             verified = True
             break
         if attempt + 1 < attempts:

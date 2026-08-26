@@ -82,6 +82,14 @@ BARE_METAL_PROVIDER_CONTRACTS: dict[str, dict[str, Any]] = {
         "actions": ["os.provision", "os.reimage", "os.recover", "os.decommission"],
         "arbitrary_install_script": False,
     },
+    "host-network": {
+        "kind": "host-networking",
+        "plan_contract": "HostNetworkPlan",
+        "credential_boundary": "credential-service-provider-worker-only",
+        "actions": ["interface.configure", "interface.bond", "vlan.configure", "mtu.configure", "address.configure", "network.discover"],
+        "arbitrary_command": False,
+        "arbitrary_shell": False,
+    },
 }
 
 NETWORK_PROVIDER_CONTRACTS: dict[str, dict[str, Any]] = {
@@ -89,7 +97,7 @@ NETWORK_PROVIDER_CONTRACTS: dict[str, dict[str, Any]] = {
         "kind": "network-infrastructure",
         "plan_contract": "SwitchNetworkPlan",
         "credential_boundary": "credential-service-provider-worker-only",
-        "actions": ["vlan.ensure", "port.configure", "bond.ensure", "network.attach", "network.detach"],
+        "actions": ["vlan.ensure", "port.configure", "bond.ensure", "network.attach", "network.detach", "lldp.observe", "bgp.configure"],
         "arbitrary_cli": False,
     }
 }
@@ -98,6 +106,10 @@ INFRASTRUCTURE_RUNTIME_OPERATIONS: dict[str, set[str]] = {
     "redfish": {"inventory.refresh", "power.set", "boot.set", "boot-order.apply", "secure-boot.apply", "sriov.apply", "iommu.apply", "virtual-media.insert", "virtual-media.eject", "bios.apply", "firmware.apply", "storage.volume.apply", "storage.volume.delete"},
     "ipmi": {"power.set", "boot.set"},
     "pxe": {"os.provision", "os.reimage"},
+    # Only provider kinds with a fully implemented trusted worker + active collector belong
+    # here. Listing a kind makes the control plane dispatch to the infrastructure worker
+    # instead of emitting a CONTRACT_ONLY plan, so C9/C10 kinds stay out until they land.
+    "host-network": {"interface.configure", "interface.bond", "vlan.configure", "mtu.configure", "address.configure", "network.discover"},
 }
 REDFISH_POWER_STATES = {"on", "force-off", "graceful-shutdown", "restart", "graceful-restart", "power-cycle"}
 REDFISH_BOOT_TARGETS = {"pxe", "disk", "cd", "none"}
@@ -558,6 +570,116 @@ def validate_infrastructure_desired_state(provider_kind: str, operation: str, de
             raise ValueError("PXE os.reimage requires confirm_server")
         if operation == "os.provision" and confirm:
             raise ValueError("PXE os.provision does not accept confirm_server")
+        return
+    if provider_kind == "host-network":
+        NETWORK_INTERFACE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$")
+        NETWORK_MAC_RE = re.compile(r"^(?:[0-9a-f]{2}:){5}[0-9a-f]{2}$")
+        NETWORK_VLAN_RE = re.compile(r"^[1-9][0-9]{0,3}$|^[1-5][0-9]{4}$|^6[0-4][0-9]{3}$|^65[0-4][0-9][0-9]$|^655[0-2][0-9]$|^6553[0-5]$")
+        NETWORK_MTU_RE = re.compile(r"^([6-9][0-9]{2,3}|1[0-8][0-9]{2}|19[0-9]{2}|20[0-9]{2}|21[0-9]{2}|22[0-9]{2}|9[0-9]{3}|[1-8][0-9]{4})$")
+        if operation == "network.discover":
+            if desired_state:
+                raise ValueError("host-network network.discover does not accept desired_state fields")
+            return
+        if operation == "interface.configure":
+            allowed = {"interface", "mac", "state", "mtu"}
+            unknown = sorted(set(desired_state) - allowed)
+            if unknown:
+                raise ValueError("unsupported host-network interface.configure field(s): " + ", ".join(unknown))
+            interface = str(desired_state.get("interface") or "")
+            if not NETWORK_INTERFACE_RE.fullmatch(interface):
+                raise ValueError("host-network interface name is invalid")
+            if "mac" in desired_state:
+                mac = str(desired_state["mac"] or "").lower()
+                if not NETWORK_MAC_RE.fullmatch(mac):
+                    raise ValueError("host-network MAC address is invalid")
+            if "state" in desired_state:
+                if str(desired_state["state"] or "").lower() not in {"up", "down"}:
+                    raise ValueError("host-network interface state must be up or down")
+            if "mtu" in desired_state:
+                mtu = str(desired_state["mtu"] or "")
+                if not NETWORK_MTU_RE.fullmatch(mtu):
+                    raise ValueError("host-network MTU is invalid")
+            return
+        if operation == "interface.bond":
+            allowed = {"bond_interface", "mode", "slaves", "miimon", "lacp_rate"}
+            unknown = sorted(set(desired_state) - allowed)
+            if unknown:
+                raise ValueError("unsupported host-network interface.bond field(s): " + ", ".join(unknown))
+            bond = str(desired_state.get("bond_interface") or "")
+            if not NETWORK_INTERFACE_RE.fullmatch(bond) or not bond.startswith("bond"):
+                raise ValueError("host-network bond interface name must start with 'bond'")
+            mode = str(desired_state.get("mode") or "802.3ad").lower()
+            if mode not in {"802.3ad", "active-backup", "balance-tlb", "balance-alb", "balance-rr", "balance-xor", "broadcast"}:
+                raise ValueError("host-network bond mode must be a supported bonding mode")
+            slaves = desired_state.get("slaves")
+            if not isinstance(slaves, list) or not 1 <= len(slaves) <= 16:
+                raise ValueError("host-network bond requires between 1 and 16 slave interfaces")
+            for slave in slaves:
+                if not NETWORK_INTERFACE_RE.fullmatch(str(slave or "")):
+                    raise ValueError("host-network bond slave interface name is invalid")
+            return
+        if operation == "vlan.configure":
+            allowed = {"interface", "vlan_id"}
+            unknown = sorted(set(desired_state) - allowed)
+            if unknown:
+                raise ValueError("unsupported host-network vlan.configure field(s): " + ", ".join(unknown))
+            vlan_id = str(desired_state.get("vlan_id") or "")
+            interface = str(desired_state.get("interface") or "")
+            if not NETWORK_INTERFACE_RE.fullmatch(interface):
+                raise ValueError("host-network vlan interface name is invalid")
+            if not NETWORK_VLAN_RE.fullmatch(vlan_id):
+                raise ValueError("host-network vlan_id must be a valid VLAN ID (1-4094)")
+            return
+        if operation == "mtu.configure":
+            allowed = {"interface", "mtu"}
+            unknown = sorted(set(desired_state) - allowed)
+            if unknown:
+                raise ValueError("unsupported host-network mtu.configure field(s): " + ", ".join(unknown))
+            mtu = str(desired_state.get("mtu") or "")
+            interface = str(desired_state.get("interface") or "")
+            if not NETWORK_INTERFACE_RE.fullmatch(interface):
+                raise ValueError("host-network mtu interface name is invalid")
+            if not NETWORK_MTU_RE.fullmatch(mtu):
+                raise ValueError("host-network MTU is invalid")
+            return
+        if operation == "address.configure":
+            allowed = {"interface", "address", "prefix", "gateway", "dns"}
+            unknown = sorted(set(desired_state) - allowed)
+            if unknown:
+                raise ValueError("unsupported host-network address.configure field(s): " + ", ".join(unknown))
+            import ipaddress
+            address = str(desired_state.get("address") or "")
+            interface = str(desired_state.get("interface") or "")
+            if not NETWORK_INTERFACE_RE.fullmatch(interface):
+                raise ValueError("host-network address interface name is invalid")
+            try:
+                ipaddress.ip_address(address)
+            except ValueError as exc:
+                raise ValueError("host-network address is not a valid IP address") from exc
+            prefix = desired_state.get("prefix")
+            if prefix is not None:
+                if not isinstance(prefix, int) or isinstance(prefix, bool) or not 1 <= prefix <= 128:
+                    raise ValueError("host-network prefix must be between 1 and 128")
+            if "gateway" in desired_state:
+                gw = str(desired_state["gateway"] or "")
+                try:
+                    ipaddress.ip_address(gw)
+                except ValueError as exc:
+                    raise ValueError("host-network gateway is not a valid IP address") from exc
+            if "dns" in desired_state:
+                dns = desired_state["dns"]
+                if not isinstance(dns, list) or len(dns) > 4:
+                    raise ValueError("host-network dns must be a list of up to 4 addresses")
+                for dns_entry in dns:
+                    try:
+                        ipaddress.ip_address(str(dns_entry or ""))
+                    except ValueError as exc:
+                        raise ValueError("host-network dns entry is not a valid IP address") from exc
+            return
+        return
+    if provider_kind == "network-switch":
+        return
+    if provider_kind in {"proxmox", "vmware-workstation", "vmware", "openstack", "aws", "azure", "gcp"}:
         return
     if provider_kind != "redfish":
         return
