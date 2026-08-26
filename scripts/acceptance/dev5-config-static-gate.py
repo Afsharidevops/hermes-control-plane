@@ -42,10 +42,10 @@ for table in (
     "cluster_blueprints", "cluster_profiles", "clusters", "node_roles", "provisioning_runs",
     "addon_plans", "upgrade_plans", "backup_plans", "kubernetes_intelligence_snapshots",
     "infrastructure_providers", "fleet_target_snapshots", "operation_plans", "operation_jobs",
-    "artifact_mirror_items", "verification_results", "hubble_flow_events",
+    "artifact_mirror_items", "verification_results", "hubble_flow_events", "server_host_observation_bindings",
 ):
     assert f"CREATE TABLE IF NOT EXISTS {table}" in db, table
-assert "PRAGMA user_version = 10" in db
+assert "PRAGMA user_version = 11" in db
 
 main = (ROOT / "control-plane/src/hermes_control_plane/main.py").read_text()
 models = (ROOT / "control-plane/src/hermes_control_plane/models.py").read_text()

@@ -70,6 +70,12 @@ hermesAgent:
   enabled: false
   image: nousresearch/hermes-agent:latest
 
+hostObserver:
+  enabled: false
+  identity: ""
+  service:
+    port: 8811
+
 nodeAgent:
   enabled: false
   executionEnabled: false
@@ -107,6 +113,7 @@ secrets:
   credentialMasterKeyVersion: "v1"
   kubernetesBrokerToken: ""
   providerWorkerToken: ""
+  hostObserverToken: ""
   executionHmacKey: ""
   routerGatewayAdminToken: ""
   smartRouterHmacSecret: ""

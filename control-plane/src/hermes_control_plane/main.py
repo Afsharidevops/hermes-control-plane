@@ -61,6 +61,9 @@ from .models import (
     ServerCreate,
     ServerUpdate,
     ServerPreflightResult,
+    ServerHostObservationBindingCreate,
+    ServerHostObservationBindingUpdate,
+    HostNetworkCollectorResult,
     BootstrapPlanCreate,
     ProviderJobTransition,
     ProviderJobRetry,
@@ -342,6 +345,21 @@ def _get_server(conn, server_id: str):
     if not row:
         raise HTTPException(status_code=404, detail="server not found")
     return row
+
+
+def _host_observation_binding_dict(row: Any) -> dict[str, Any]:
+    return dict(row)
+
+
+def _configured_host_observation_bindings(conn, server_ids: list[str]) -> list[dict[str, Any]]:
+    if not server_ids:
+        return []
+    placeholders = ",".join("?" for _ in server_ids)
+    rows = conn.execute(
+        f"SELECT * FROM server_host_observation_bindings WHERE status='configured' AND server_id IN ({placeholders}) ORDER BY server_id",
+        tuple(sorted(server_ids)),
+    ).fetchall()
+    return [_host_observation_binding_dict(row) for row in rows]
 
 
 def _assert_server_ips_unique(conn, management_ip: str, provisioning_ip: str | None, bmc_ip: str | None, *, exclude_id: str | None = None) -> None:
@@ -906,6 +924,7 @@ def system() -> dict[str, Any]:
             "operation_jobs": conn.execute("SELECT COUNT(*) FROM operation_jobs").fetchone()[0],
             "artifact_mirror_items": conn.execute("SELECT COUNT(*) FROM artifact_mirror_items").fetchone()[0],
             "verification_results": conn.execute("SELECT COUNT(*) FROM verification_results").fetchone()[0],
+            "host_observation_bindings": conn.execute("SELECT COUNT(*) FROM server_host_observation_bindings").fetchone()[0],
         }
         policy_generation = db.get_policy_generation(conn)
     return {
@@ -1608,9 +1627,64 @@ def delete_server(server_id: str, authorization: str | None = Header(default=Non
             raise HTTPException(status_code=409, detail="server has active provider jobs")
         conn.execute("DELETE FROM provider_job_events WHERE job_id IN (SELECT id FROM provider_jobs WHERE server_id=?)", (server_id,))
         conn.execute("DELETE FROM provider_jobs WHERE server_id=?", (server_id,))
+        conn.execute("DELETE FROM server_host_observation_bindings WHERE server_id=?", (server_id,))
         conn.execute("DELETE FROM servers WHERE id=?", (server_id,))
         db.audit(conn, "server.deleted", "admin", "server", server_id)
         conn.commit()
+
+
+@app.get("/v1/servers/{server_id}/host-observation-binding")
+def get_server_host_observation_binding(server_id: str, authorization: str | None = Header(default=None)) -> dict[str, Any] | None:
+    _require_admin(authorization)
+    with closing(db.connect()) as conn:
+        _get_server(conn, server_id)
+        row = conn.execute("SELECT * FROM server_host_observation_bindings WHERE server_id=?", (server_id,)).fetchone()
+    return _host_observation_binding_dict(row) if row else None
+
+
+@app.post("/v1/servers/{server_id}/host-observation-binding", status_code=201)
+def create_server_host_observation_binding(server_id: str, payload: ServerHostObservationBindingCreate, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_admin(authorization)
+    binding_id = f"hob_{uuid.uuid4().hex[:16]}"
+    now = int(time.time())
+    with closing(db.connect()) as conn:
+        server = _get_server(conn, server_id)
+        if server["status"] != "configured":
+            raise HTTPException(status_code=409, detail="server must be configured before host observation binding")
+        try:
+            conn.execute(
+                "INSERT INTO server_host_observation_bindings (id,server_id,collector_kind,collector_identity,transport,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)",
+                (binding_id, server_id, payload.collector_kind, payload.collector_identity, payload.transport, "configured", now, now),
+            )
+        except Exception as exc:
+            if "UNIQUE" in str(exc):
+                raise HTTPException(status_code=409, detail="server already has a host observation binding or observer identity is already active") from exc
+            raise
+        db.audit(conn, "server.host_observation_binding_created", "admin", "server", server_id, {"binding_id": binding_id, "collector_kind": payload.collector_kind, "collector_identity": payload.collector_identity, "transport": payload.transport})
+        conn.commit()
+        row = conn.execute("SELECT * FROM server_host_observation_bindings WHERE id=?", (binding_id,)).fetchone()
+    return _host_observation_binding_dict(row)
+
+
+@app.patch("/v1/servers/{server_id}/host-observation-binding")
+def update_server_host_observation_binding(server_id: str, payload: ServerHostObservationBindingUpdate, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_admin(authorization)
+    now = int(time.time())
+    with closing(db.connect()) as conn:
+        _get_server(conn, server_id)
+        row = conn.execute("SELECT * FROM server_host_observation_bindings WHERE server_id=?", (server_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="host observation binding not found")
+        try:
+            conn.execute("UPDATE server_host_observation_bindings SET status=?,updated_at=? WHERE id=?", (payload.status, now, row["id"]))
+        except Exception as exc:
+            if "UNIQUE" in str(exc):
+                raise HTTPException(status_code=409, detail="observer identity is already active for another server") from exc
+            raise
+        db.audit(conn, "server.host_observation_binding_updated", "admin", "server", server_id, {"binding_id": row["id"], "status": payload.status})
+        conn.commit()
+        updated = conn.execute("SELECT * FROM server_host_observation_bindings WHERE id=?", (row["id"],)).fetchone()
+    return _host_observation_binding_dict(updated)
 
 
 @app.post("/v1/servers/{server_id}/preflight-plan", status_code=201)
@@ -3441,6 +3515,82 @@ def _validate_diagnostic_evidence(value: Any, *, depth: int = 0) -> None:
         raise HTTPException(status_code=502, detail="Kubernetes Broker diagnostic evidence string is too large")
 
 
+HOST_OBSERVER_INTERFACE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,30}$")
+HOST_OBSERVER_INTERFACE_STATES = {"up", "down", "unknown", "dormant", "lowerlayerdown", "notpresent", "testing"}
+
+
+def _validate_host_observer_facts(facts: dict[str, Any]) -> None:
+    if set(facts) != {"interfaces", "bond_count", "vlan_count"}:
+        raise HTTPException(status_code=502, detail="host observer returned an unsupported facts schema")
+    interfaces = facts["interfaces"]
+    if not isinstance(interfaces, list) or len(interfaces) > 64:
+        raise HTTPException(status_code=502, detail="host observer interface inventory is invalid")
+    previous_name = ""
+    for interface in interfaces:
+        if not isinstance(interface, dict) or set(interface) != {"name", "state", "mtu"}:
+            raise HTTPException(status_code=502, detail="host observer interface evidence is invalid")
+        name = interface["name"]
+        state = interface["state"]
+        mtu = interface["mtu"]
+        if (
+            not isinstance(name, str)
+            or not HOST_OBSERVER_INTERFACE_NAME_RE.fullmatch(name)
+            or name <= previous_name
+            or not isinstance(state, str)
+            or state not in HOST_OBSERVER_INTERFACE_STATES
+            or isinstance(mtu, bool)
+            or not isinstance(mtu, int)
+            or not 576 <= mtu <= 9216
+        ):
+            raise HTTPException(status_code=502, detail="host observer interface evidence is invalid")
+        previous_name = name
+    for key, maximum in (("bond_count", 32), ("vlan_count", 128)):
+        value = facts[key]
+        if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= maximum:
+            raise HTTPException(status_code=502, detail=f"host observer {key} is invalid")
+
+
+async def _host_observation_check(cluster: dict[str, Any]) -> dict[str, Any]:
+    with closing(db.connect()) as conn:
+        profile = _profile_dict(_get_profile(conn, cluster["profile_id"]))
+        server_ids = sorted(profile["server_ids"])
+        bindings = _configured_host_observation_bindings(conn, server_ids)
+    if not bindings:
+        return {"id": "hosts", "status": "SKIP", "summary": "No configured explicit host-observer binding exists for this cluster's registered servers.", "evidence": {"collector": "not-configured", "server_count": len(server_ids)}}
+
+    try:
+        raw = await provider_worker.collect_host_network()
+        result = HostNetworkCollectorResult.model_validate(raw)
+        _validate_host_observer_facts(result.facts)
+        verified_result = result.model_dump(exclude={"observation_hash"})
+        if result.observation_hash != sha256_hex(verified_result):
+            raise HTTPException(status_code=502, detail="host observer result hash is invalid")
+        if result.mutation_commands_executed or result.credential_material_returned or result.arbitrary_cli or result.arbitrary_shell:
+            raise HTTPException(status_code=502, detail="host observer returned unsafe execution assertions")
+        observed_age = int(time.time()) - result.observed_at
+        if observed_age < 0 or observed_age > 60:
+            raise HTTPException(status_code=502, detail="host observer result is stale")
+    except HTTPException as exc:
+        return {"id": "hosts", "status": "FAIL", "summary": "Configured host observer failed active collection or returned unsafe evidence.", "evidence": {"configured_binding_count": len(bindings), "error_type": f"http-{exc.status_code}"}}
+    except Exception:
+        return {"id": "hosts", "status": "FAIL", "summary": "Configured host observer returned malformed collection data.", "evidence": {"configured_binding_count": len(bindings), "error_type": "malformed-response"}}
+
+    matching = [binding for binding in bindings if binding["collector_kind"] == result.collector_kind and binding["collector_identity"] == result.collector_identity and binding["transport"] == "host-observer-default"]
+    if not matching:
+        return {"id": "hosts", "status": "FAIL", "summary": "Configured host observer identity does not match an explicit server binding for this cluster.", "evidence": {"configured_binding_count": len(bindings), "collector_identity": result.collector_identity}}
+    if result.status == "FAIL":
+        return {"id": "hosts", "status": "FAIL", "summary": "Configured host observer reported a failed host-network collection.", "evidence": {"binding_id": matching[0]["id"], "collector_identity": result.collector_identity, "observed_at": result.observed_at}}
+    if result.status == "SKIP" or not result.host_roots_visible:
+        return {"id": "hosts", "status": "SKIP", "summary": "Configured host observer cannot see the required mounted host network roots.", "evidence": {"binding_id": matching[0]["id"], "collector_identity": result.collector_identity, "observed_at": result.observed_at}}
+    if not result.facts["interfaces"]:
+        return {"id": "hosts", "status": "FAIL", "summary": "Configured host observer reported insufficient host-network evidence for a successful verification.", "evidence": {"binding_id": matching[0]["id"], "collector_identity": result.collector_identity, "observed_at": result.observed_at}}
+
+    covered_ids = {binding["server_id"] for binding in matching}
+    status = "PASS" if covered_ids == set(server_ids) else "WARN"
+    summary = "Fresh explicit host observation covers every registered cluster server." if status == "PASS" else "Fresh explicit host observation covers only part of the registered cluster server set."
+    return {"id": "hosts", "status": status, "summary": summary, "evidence": {"collector_kind": result.collector_kind, "collector_identity": result.collector_identity, "binding_ids": [binding["id"] for binding in matching], "covered_server_count": len(covered_ids), "server_count": len(server_ids), "observed_at": result.observed_at, "host_roots_visible": result.host_roots_visible, "interface_count": len(result.facts.get("interfaces") or []), "bond_count": result.facts.get("bond_count", 0), "vlan_count": result.facts.get("vlan_count", 0)}}
+
+
 async def _execute_cluster_diagnostics(*, cluster_id: str, native_target_id: str, checks: list[str], actor: str) -> tuple[dict[str, Any], dict[str, Any]]:
     with closing(db.connect()) as conn:
         cluster = _cluster_dict(_get_cluster(conn, cluster_id))
@@ -3495,6 +3645,9 @@ async def run_cluster_unified_verification(cluster_id: str, payload: UnifiedVeri
         actor="admin:unified-verification",
     )
     checks = unified_verification.from_diagnostics(diagnostics, selected)
+
+    if "hosts" in selected:
+        unified_verification.replace_check(checks, await _host_observation_check(cluster))
 
     if "radar" in selected:
         integration = None

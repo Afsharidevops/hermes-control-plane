@@ -128,6 +128,94 @@ def test_unified_verification_runs_live_collectors_persists_and_audits(client: T
     assert any(row["event_type"] == "verification.active.executed" for row in audit)
 
 
+def test_unified_verification_uses_only_fresh_explicit_host_observer_binding(client: TestClient, monkeypatch):
+    cluster, target = _cluster_and_target(client)
+    server_id = client.get("/v1/servers").json()[0]["id"]
+    binding = client.post(
+        f"/v1/servers/{server_id}/host-observation-binding",
+        headers=ADMIN,
+        json={"collector_identity": "host-observer-a"},
+    )
+    assert binding.status_code == 201
+
+    async def fake_post(path: str, payload: dict) -> dict:
+        return _diagnostic_result(payload["checks"])
+
+    async def fake_collect() -> dict:
+        result = {
+            "contract_version": "host-network-local-v1",
+            "collector_kind": "host-network-local-v1",
+            "collector_identity": "host-observer-a",
+            "status": "PASS",
+            "summary": "fresh local host observation",
+            "observed_at": __import__("time").time().__int__(),
+            "host_roots_visible": True,
+            "facts": {"interfaces": [{"name": "eth0", "state": "up", "mtu": 1500}], "bond_count": 0, "vlan_count": 0},
+            "mutation_commands_executed": False,
+            "credential_material_returned": False,
+            "arbitrary_cli": False,
+            "arbitrary_shell": False,
+        }
+        from hermes_control_plane.canonical import sha256_hex
+        return {**result, "observation_hash": sha256_hex(result)}
+
+    monkeypatch.setattr(kubernetes_broker, "post", fake_post)
+    from hermes_control_plane import provider_worker
+    monkeypatch.setattr(provider_worker, "collect_host_network", fake_collect)
+    response = client.post(
+        f"/v1/clusters/{cluster['id']}/verify",
+        headers=ADMIN,
+        json={"native_target_id": target["id"], "checks": ["hosts"]},
+    )
+    assert response.status_code == 201, response.text
+    hosts = response.json()["checks"][0]
+    assert hosts["status"] == "PASS"
+    assert hosts["evidence"]["covered_server_count"] == 1
+    assert "address" not in str(hosts["evidence"]).lower()
+
+
+def test_unified_verification_rejects_tampered_or_unsafe_host_observer_evidence(client: TestClient, monkeypatch):
+    cluster, target = _cluster_and_target(client)
+    server_id = client.get("/v1/servers").json()[0]["id"]
+    binding = client.post(
+        f"/v1/servers/{server_id}/host-observation-binding",
+        headers=ADMIN,
+        json={"collector_identity": "host-observer-a"},
+    )
+    assert binding.status_code == 201
+
+    async def fake_collect() -> dict:
+        return {
+            "contract_version": "host-network-local-v1",
+            "collector_kind": "host-network-local-v1",
+            "collector_identity": "host-observer-a",
+            "status": "PASS",
+            "summary": "fresh but tampered host observation",
+            "observed_at": __import__("time").time().__int__(),
+            "host_roots_visible": True,
+            "facts": {"interfaces": [], "bond_count": 0, "vlan_count": 0},
+            "observation_hash": "a" * 64,
+            "mutation_commands_executed": False,
+            "credential_material_returned": False,
+            "arbitrary_cli": False,
+            "arbitrary_shell": False,
+        }
+
+    async def fake_post(path: str, payload: dict) -> dict:
+        return _diagnostic_result(payload["checks"])
+
+    monkeypatch.setattr(kubernetes_broker, "post", fake_post)
+    from hermes_control_plane import provider_worker
+    monkeypatch.setattr(provider_worker, "collect_host_network", fake_collect)
+    response = client.post(
+        f"/v1/clusters/{cluster['id']}/verify",
+        headers=ADMIN,
+        json={"native_target_id": target["id"], "checks": ["hosts"]},
+    )
+    assert response.status_code == 201, response.text
+    assert response.json()["checks"][0]["status"] == "FAIL"
+
+
 def test_unified_verification_rejects_sensitive_broker_evidence(client: TestClient, monkeypatch):
     cluster, target = _cluster_and_target(client)
 

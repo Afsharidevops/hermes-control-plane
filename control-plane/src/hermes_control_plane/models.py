@@ -262,6 +262,32 @@ class ServerPreflightResult(StrictModel):
     facts: dict[str, Any] = Field(default_factory=dict)
 
 
+class ServerHostObservationBindingCreate(StrictModel):
+    collector_kind: Literal["host-network-local-v1"] = "host-network-local-v1"
+    collector_identity: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]{2,119}$")
+    transport: Literal["host-observer-default"] = "host-observer-default"
+
+
+class ServerHostObservationBindingUpdate(StrictModel):
+    status: Literal["configured", "disabled"]
+
+
+class HostNetworkCollectorResult(StrictModel):
+    contract_version: Literal["host-network-local-v1"]
+    collector_kind: Literal["host-network-local-v1"]
+    collector_identity: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]{2,119}$")
+    status: Literal["PASS", "FAIL", "SKIP"]
+    summary: str = Field(min_length=1, max_length=1000)
+    observed_at: int
+    host_roots_visible: bool
+    facts: dict[str, Any] = Field(default_factory=dict)
+    observation_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    mutation_commands_executed: Literal[False]
+    credential_material_returned: Literal[False]
+    arbitrary_cli: Literal[False]
+    arbitrary_shell: Literal[False]
+
+
 class BootstrapPlanCreate(StrictModel):
     provider: Literal["kubespray", "k3s", "rke2"]
     requested_by: str = Field(min_length=1, max_length=160)

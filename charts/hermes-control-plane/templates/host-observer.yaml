@@ -1,0 +1,56 @@
+{{- if .Values.hostObserver.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "hermes.fullname" . }}-host-observer
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app.kubernetes.io/component: host-observer, app.kubernetes.io/instance: {{ .Release.Name }}}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/component: host-observer, app.kubernetes.io/instance: {{ .Release.Name }}}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10022
+        runAsGroup: 10022
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: host-observer
+          image: "{{ .Values.imageNamespace }}/hermes-control-plane-node-agent:{{ .Values.imageTag }}"
+          imagePullPolicy: {{ .Values.imagePullPolicy }}
+          command: ["uvicorn", "hermes_node_agent.host_observer:app", "--host", "0.0.0.0", "--port", "8811"]
+          ports: [{name: http, containerPort: 8811}]
+          resources:
+            requests: {cpu: 25m, memory: 64Mi}
+            limits: {cpu: 100m, memory: 128Mi}
+          env:
+            - name: HERMES_HOST_OBSERVER_TOKEN
+              valueFrom: {secretKeyRef: {name: {{ include "hermes.secretName" . }}, key: host-observer-token}}
+            - {name: HERMES_HOST_OBSERVER_IDENTITY, value: {{ .Values.hostObserver.identity | quote }}}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          volumeMounts:
+            - {name: host-sys, mountPath: /host-sys/class/net, readOnly: true}
+            - {name: host-proc, mountPath: /host-proc/net/vlan, readOnly: true}
+          readinessProbe: {httpGet: {path: /health, port: http}, initialDelaySeconds: 3, periodSeconds: 10}
+          livenessProbe: {httpGet: {path: /health, port: http}, initialDelaySeconds: 10, periodSeconds: 20}
+      volumes:
+        - name: host-sys
+          hostPath: {path: /sys/class/net, type: Directory}
+        - name: host-proc
+          hostPath: {path: /proc/net/vlan, type: DirectoryOrCreate}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "hermes.fullname" . }}-host-observer
+spec:
+  selector:
+    app.kubernetes.io/component: host-observer
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  ports: [{name: http, port: {{ .Values.hostObserver.service.port }}, targetPort: http}]
+{{- end }}

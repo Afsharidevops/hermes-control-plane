@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from typing import Any
 
 import httpx
@@ -32,4 +33,59 @@ async def post(path: str, payload: dict[str, Any]) -> dict[str, Any]:
         raise HTTPException(status_code=response.status_code, detail=detail or "provider worker request failed")
     if not isinstance(body, dict):
         raise HTTPException(status_code=502, detail="provider worker returned invalid response")
+    return body
+
+
+HOST_OBSERVER_URL = os.getenv("HERMES_HOST_OBSERVER_URL", "").rstrip("/")
+HOST_OBSERVER_TOKEN = os.getenv("HERMES_HOST_OBSERVER_TOKEN", "")
+HOST_OBSERVER_TIMEOUT = float(os.getenv("HERMES_HOST_OBSERVER_TIMEOUT_SECONDS", "10"))
+HOST_OBSERVER_MAX_TIMEOUT = 30.0
+HOST_OBSERVER_SERVICE_RE = re.compile(r"^(?:host-observer|[a-z0-9](?:[-a-z0-9]*[a-z0-9])?-host-observer)$")
+
+
+def _host_observer_endpoint() -> str:
+    if not HOST_OBSERVER_TOKEN:
+        raise HTTPException(status_code=503, detail="host observer token is not configured")
+    try:
+        parsed = httpx.URL(HOST_OBSERVER_URL)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=503, detail="host observer endpoint is invalid") from exc
+    if (
+        parsed.scheme != "http"
+        or not parsed.host
+        or not HOST_OBSERVER_SERVICE_RE.fullmatch(parsed.host)
+        or parsed.port != 8811
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or parsed.path not in ("", "/")
+    ):
+        raise HTTPException(status_code=503, detail="host observer endpoint is not the fixed in-cluster service")
+    if not 0 < HOST_OBSERVER_TIMEOUT <= HOST_OBSERVER_MAX_TIMEOUT:
+        raise HTTPException(status_code=503, detail="host observer timeout is outside the fixed bound")
+    return "http://host-observer:8811/v1/collectors/host-network"
+
+
+async def collect_host_network() -> dict[str, Any]:
+    endpoint = _host_observer_endpoint()
+    try:
+        async with httpx.AsyncClient(timeout=HOST_OBSERVER_TIMEOUT, follow_redirects=False) as client:
+            response = await client.post(
+                endpoint,
+                headers={"Authorization": f"Bearer {HOST_OBSERVER_TOKEN}"},
+                json={},
+            )
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"host observer unavailable: {type(exc).__name__}") from exc
+    if len(response.content) > 128_000:
+        raise HTTPException(status_code=502, detail="host observer response exceeds 128 KiB")
+    try:
+        body = response.json()
+    except ValueError as exc:
+        raise HTTPException(status_code=502, detail="host observer returned non-JSON response") from exc
+    if response.status_code >= 400:
+        raise HTTPException(status_code=502, detail="host observer collection failed")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=502, detail="host observer returned invalid response")
     return body

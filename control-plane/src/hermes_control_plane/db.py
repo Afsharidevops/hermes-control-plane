@@ -128,6 +128,23 @@ def init_db() -> None:
             CREATE UNIQUE INDEX IF NOT EXISTS idx_servers_provisioning_ip ON servers(provisioning_ip) WHERE provisioning_ip IS NOT NULL;
             CREATE UNIQUE INDEX IF NOT EXISTS idx_servers_bmc_ip ON servers(bmc_ip) WHERE bmc_ip IS NOT NULL;
 
+            CREATE TABLE IF NOT EXISTS server_host_observation_bindings (
+                id TEXT PRIMARY KEY,
+                server_id TEXT NOT NULL UNIQUE,
+                collector_kind TEXT NOT NULL,
+                collector_identity TEXT NOT NULL,
+                transport TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                CHECK(collector_kind='host-network-local-v1'),
+                CHECK(transport='host-observer-default'),
+                CHECK(status IN ('configured','disabled')),
+                FOREIGN KEY(server_id) REFERENCES servers(id)
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_host_observation_active_identity
+                ON server_host_observation_bindings(collector_identity) WHERE status='configured';
+
             CREATE TABLE IF NOT EXISTS provider_jobs (
                 id TEXT PRIMARY KEY,
                 provider_id TEXT NOT NULL,
@@ -621,7 +638,7 @@ def init_db() -> None:
         if "artifact_dependencies_json" not in blueprint_cols:
             conn.execute("ALTER TABLE cluster_blueprints ADD COLUMN artifact_dependencies_json TEXT NOT NULL DEFAULT '[]'")
 
-        conn.execute("PRAGMA user_version = 10")
+        conn.execute("PRAGMA user_version = 11")
         conn.commit()
 
 
