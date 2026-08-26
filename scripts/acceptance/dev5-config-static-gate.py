@@ -157,6 +157,10 @@ assert services["node-agent"]["environment"]["HERMES_CAPACITY_REQUEST_TIMEOUT_SE
 assert services["node-agent"]["environment"]["HERMES_CAPACITY_MAX_RESPONSE_BYTES"] == "${HERMES_CAPACITY_MAX_RESPONSE_BYTES:-1048576}"
 assert services["node-agent"]["environment"]["HERMES_CAPACITY_MAX_REQUESTS"] == "${HERMES_CAPACITY_MAX_REQUESTS:-8}"
 assert services["control-plane"]["environment"]["HERMES_CAPACITY_WORKER_TIMEOUT_SECONDS"] == "${HERMES_CAPACITY_WORKER_TIMEOUT_SECONDS:-60}"
+assert services["control-plane"]["environment"]["HERMES_VM_INVENTORY_WORKER_TIMEOUT_SECONDS"] == "${HERMES_VM_INVENTORY_WORKER_TIMEOUT_SECONDS:-60}"
+assert services["node-agent"]["environment"]["HERMES_VM_INVENTORY_COLLECTION_ENABLED"] == "${HERMES_VM_INVENTORY_COLLECTION_ENABLED:-false}"
+assert services["node-agent"]["environment"]["HERMES_VM_INVENTORY_REQUEST_TIMEOUT_SECONDS"] == "${HERMES_VM_INVENTORY_REQUEST_TIMEOUT_SECONDS:-20}"
+assert services["node-agent"]["environment"]["HERMES_VM_INVENTORY_MAX_RESPONSE_BYTES"] == "${HERMES_VM_INVENTORY_MAX_RESPONSE_BYTES:-1048576}"
 assert "HERMES_EXECUTION_HMAC_KEY" in services["node-agent"]["environment"]
 assert "HERMES_PROVIDER_SSH_PROFILE_ROOT" in services["node-agent"]["environment"]
 assert values["nodeAgent"]["enabled"] is False
@@ -175,6 +179,10 @@ assert values["nodeAgent"]["capacityRequestTimeoutSeconds"] == 20
 assert values["nodeAgent"]["capacityMaxResponseBytes"] == 1048576
 assert values["nodeAgent"]["capacityMaxRequests"] == 8
 assert values["nodeAgent"]["capacityWorkerTimeoutSeconds"] == 60
+assert values["nodeAgent"]["vmInventoryCollectionEnabled"] is False
+assert values["nodeAgent"]["vmInventoryRequestTimeoutSeconds"] == 20
+assert values["nodeAgent"]["vmInventoryMaxResponseBytes"] == 1048576
+assert values["nodeAgent"]["vmInventoryWorkerTimeoutSeconds"] == 60
 node_agent_template = (ROOT / "charts/hermes-control-plane/templates/node-agent.yaml").read_text()
 for marker in ("runAsNonRoot: true", "runAsUser: 10022", "runAsGroup: 10022", "fsGroup: 10022", "defaultMode: 0440"):
     assert marker in node_agent_template, marker
@@ -183,14 +191,34 @@ for marker in (
     "HERMES_CAPACITY_MAX_RESPONSE_BYTES", "HERMES_CAPACITY_MAX_REQUESTS",
 ):
     assert marker in node_agent_template, marker
+for marker in (
+    "HERMES_VM_INVENTORY_COLLECTION_ENABLED", "HERMES_VM_INVENTORY_REQUEST_TIMEOUT_SECONDS",
+    "HERMES_VM_INVENTORY_MAX_RESPONSE_BYTES",
+):
+    assert marker in node_agent_template, marker
 control_plane_template = (ROOT / "charts/hermes-control-plane/templates/control-plane.yaml").read_text()
 assert "HERMES_CAPACITY_WORKER_TIMEOUT_SECONDS" in control_plane_template
+assert "HERMES_VM_INVENTORY_WORKER_TIMEOUT_SECONDS" in control_plane_template
 for marker in (
     "HERMES_CAPACITY_COLLECTION_ENABLED=false", "HERMES_CAPACITY_REQUEST_TIMEOUT_SECONDS=20",
     "HERMES_CAPACITY_MAX_RESPONSE_BYTES=1048576", "HERMES_CAPACITY_MAX_REQUESTS=8",
     "HERMES_CAPACITY_WORKER_TIMEOUT_SECONDS=60",
+    "HERMES_VM_INVENTORY_COLLECTION_ENABLED=false", "HERMES_VM_INVENTORY_REQUEST_TIMEOUT_SECONDS=20",
+    "HERMES_VM_INVENTORY_MAX_RESPONSE_BYTES=1048576", "HERMES_VM_INVENTORY_WORKER_TIMEOUT_SECONDS=60",
 ):
     assert marker in (ROOT / ".env.example").read_text(), marker
+compose_text = (ROOT / "docker-compose.yml").read_text()
+for marker in (
+    "HERMES_VM_INVENTORY_COLLECTION_ENABLED", "HERMES_VM_INVENTORY_REQUEST_TIMEOUT_SECONDS",
+    "HERMES_VM_INVENTORY_MAX_RESPONSE_BYTES", "HERMES_VM_INVENTORY_WORKER_TIMEOUT_SECONDS",
+):
+    assert marker in compose_text, marker
+values_text = (ROOT / "charts/hermes-control-plane/values.yaml").read_text()
+for marker in (
+    "vmInventoryCollectionEnabled: false", "vmInventoryRequestTimeoutSeconds: 20",
+    "vmInventoryMaxResponseBytes: 1048576", "vmInventoryWorkerTimeoutSeconds: 60",
+):
+    assert marker in values_text, marker
 validate_script = (ROOT / "validate.sh").read_text()
 assert 'PYTHONPATH=node-agent/src "$PYTHON_BIN" -m pytest -q node-agent/tests' in validate_script
 assert 'HERMES_PROVIDER_EXECUTION_ENABLED:-false' in (ROOT / "docker-compose.yml").read_text()
@@ -202,6 +230,10 @@ assert (ROOT / "node-agent/src/hermes_node_agent/infrastructure_runtime.py").is_
 assert (ROOT / "node-agent/src/hermes_node_agent/capacity_runtime.py").is_file()
 assert (ROOT / "node-agent/tests/test_capacity_runtime.py").is_file()
 assert (ROOT / "control-plane/tests/test_dev5_capacity_refresh.py").is_file()
+# VM inventory collector files are present.
+assert (ROOT / "node-agent/src/hermes_node_agent/vm_inventory_runtime.py").is_file()
+assert (ROOT / "node-agent/tests/test_vm_inventory_runtime.py").is_file()
+assert (ROOT / "control-plane/tests/test_dev5_vm_inventory_refresh.py").is_file()
 node_agent_dockerfile = (ROOT / "node-agent/Dockerfile").read_text()
 assert "openssh-client ca-certificates ipmitool" in node_agent_dockerfile
 node_agent_main = (ROOT / "node-agent/src/hermes_node_agent/main.py").read_text()

@@ -46,6 +46,9 @@ spec:
             - {name: HERMES_CAPACITY_REQUEST_TIMEOUT_SECONDS, value: {{ .Values.nodeAgent.capacityRequestTimeoutSeconds | quote }}}
             - {name: HERMES_CAPACITY_MAX_RESPONSE_BYTES, value: {{ .Values.nodeAgent.capacityMaxResponseBytes | quote }}}
             - {name: HERMES_CAPACITY_MAX_REQUESTS, value: {{ .Values.nodeAgent.capacityMaxRequests | quote }}}
+            - {name: HERMES_VM_INVENTORY_COLLECTION_ENABLED, value: {{ .Values.nodeAgent.vmInventoryCollectionEnabled | quote }}}
+            - {name: HERMES_VM_INVENTORY_REQUEST_TIMEOUT_SECONDS, value: {{ .Values.nodeAgent.vmInventoryRequestTimeoutSeconds | quote }}}
+            - {name: HERMES_VM_INVENTORY_MAX_RESPONSE_BYTES, value: {{ .Values.nodeAgent.vmInventoryMaxResponseBytes | quote }}}
             - {name: HERMES_PROVIDER_WORK_ROOT, value: /var/lib/hermes-provider}
             - {name: HERMES_ARTIFACT_MIRROR_ROOT, value: /data/artifact-mirror}
             - {name: HERMES_PROVIDER_FILES_REPO_URL, value: {{ .Values.nodeAgent.filesRepoUrl | quote }}}

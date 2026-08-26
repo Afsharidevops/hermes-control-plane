@@ -179,12 +179,15 @@ READ_OPERATIONS = {
     "network.live": "NetworkLiveQuery",
     "audit.read": "AuditQuery",
     "capacity.refresh": "ProviderCapacityQuery",
+    "vm.inventory.refresh": "ProviderVmInventoryQuery",
 }
 
 # Capacity collection is intentionally staged. VMware Workstation has no supported
 # remote collector; all unlisted providers remain contract-only for capacity too.
 CAPACITY_PROVIDER_KINDS = {"proxmox"}
 CAPACITY_PROVIDER_PINS = {"proxmox": ("pve-8.2", "pve-capacity-v1")}
+VM_INVENTORY_PROVIDER_KINDS = {"proxmox"}
+VM_INVENTORY_PROVIDER_PINS = {"proxmox": ("pve-8.2", "pve-vm-inventory-v1")}
 
 KUBERNETES_DAY2_RUNTIME_OPERATIONS: dict[str, dict[str, Any]] = {
     "cluster.node.cordon": {"executor": "kubernetes-broker", "verification": ["node-unschedulable"]},
@@ -513,6 +516,57 @@ def capacity_query_plan(*, provider_snapshot: dict[str, Any]) -> dict[str, Any]:
         "schema_version": 1,
         "kind": "ProviderCapacityQuery",
         "operation": "capacity.refresh",
+        "mode": "read",
+        "provider": provider_snapshot,
+        "read_only": True,
+        "live_upstream_required": True,
+        "credential_material_in_plan": False,
+        "mutation_runtime": "CONTRACT_ONLY",
+        "authorization": "required",
+    })
+
+
+def validate_vm_inventory_provider(provider_snapshot: dict[str, Any]) -> None:
+    kind = str(provider_snapshot.get("kind") or "")
+    if kind not in VM_INVENTORY_PROVIDER_KINDS:
+        raise ValueError("provider does not have a supported live VM inventory collector")
+    if provider_snapshot.get("status") != "configured":
+        raise ValueError("VM inventory provider must be configured")
+    if (str(provider_snapshot.get("api_version") or ""), str(provider_snapshot.get("implementation_version") or "")) != VM_INVENTORY_PROVIDER_PINS[kind]:
+        raise ValueError("VM inventory provider versions do not match the supported collector profile")
+    endpoint = str(provider_snapshot.get("endpoint") or "")
+    parsed = urlparse(endpoint)
+    if (
+        parsed.scheme != "https" or not parsed.hostname or parsed.username is not None
+        or parsed.password is not None or parsed.query or parsed.fragment or parsed.port != 8006
+        or parsed.path.rstrip("/") != "/api2/json"
+    ):
+        raise ValueError("Proxmox VM inventory endpoint must be credential-free HTTPS on port 8006 with /api2/json root")
+    caps = provider_snapshot.get("capabilities")
+    nodes = caps.get("node_allowlist") if isinstance(caps, dict) else None
+    if set(caps or {}) != {"node_allowlist"} or not isinstance(nodes, list) or not 1 <= len(nodes) <= 32:
+        raise ValueError("Proxmox VM inventory requires a bounded node_allowlist capability")
+    normalized = [str(node) for node in nodes]
+    if len(set(normalized)) != len(normalized) or any(not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", node) for node in normalized):
+        raise ValueError("Proxmox VM inventory node_allowlist contains unsafe or duplicate nodes")
+    credential = provider_snapshot.get("credential_snapshot")
+    if not isinstance(credential, dict) or credential.get("status") != "configured":
+        raise ValueError("VM inventory provider credential reference must be configured")
+    if credential.get("id") != provider_snapshot.get("credential_ref"):
+        raise ValueError("VM inventory provider credential snapshot does not match its reference")
+    snapshot_hash = provider_snapshot.get("snapshot_hash")
+    unsigned = dict(provider_snapshot)
+    unsigned.pop("snapshot_hash", None)
+    if not isinstance(snapshot_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", snapshot_hash) or sha256_hex(unsigned) != snapshot_hash:
+        raise ValueError("VM inventory provider snapshot hash is invalid")
+
+
+def vm_inventory_query_plan(*, provider_snapshot: dict[str, Any]) -> dict[str, Any]:
+    validate_vm_inventory_provider(provider_snapshot)
+    return _finish({
+        "schema_version": 1,
+        "kind": "ProviderVmInventoryQuery",
+        "operation": "vm.inventory.refresh",
         "mode": "read",
         "provider": provider_snapshot,
         "read_only": True,

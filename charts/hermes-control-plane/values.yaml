@@ -97,6 +97,10 @@ nodeAgent:
   capacityMaxResponseBytes: 1048576
   capacityMaxRequests: 8
   capacityWorkerTimeoutSeconds: 60
+  vmInventoryCollectionEnabled: false
+  vmInventoryRequestTimeoutSeconds: 20
+  vmInventoryMaxResponseBytes: 1048576
+  vmInventoryWorkerTimeoutSeconds: 60
   filesRepoUrl: ""
   aptRepoUrl: ""
   rpmRepoUrl: ""

@@ -22,6 +22,9 @@ def _headers() -> dict[str, str]:
 CAPACITY_TIMEOUT = float(os.getenv("HERMES_CAPACITY_WORKER_TIMEOUT_SECONDS", "60"))
 CAPACITY_MAX_TIMEOUT = 60.0
 CAPACITY_MAX_RESPONSE_BYTES = 1_048_576
+VM_INVENTORY_TIMEOUT = float(os.getenv("HERMES_VM_INVENTORY_WORKER_TIMEOUT_SECONDS", "60"))
+VM_INVENTORY_MAX_TIMEOUT = 60.0
+VM_INVENTORY_MAX_RESPONSE_BYTES = 1_048_576
 
 
 async def post(path: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -42,38 +45,61 @@ async def post(path: str, payload: dict[str, Any]) -> dict[str, Any]:
     return body
 
 
-async def capacity_refresh(provider_snapshot: dict[str, Any]) -> dict[str, Any]:
-    if not 0 < CAPACITY_TIMEOUT <= CAPACITY_MAX_TIMEOUT:
-        raise HTTPException(status_code=503, detail="capacity worker timeout is outside the fixed bound")
+async def _bounded_refresh(path: str, payload: dict[str, Any], *, timeout: float, max_timeout: float, max_response_bytes: int, failure_prefix: str) -> dict[str, Any]:
+    if not 0 < timeout <= max_timeout:
+        raise HTTPException(status_code=503, detail=f"{failure_prefix} worker timeout is outside the fixed bound")
     try:
-        async with httpx.AsyncClient(timeout=CAPACITY_TIMEOUT, follow_redirects=False) as client:
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
             async with client.stream(
                 "POST",
-                f"{BASE_URL}/v1/capacity/refresh",
+                f"{BASE_URL}{path}",
                 headers=_headers(),
-                json={"provider_snapshot": provider_snapshot},
+                json=payload,
             ) as response:
                 chunks: list[bytes] = []
                 size = 0
                 async for chunk in response.aiter_bytes():
                     size += len(chunk)
-                    if size > CAPACITY_MAX_RESPONSE_BYTES:
-                        raise HTTPException(status_code=502, detail="capacity worker response exceeds the bounded limit")
+                    if size > max_response_bytes:
+                        raise HTTPException(status_code=502, detail=f"{failure_prefix} worker response exceeds the bounded limit")
                     chunks.append(chunk)
                 raw = b"".join(chunks)
+                status_code = response.status_code
     except HTTPException:
         raise
     except httpx.HTTPError as exc:
-        raise HTTPException(status_code=502, detail=f"capacity worker unavailable: {type(exc).__name__}") from exc
+        raise HTTPException(status_code=502, detail=f"{failure_prefix} worker unavailable: {type(exc).__name__}") from exc
     try:
         body = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, ValueError) as exc:
-        raise HTTPException(status_code=502, detail="capacity worker returned non-JSON response") from exc
-    if response.status_code >= 400:
-        raise HTTPException(status_code=502, detail="capacity worker collection failed")
+        raise HTTPException(status_code=502, detail=f"{failure_prefix} worker returned non-JSON response") from exc
+    if status_code >= 400:
+        raise HTTPException(status_code=502, detail=f"{failure_prefix} worker collection failed")
     if not isinstance(body, dict):
-        raise HTTPException(status_code=502, detail="capacity worker returned invalid response")
+        raise HTTPException(status_code=502, detail=f"{failure_prefix} worker returned invalid response")
     return body
+
+
+async def capacity_refresh(provider_snapshot: dict[str, Any]) -> dict[str, Any]:
+    return await _bounded_refresh(
+        "/v1/capacity/refresh",
+        {"provider_snapshot": provider_snapshot},
+        timeout=CAPACITY_TIMEOUT,
+        max_timeout=CAPACITY_MAX_TIMEOUT,
+        max_response_bytes=CAPACITY_MAX_RESPONSE_BYTES,
+        failure_prefix="capacity",
+    )
+
+
+async def vm_inventory_refresh(provider_snapshot: dict[str, Any]) -> dict[str, Any]:
+    return await _bounded_refresh(
+        "/v1/vm/inventory/refresh",
+        {"provider_snapshot": provider_snapshot},
+        timeout=VM_INVENTORY_TIMEOUT,
+        max_timeout=VM_INVENTORY_MAX_TIMEOUT,
+        max_response_bytes=VM_INVENTORY_MAX_RESPONSE_BYTES,
+        failure_prefix="vm inventory",
+    )
 
 
 HOST_OBSERVER_URL = os.getenv("HERMES_HOST_OBSERVER_URL", "").rstrip("/")

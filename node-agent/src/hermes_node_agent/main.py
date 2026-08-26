@@ -8,8 +8,9 @@ from fastapi import FastAPI, Header
 from pydantic import BaseModel, ConfigDict, Field
 
 from . import capacity_runtime
-from . import provider_runtime
 from . import infrastructure_runtime
+from . import provider_runtime
+from . import vm_inventory_runtime
 
 VERSION = "0.5.11-dev.5"
 app = FastAPI(title="Hermes Node Agent / Cluster Provider Worker", version=VERSION)
@@ -32,6 +33,10 @@ class CapacityRefreshRequest(StrictModel):
     provider_snapshot: dict[str, Any]
 
 
+class VmInventoryRefreshRequest(StrictModel):
+    provider_snapshot: dict[str, Any]
+
+
 @app.get("/health")
 def health() -> dict[str, Any]:
     return {
@@ -42,7 +47,7 @@ def health() -> dict[str, Any]:
         "mode": "cluster-provider-worker",
         "execution_enabled": provider_runtime.EXECUTION_ENABLED,
         "infrastructure_execution_enabled": infrastructure_runtime.EXECUTION_ENABLED,
-        "capabilities": ["kubespray", "k3s", "rke2", "cluster-day2", "direct-etcd", "offline-artifact-binding", "redfish-runtime", "redfish-virtual-media-runtime", "ipmi-lanplus-runtime", "pxe-unattended-runtime", "host-network-runtime", "openconfig-restconf-v1-vlan-port-lldp-runtime", "proxmox-capacity-collector-v1" if capacity_runtime.COLLECTION_ENABLED else "proxmox-capacity-collector-disabled", "proxmox-contract-only", "vmware-workstation-contract-only", "vmware-contract-only", "openstack-contract-only", "aws-contract-only", "azure-contract-only", "gcp-contract-only"],
+        "capabilities": ["kubespray", "k3s", "rke2", "cluster-day2", "direct-etcd", "offline-artifact-binding", "redfish-runtime", "redfish-virtual-media-runtime", "ipmi-lanplus-runtime", "pxe-unattended-runtime", "host-network-runtime", "openconfig-restconf-v1-vlan-port-lldp-runtime", "proxmox-capacity-collector-v1" if capacity_runtime.COLLECTION_ENABLED else "proxmox-capacity-collector-disabled", "proxmox-vm-inventory-collector-v1" if vm_inventory_runtime.COLLECTION_ENABLED else "proxmox-vm-inventory-collector-disabled", "proxmox-contract-only", "vmware-workstation-contract-only", "vmware-contract-only", "openstack-contract-only", "aws-contract-only", "azure-contract-only", "gcp-contract-only"],
         "arbitrary_shell": False,
         "arbitrary_ssh_command": False,
     }
@@ -64,6 +69,12 @@ def provider_execute(payload: ProviderExecuteRequest, authorization: str | None 
 def capacity_refresh(payload: CapacityRefreshRequest, authorization: str | None = Header(default=None)) -> dict[str, Any]:
     infrastructure_runtime.require_token(authorization)
     return capacity_runtime.collect(payload.provider_snapshot)
+
+
+@app.post("/v1/vm/inventory/refresh")
+def vm_inventory_refresh(payload: VmInventoryRefreshRequest, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    infrastructure_runtime.require_token(authorization)
+    return vm_inventory_runtime.collect(payload.provider_snapshot)
 
 
 @app.post("/v1/infrastructure/preview")

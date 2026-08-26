@@ -597,6 +597,78 @@ for forbidden in (
     'openstacksdk', 'pyvmomi',
 ):
     assert forbidden not in capacity_runtime, forbidden
+# Dev.5 C10/C11 VM inventory refresh is a parallel read-only, disabled-by-default Proxmox-only live collector.
+# It returns only sanitized VM identity records and never fabricates LIVE evidence.
+vm_inventory_runtime = text("node-agent/src/hermes_node_agent/vm_inventory_runtime.py")
+for marker in (
+    'COLLECTION_ENABLED = os.getenv("HERMES_VM_INVENTORY_COLLECTION_ENABLED", "false").lower() == "true"',
+    'REQUEST_TIMEOUT = float(os.getenv("HERMES_VM_INVENTORY_REQUEST_TIMEOUT_SECONDS", "20"))',
+    'MAX_RESPONSE_BYTES = int(os.getenv("HERMES_VM_INVENTORY_MAX_RESPONSE_BYTES", "1048576"))',
+    'MAX_REQUESTS = 2',
+    'MAX_VMS = 512',
+    'PROVIDER_PINS = {"proxmox": ("pve-8.2", "pve-vm-inventory-v1")}',
+    'def canonical_json(value: Any) -> str:',
+    'def sha256_hex(value: Any) -> str:',
+    'def _safe_child(directory: Path, name: str) -> Path:',
+    'def _secret(directory: Path, profile: dict[str, Any], field: str) -> str:',
+    'def _url(base: str, resource_type: str) -> str:',
+    'def _request(url: str, *, authorization: str, ca_file: Path | None, requests: list[int]) -> dict[str, Any]:',
+    'def _proxmox(snapshot: dict[str, Any], caps: dict[str, Any], directory: Path, profile: dict[str, Any], requests: list[int]) -> list[dict[str, Any]]:',
+    'def collect(provider_snapshot: dict[str, Any]) -> dict[str, Any]:',
+    'observation_state": "LIVE"',
+    'credential_material_returned": False',
+    'mutation_commands_executed": False',
+    'arbitrary_cli": False',
+    'arbitrary_shell": False',
+    'observation_hash": sha256_hex(result)',
+    'urllib.request.ProxyHandler({})',
+    'PVEAPIToken=',
+    '"/cluster/resources"',
+    'POLICY_DENIED',
+    'AUTH_FAILED',
+    'UPSTREAM_UNAVAILABLE',
+    'UPSTREAM_SCHEMA_INVALID',
+    'RESPONSE_LIMIT',
+    'snapshot.get("snapshot_hash")',
+    '_safe_child(directory, "profile.json")',
+    'candidate.is_symlink()',
+    'requests[0] != MAX_REQUESTS',
+    'vm_id": vm_id, "node": node, "type": vm_type, "power_state": status, "template": bool(template)',
+    'vm_count": len(records)',
+    'inventory_kind": "virtual_machine_identity_state',
+    'coverage": "allowlisted_nodes',
+    'pve-vm-inventory-v1',
+):
+    assert marker in vm_inventory_runtime, marker
+for forbidden in (
+    'os.system', 'shell=True', 'subprocess', 'boto3', 'google-cloud', 'azure-identity',
+    'openstacksdk', 'pyvmomi',
+):
+    assert forbidden not in vm_inventory_runtime, forbidden
+assert 'vm.inventory.refresh' in operations
+assert 'vm_inventory_query_plan' in operations
+assert 'validate_vm_inventory_provider' in operations
+assert 'ProviderVmInventoryQuery' in operations
+assert 'VM_INVENTORY_PROVIDER_KINDS = {"proxmox"}' in operations
+assert 'live_upstream_required": True' in operations
+assert 'mutation_runtime": "CONTRACT_ONLY"' in operations
+assert '@app.post("/v1/vm/inventory/refresh")' in provider_agent_main
+assert 'vm_inventory_runtime.collect(payload.provider_snapshot)' in provider_agent_main
+assert 'proxmox-vm-inventory-collector-v1' in provider_agent_main
+assert 'proxmox-vm-inventory-collector-disabled' in provider_agent_main
+assert '_validate_vm_inventory_payload' in cp_main
+assert '_validate_vm_inventory_result' in cp_main
+assert 'VM_INVENTORY_RECORD_KEYS' in cp_main
+assert 'VM_INVENTORY_RESULT_KEYS' in cp_main
+assert 'provider.vm_inventory.refreshed' in cp_main
+assert 'provider_worker.vm_inventory_refresh(provider)' in cp_main
+assert 'vm_inventory_refresh' in text("control-plane/src/hermes_control_plane/provider_worker.py")
+# VM inventory records must be strictly sanitized and never leak raw PVE data.
+for forbidden in ('"name"', '"ip"', '"mac"', '"tags"', '"disk"', '"storage"', '"pool"', '"owner"', '"url"', '"response"', '"headers"', '"body"'):
+    assert forbidden not in vm_inventory_runtime, forbidden
+assert 'requests[0] != MAX_REQUESTS' in vm_inventory_runtime
+assert 'vm_inventory_refresh' in cp_main
+
 assert 'capacity.refresh' in operations
 assert 'capacity_query_plan' in operations
 assert 'validate_capacity_provider' in operations

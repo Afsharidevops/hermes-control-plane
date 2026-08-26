@@ -451,6 +451,31 @@ VMware Workstation remains contract-only for capacity. Its deployed REST API/ver
 
 All C10/C11 VM/cloud mutation operations remain `CONTRACT_ONLY` and are not listed in any runtime operation map. The capacity collector adds no mutation path, no cloud SDK dependency, and no change to the existing mutation governance.
 
+### C10/C11 — read-only Proxmox VM inventory collector
+
+A second, separate read-only Proxmox collector is now implemented locally: `vm.inventory.refresh`, disabled by default (`HERMES_VM_INVENTORY_COLLECTION_ENABLED=false`). It is a sibling of the capacity collector, not a modification of it. It has its own runtime module, worker route, operation registration, result validator, and implementation pin `pve-vm-inventory-v1` — distinct from capacity's `pve-capacity-v1`. Because a provider registration carries exactly one `implementation_version`, an operator that wants both collectors registers two separate Proxmox provider entries, one pinned to each.
+
+A `LIVE` observation state means exactly two authenticated PVE API reads succeeded, in order:
+
+1. `GET https://host:8006/api2/json/cluster/resources?type=node`
+2. `GET https://host:8006/api2/json/cluster/resources?type=vm`
+
+Every configured allowlisted node must appear in the first response before the second request is attempted. If node coverage is incomplete the collector fails closed and never issues the VM read, so an empty VM result is truthful coverage of known nodes rather than an inferred or partially observed one. No fixture, cache, deterministic calculation, or partial request is ever labeled `LIVE`.
+
+Security/runtime properties:
+
+- The collector accepts only a canonical provider snapshot with matching `snapshot_hash`, validates the Proxmox kind against its own `PROVIDER_PINS`, and reads worker-mounted credentials from `<credential-ref>/profile.json` using strict containment and symlink rejection, with bounded secret reads and token sanitization.
+- Transport uses stdlib with TLS verification and an optional mounted CA, `urllib.request.ProxyHandler({})` (no ambient proxy), `_NoRedirect`, a fixed 20-second per-request timeout, GET-only fixed URLs validated against a closed `{node, vm}` resource-type set, JSON content-type enforcement, and a 1 MiB response bound.
+- Exactly two requests are permitted (`MAX_REQUESTS = 2`) and the envelope is rejected if the observed request count differs. Auth failure, transport failure, policy violation, upstream schema mismatch, incomplete node coverage, or response limit all produce a generic bounded error with no result body.
+- Records are restricted to `{vm_id, node, type, power_state, template}` with a bounded positive `vm_id`, an allowlisted `node`, `type` in `{qemu, lxc}`, `power_state` in `{running, stopped}`, and a strict boolean `template`. Records are deterministically sorted by `(node, vm_id)`, bounded to 512 entries, deduplicated by `vm_id`, and silently filtered to allowlisted nodes. Names, tags, IP/MAC data, disks, storage, owner/pool, raw PVE responses, URLs, headers, credential paths, and token material are never returned.
+- The envelope includes `inventory_kind="virtual_machine_identity_state"`, `coverage="allowlisted_nodes"`, bounded scope counts, fixed source metadata with `request_count=2`, `credential_material_returned=False`, `mutation_commands_executed=False`, `arbitrary_cli=False`, `arbitrary_shell=False`, and an `observation_hash` computed over the canonical JSON of the complete envelope.
+- The Control Plane independently re-validates the worker result before audit: exact key sets, recursive forbidden sensitive-key detection, bounded depth/size, `observation_state=LIVE`, matching provider identity and pins, staleness within 90 seconds, all four safety flags exactly `False`, exact source metadata, scope/record count agreement, per-record identity and state validity, uniqueness, deterministic sort order, and observation-hash re-verification. Non-compliant results are rejected with a generic error and never audited.
+- The read path persists nothing, produces no ChangeSet, approval, ticket, job, or verification record, and emits only a sanitized `provider.vm_inventory.refreshed` audit entry.
+
+VM inventory is identity and power-state observation only. It is not capacity evidence, not a placement or scheduling guarantee, and not lifecycle proof. All C10/C11 VM/cloud mutation operations remain `CONTRACT_ONLY`; nothing in this slice is added to `INFRASTRUCTURE_RUNTIME_OPERATIONS`, and no cloud/hypervisor SDK dependency is introduced.
+
+This is local/mock test evidence only. No disposable real Proxmox target has returned a `LIVE` VM inventory observation, and no real-target proof may be claimed until one does at the exact pushed SHA.
+
 ### Trusted host observation for unified verification
 
 The canonical `hosts` check can now consume one fixed read-only collector contract, `host-network-local-v1`. The collector runs as a separate, disabled-by-default host-observer workload with its own bearer token. It mounts no SSH, infrastructure, provider, or execution credentials and exposes only health plus the fixed host-network collection route. Its evidence is bounded to interface name/state/MTU and bond/VLAN counts; MAC/IP addresses, routes, DNS, raw files, environment data, mount paths, credentials, arbitrary CLI, shell, plans, tickets, and mutation surfaces are excluded.

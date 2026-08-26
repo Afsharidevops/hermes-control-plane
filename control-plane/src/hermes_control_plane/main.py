@@ -4239,6 +4239,88 @@ def _validate_capacity_result(value: dict[str, Any], provider: dict[str, Any]) -
         raise HTTPException(status_code=502, detail="capacity worker observation hash is invalid")
 
 
+VM_INVENTORY_RECORD_KEYS = {"vm_id", "node", "type", "power_state", "template"}
+VM_INVENTORY_RESULT_KEYS = {
+    "schema_version", "operation", "observation_state", "provider", "observed_at", "inventory_kind", "coverage",
+    "scope", "records", "source", "credential_material_returned", "mutation_commands_executed", "arbitrary_cli",
+    "arbitrary_shell", "observation_hash",
+}
+
+
+def _validate_vm_inventory_payload(value: Any, *, depth: int = 0) -> None:
+    if depth > 6:
+        raise HTTPException(status_code=502, detail="VM inventory worker result is nested too deeply")
+    if isinstance(value, dict):
+        if len(value) > 128:
+            raise HTTPException(status_code=502, detail="VM inventory worker result object is too large")
+        for key, child in value.items():
+            normalized = re.sub(r"[^a-z0-9]", "", str(key).lower())
+            if normalized in {re.sub(r"[^a-z0-9]", "", item.lower()) for item in CAPACITY_FORBIDDEN_EVIDENCE_KEYS}:
+                raise HTTPException(status_code=502, detail="VM inventory worker result contains a forbidden sensitive field")
+            _validate_vm_inventory_payload(child, depth=depth + 1)
+    elif isinstance(value, list):
+        if len(value) > 512:
+            raise HTTPException(status_code=502, detail="VM inventory worker result list is too large")
+        for child in value:
+            _validate_vm_inventory_payload(child, depth=depth + 1)
+    elif isinstance(value, str) and len(value.encode("utf-8", errors="replace")) > 512:
+        raise HTTPException(status_code=502, detail="VM inventory worker result string is too large")
+
+
+def _validate_vm_inventory_result(value: dict[str, Any], provider: dict[str, Any]) -> None:
+    if set(value) != VM_INVENTORY_RESULT_KEYS:
+        raise HTTPException(status_code=502, detail="VM inventory worker returned an unsupported result schema")
+    if value.get("schema_version") != 1 or value.get("operation") != "vm.inventory.refresh" or value.get("observation_state") != "LIVE":
+        raise HTTPException(status_code=502, detail="VM inventory worker did not return a live VM inventory observation")
+    returned_provider = value.get("provider")
+    if not isinstance(returned_provider, dict) or returned_provider != {
+        "id": provider["id"], "kind": provider["kind"], "api_version": provider["api_version"],
+        "implementation_version": provider["implementation_version"], "snapshot_hash": provider["snapshot_hash"],
+    }:
+        raise HTTPException(status_code=502, detail="VM inventory worker result does not match the provider snapshot")
+    if any(value.get(key) is not False for key in ("credential_material_returned", "mutation_commands_executed", "arbitrary_cli", "arbitrary_shell")):
+        raise HTTPException(status_code=502, detail="VM inventory worker returned unsafe execution assertions")
+    observed_at = value.get("observed_at")
+    if isinstance(observed_at, bool) or not isinstance(observed_at, int) or abs(int(time.time()) - observed_at) > 90:
+        raise HTTPException(status_code=502, detail="VM inventory worker observation is stale or invalid")
+    if value.get("inventory_kind") != "virtual_machine_identity_state" or value.get("coverage") != "allowlisted_nodes":
+        raise HTTPException(status_code=502, detail="VM inventory worker returned unsupported inventory semantics")
+    caps = provider.get("capabilities") if isinstance(provider.get("capabilities"), dict) else {}
+    allowed_nodes = caps.get("node_allowlist")
+    if not isinstance(allowed_nodes, list) or not 1 <= len(allowed_nodes) <= 32:
+        raise HTTPException(status_code=502, detail="VM inventory provider scope is invalid")
+    scope = value.get("scope")
+    if not isinstance(scope, dict) or set(scope) != {"node_count", "vm_count"} or scope.get("node_count") != len(allowed_nodes) or isinstance(scope.get("vm_count"), bool) or not isinstance(scope.get("vm_count"), int) or not 0 <= scope["vm_count"] <= 512:
+        raise HTTPException(status_code=502, detail="VM inventory worker result scope is invalid")
+    records = value.get("records")
+    if not isinstance(records, list) or len(records) != scope["vm_count"] or len(records) > 512:
+        raise HTTPException(status_code=502, detail="VM inventory worker records are invalid")
+    normalized_records: list[tuple[str, int]] = []
+    seen_ids: set[int] = set()
+    for record in records:
+        if not isinstance(record, dict) or set(record) != VM_INVENTORY_RECORD_KEYS:
+            raise HTTPException(status_code=502, detail="VM inventory worker record schema is invalid")
+        vm_id = record.get("vm_id")
+        node = record.get("node")
+        if isinstance(vm_id, bool) or not isinstance(vm_id, int) or not 1 <= vm_id <= 2_147_483_647 or not isinstance(node, str) or node not in allowed_nodes:
+            raise HTTPException(status_code=502, detail="VM inventory worker record identity is invalid")
+        if record.get("type") not in {"qemu", "lxc"} or record.get("power_state") not in {"running", "stopped"} or not isinstance(record.get("template"), bool):
+            raise HTTPException(status_code=502, detail="VM inventory worker record state is invalid")
+        if vm_id in seen_ids:
+            raise HTTPException(status_code=502, detail="VM inventory worker returned duplicate VM IDs")
+        seen_ids.add(vm_id)
+        normalized_records.append((node, vm_id))
+    if normalized_records != sorted(normalized_records):
+        raise HTTPException(status_code=502, detail="VM inventory worker records are not deterministically sorted")
+    if value.get("source") != {"adapter": "proxmox-api-token-v1", "endpoint_profile": "pve-8.2", "request_count": 2}:
+        raise HTTPException(status_code=502, detail="VM inventory worker source metadata is invalid")
+    _validate_vm_inventory_payload(value)
+    unsigned = dict(value)
+    observation_hash = unsigned.pop("observation_hash")
+    if not isinstance(observation_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", observation_hash) or observation_hash != sha256_hex(unsigned):
+        raise HTTPException(status_code=502, detail="VM inventory worker observation hash is invalid")
+
+
 @app.post("/v1/operations-center/intents/plan", status_code=201)
 async def plan_operations_intent(payload: OperationsIntentPlanCreate, authorization: str | None = Header(default=None)) -> dict[str, Any]:
     selector = payload.selector.model_dump()
@@ -4261,6 +4343,24 @@ async def plan_operations_intent(payload: OperationsIntentPlanCreate, authorizat
                     "provider_kind": provider["kind"], "observation_state": result["observation_state"],
                     "observed_at": result["observed_at"], "request_count": result["source"]["request_count"],
                     "observation_hash": result["observation_hash"],
+                })
+                conn.commit()
+            return {"mode": "read", "query_plan": query_plan, "observation": result, "changeset": None, "operation_job": None}
+        if payload.operation == "vm.inventory.refresh":
+            if payload.target_id is not None or payload.parameters or payload.desired_state or not payload.provider_id or not payload.provider_id.startswith("ipr_"):
+                raise HTTPException(status_code=422, detail="vm.inventory.refresh requires only an infrastructure provider_id")
+            with closing(db.connect()) as conn:
+                provider = _infrastructure_provider_snapshot(conn, payload.provider_id)
+                try:
+                    query_plan = operations.vm_inventory_query_plan(provider_snapshot=provider)
+                except ValueError as exc:
+                    raise HTTPException(status_code=422, detail=str(exc)) from exc
+                result = await provider_worker.vm_inventory_refresh(provider)
+                _validate_vm_inventory_result(result, provider)
+                db.audit(conn, "provider.vm_inventory.refreshed", "admin", "infrastructure_provider", provider["id"], {
+                    "provider_kind": provider["kind"], "observation_state": result["observation_state"],
+                    "observed_at": result["observed_at"], "request_count": result["source"]["request_count"],
+                    "vm_count": result["scope"]["vm_count"], "observation_hash": result["observation_hash"],
                 })
                 conn.commit()
             return {"mode": "read", "query_plan": query_plan, "observation": result, "changeset": None, "operation_job": None}
