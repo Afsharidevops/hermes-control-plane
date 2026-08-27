@@ -1,6 +1,8 @@
 # Hermes Control Plane
 
-> v0.5.11 includes Radar runtime, Cilium/Hubble Network Live, executable native diagnostics, a full Hermes-native Operator Center UI scope contract, bounded trusted-Kubernetes day-2 execution, active unified cluster verification, the Batch C trusted Redfish infrastructure runtime, read-only Proxmox capacity and VM-inventory collectors, and a disabled-by-default worker-only QEMU Proxmox mutation runtime. The Proxmox runtime supports only eight governed QEMU actions and has local/mock evidence only; it is not capacity-backed Cluster Factory lifecycle or real-provider proof. UI state is reported separately from provider/runtime completion.
+> **Start with the [Hermes Operator Guide](docs/guide/README.md).** It provides zero-to-one Docker and Helm deployment, the full configuration reference, every UI surface, governance and operations workflows, CLI and API references, and explicit runtime-evidence boundaries.
+
+> v0.5.11 includes Radar runtime, Cilium/Hubble Network Live, executable native diagnostics, a full Hermes-native Operator Center UI scope contract, bounded trusted-Kubernetes day-2 execution, active unified cluster verification, a Batch C trusted Redfish infrastructure execution path (**Integration/local evidence**; disposable real-target evidence remains required), read-only Proxmox capacity and VM-inventory collectors, and a disabled-by-default worker-only QEMU Proxmox mutation runtime. The Proxmox runtime supports only eight governed QEMU actions and has local/mock evidence only; it is not capacity-backed Cluster Factory lifecycle or real-provider proof. UI state is reported separately from provider/runtime completion.
 
 Hermes Control Plane is a self-hosted, AI-assisted DevOps control plane designed to run on a Docker/VM installation or Kubernetes while keeping privileged credentials and infrastructure execution outside the LLM trust boundary.
 
@@ -104,6 +106,8 @@ cp .env.example .env
 ./hermesctl status
 ```
 
+The `v0.5.11` paragraph above is immutable release history. This checkout and its local Helm chart default to `0.5.11-dev.5`; the expanded operator guide documents that checked-out source surface. Use its [Feature status](docs/guide/feature-status.md) matrix to distinguish stable runtime, integration/local evidence, and deferred capabilities before selecting an image or enabling an optional gate.
+
 Open the Operations Center locally:
 
 ```text
@@ -157,7 +161,7 @@ The repository uses these GitHub settings:
 - Actions variable: `DOCKERHUB_USERNAME`
 - Actions secret: `DOCKERHUB_TOKEN`
 
-Pull requests build but do not push. A push to `main` publishes `:edge` and `:sha-...`. A version tag such as `v0.5.10-alpha.2` publishes `:0.5.10-alpha.2`. Only a stable tag such as `v0.5.10` publishes `:latest`.
+Pull requests build but do not push. A push to `main` publishes `:edge` and `:sha-...`. A version tag such as `v0.5.11-dev.5` publishes `:0.5.11-dev.5`. Only a stable tag such as `v0.5.11` publishes `:latest`.
 
 Project-owned Docker Hub repositories are isolated from `hermes-linux-stack`:
 
@@ -175,7 +179,7 @@ The Kubernetes Broker re-enforces target scope (`namespace_allowlist`/`namespace
 Manual fallback build/publish remains available:
 
 ```bash
-IMAGE_NAMESPACE=afsharidevops VERSION=0.5.10 ./scripts/push-images.sh
+IMAGE_NAMESPACE=afsharidevops VERSION=0.5.11-dev.5 ./scripts/push-images.sh
 ```
 
 ## Verify
