@@ -141,4 +141,4 @@ def test_audit_events_are_written(client: TestClient):
 def test_ui_is_served(client: TestClient):
     r = client.get("/ui")
     assert r.status_code == 200
-    assert "0.5.11-dev.5 · Scope Closure + runtime integration" in r.text
+    assert "0.5.11 · Stable runtime" in r.text

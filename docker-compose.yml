@@ -73,7 +73,7 @@ services:
       start_period: 40s
 
   router-gateway:
-    image: ${IMAGE_NAMESPACE:-afsharidevops}/hermes-control-plane-router-gateway:${VERSION:-0.5.11-dev.5}
+    image: ${IMAGE_NAMESPACE:-afsharidevops}/hermes-control-plane-router-gateway:${VERSION:-0.5.11}
     build:
       context: ./router-gateway
     restart: unless-stopped
@@ -106,7 +106,7 @@ services:
     networks: [app-net]
 
   smart-router:
-    image: ${IMAGE_NAMESPACE:-afsharidevops}/hermes-control-plane-smart-router:${VERSION:-0.5.11-dev.5}
+    image: ${IMAGE_NAMESPACE:-afsharidevops}/hermes-control-plane-smart-router:${VERSION:-0.5.11}
     build:
       context: ./smart-router
     restart: unless-stopped
@@ -157,7 +157,7 @@ services:
 
 
   kubernetes-broker:
-    image: ${IMAGE_NAMESPACE:-afsharidevops}/hermes-control-plane-kubernetes-broker:${VERSION:-0.5.11-dev.5}
+    image: ${IMAGE_NAMESPACE:-afsharidevops}/hermes-control-plane-kubernetes-broker:${VERSION:-0.5.11}
     build:
       context: ./kubernetes-broker
       args:
@@ -191,7 +191,7 @@ services:
     cap_drop: ["ALL"]
 
   control-plane:
-    image: ${IMAGE_NAMESPACE:-afsharidevops}/hermes-control-plane-api:${VERSION:-0.5.11-dev.5}
+    image: ${IMAGE_NAMESPACE:-afsharidevops}/hermes-control-plane-api:${VERSION:-0.5.11}
     build:
       context: ./control-plane
     restart: unless-stopped
@@ -242,7 +242,7 @@ services:
     cap_drop: ["ALL"]
 
   credential-service:
-    image: ${IMAGE_NAMESPACE:-afsharidevops}/hermes-control-plane-credential-service:${VERSION:-0.5.11-dev.5}
+    image: ${IMAGE_NAMESPACE:-afsharidevops}/hermes-control-plane-credential-service:${VERSION:-0.5.11}
     build:
       context: ./credential-service
     restart: unless-stopped
@@ -302,7 +302,7 @@ services:
     networks: [app-net]
 
   node-agent:
-    image: ${IMAGE_NAMESPACE:-afsharidevops}/hermes-control-plane-node-agent:${VERSION:-0.5.11-dev.5}
+    image: ${IMAGE_NAMESPACE:-afsharidevops}/hermes-control-plane-node-agent:${VERSION:-0.5.11}
     build:
       context: ./node-agent
     restart: unless-stopped

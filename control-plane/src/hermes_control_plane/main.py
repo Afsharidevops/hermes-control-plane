@@ -95,7 +95,7 @@ from .models import (
 )
 from .risk import approval_required, classify
 
-VERSION = "0.5.11-dev.5"
+VERSION = "0.5.11"
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 TERMINAL_CHANGESET_STATES = {
     "REJECTED", "CANCELLED", "EXPIRED", "EXECUTED", "FAILED",
@@ -150,7 +150,7 @@ async def lifespan(_: FastAPI):
 app = FastAPI(
     title="Hermes Control Plane API",
     version=VERSION,
-    description="Hermes Control Plane 0.5.11-dev.5 development API",
+    description="Hermes Control Plane 0.5.11 API",
     lifespan=lifespan,
 )
 

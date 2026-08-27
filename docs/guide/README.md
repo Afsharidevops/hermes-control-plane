@@ -1,6 +1,6 @@
 # Hermes Operator Guide
 
-This guide documents the shipped Hermes Control Plane `0.5.11-dev.5` product surface: local Docker deployment, Kubernetes deployment, the Control Plane Operator Center, Smart Router Operations Center, ChatOps, governance, provider workers, APIs, and recovery.
+This guide documents the shipped Hermes Control Plane `0.5.11` product surface: local Docker deployment, Kubernetes deployment, the Control Plane Operator Center, Smart Router Operations Center, ChatOps, governance, provider workers, APIs, and recovery.
 
 ## Read this first
 

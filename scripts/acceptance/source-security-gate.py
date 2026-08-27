@@ -15,7 +15,7 @@ def require(condition: bool, message: str) -> None:
 
 
 version = (ROOT / "VERSION").read_text().strip()
-require(version == "0.5.10", f"VERSION must be 0.5.10, got {version!r}")
+require(version == "0.5.11", f"VERSION must be 0.5.11, got {version!r}")
 
 compose_text = (ROOT / "docker-compose.yml").read_text()
 compose = yaml.safe_load(compose_text)
@@ -60,7 +60,7 @@ require("activeProvider: nine-router" in values and "omniroute:" in values, "Hel
 require("profiles: [\"nine-router\"]" in compose_text and "profiles: [\"omniroute\"]" in compose_text, "Compose must expose both router providers")
 
 workflow = (ROOT / ".github/workflows/publish-images.yml").read_text()
-require("0.5.10-candidate.<sha>" in workflow, "stable pre-tag candidate publishing documentation missing")
+require("0.5.11-candidate.<sha>" in workflow, "stable pre-tag candidate publishing documentation missing")
 require(re.search(r"\(-rc\\\.\[0-9\]\+\)\?", workflow) is not None or "(-rc\\.[0-9]+)?-candidate" in workflow, "candidate regex must allow stable pre-tag candidates")
 
 print("stable-source-security: PASS")

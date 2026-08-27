@@ -10,8 +10,8 @@ def text(path: str) -> str:
     return (ROOT / path).read_text()
 
 
-assert text("VERSION").strip() == "0.5.11-dev.5"
-assert 'appVersion: "0.5.11-dev.5"' in text("charts/hermes-control-plane/Chart.yaml")
+assert text("VERSION").strip() == "0.5.11"
+assert 'appVersion: "0.5.11"' in text("charts/hermes-control-plane/Chart.yaml")
 
 # Frozen trust/security foundations remain present.
 cred_main = text("credential-service/src/hermes_credential_service/main.py")
@@ -707,4 +707,4 @@ for op in ("vm.create", "vm.clone", "vm.update", "vm.delete", "vm.power", "netwo
 for forbidden in ('"vmware-workstation"', '"vmware"', '"openstack"', '"aws"', '"azure"', '"gcp"'):
     assert forbidden not in infra_runtime, f'{forbidden} must not be in INFRASTRUCTURE_RUNTIME_OPERATIONS'
 
-print("0.5.11-dev.5-source-security: PASS")
+print("0.5.11-source-security: PASS")

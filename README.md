@@ -106,7 +106,7 @@ cp .env.example .env
 ./hermesctl status
 ```
 
-The `v0.5.11` paragraph above is immutable release history. This checkout and its local Helm chart default to `0.5.11-dev.5`; the expanded operator guide documents that checked-out source surface. Use its [Feature status](docs/guide/feature-status.md) matrix to distinguish stable runtime, integration/local evidence, and deferred capabilities before selecting an image or enabling an optional gate.
+The `v0.5.11` paragraph above is immutable release history. This checkout and its local Helm chart default to `0.5.11`; the expanded operator guide documents that checked-out source surface. Use its [Feature status](docs/guide/feature-status.md) matrix to distinguish stable runtime, integration/local evidence, and deferred capabilities before selecting an image or enabling an optional gate.
 
 Open the Operations Center locally:
 
@@ -161,7 +161,7 @@ The repository uses these GitHub settings:
 - Actions variable: `DOCKERHUB_USERNAME`
 - Actions secret: `DOCKERHUB_TOKEN`
 
-Pull requests build but do not push. A push to `main` publishes `:edge` and `:sha-...`. A version tag such as `v0.5.11-dev.5` publishes `:0.5.11-dev.5`. Only a stable tag such as `v0.5.11` publishes `:latest`.
+Pull requests build but do not push. A push to `main` publishes `:edge` and `:sha-...`. A prerelease version tag publishes its matching prerelease image tag. The stable `v0.5.11` tag publishes `:0.5.11` and `:latest`.
 
 Project-owned Docker Hub repositories are isolated from `hermes-linux-stack`:
 
@@ -179,7 +179,7 @@ The Kubernetes Broker re-enforces target scope (`namespace_allowlist`/`namespace
 Manual fallback build/publish remains available:
 
 ```bash
-IMAGE_NAMESPACE=afsharidevops VERSION=0.5.11-dev.5 ./scripts/push-images.sh
+IMAGE_NAMESPACE=afsharidevops VERSION=0.5.11 ./scripts/push-images.sh
 ```
 
 ## Verify
