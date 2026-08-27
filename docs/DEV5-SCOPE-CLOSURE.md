@@ -449,7 +449,7 @@ Security/runtime properties:
 
 VMware Workstation remains contract-only for capacity. Its deployed REST API/version must first be verified to provide a documented authenticated inventory endpoint with unambiguous allocation fields and reliable physical host free capacity before an adapter can be added. VMware vSphere, OpenStack, AWS, Azure, and GCP capacity collectors also remain contract-only.
 
-All C10/C11 VM/cloud mutation operations remain `CONTRACT_ONLY` and are not listed in any runtime operation map. The capacity collector adds no mutation path, no cloud SDK dependency, and no change to the existing mutation governance.
+The capacity collector itself adds no mutation path, no cloud SDK dependency, and no change to the existing mutation governance. Separately, the dev.5 scope includes a narrow Proxmox QEMU mutation runtime; it does not add capacity-backed Cluster Factory lifecycle behavior.
 
 ### C10/C11 — read-only Proxmox VM inventory collector
 
@@ -472,9 +472,21 @@ Security/runtime properties:
 - The Control Plane independently re-validates the worker result before audit: exact key sets, recursive forbidden sensitive-key detection, bounded depth/size, `observation_state=LIVE`, matching provider identity and pins, staleness within 90 seconds, all four safety flags exactly `False`, exact source metadata, scope/record count agreement, per-record identity and state validity, uniqueness, deterministic sort order, and observation-hash re-verification. Non-compliant results are rejected with a generic error and never audited.
 - The read path persists nothing, produces no ChangeSet, approval, ticket, job, or verification record, and emits only a sanitized `provider.vm_inventory.refreshed` audit entry.
 
-VM inventory is identity and power-state observation only. It is not capacity evidence, not a placement or scheduling guarantee, and not lifecycle proof. All C10/C11 VM/cloud mutation operations remain `CONTRACT_ONLY`; nothing in this slice is added to `INFRASTRUCTURE_RUNTIME_OPERATIONS`, and no cloud/hypervisor SDK dependency is introduced.
+VM inventory is identity and power-state observation only. It is not capacity evidence, not a placement or scheduling guarantee, and not lifecycle proof. This collector adds nothing to `INFRASTRUCTURE_RUNTIME_OPERATIONS` and no cloud/hypervisor SDK dependency. The separate Proxmox QEMU mutation runtime remains governed independently and does not consume inventory as lifecycle proof.
 
 This is local/mock test evidence only. No disposable real Proxmox target has returned a `LIVE` VM inventory observation, and no real-target proof may be claimed until one does at the exact pushed SHA.
+
+### Proxmox QEMU VM mutation runtime
+
+A narrow separate Proxmox QEMU mutation runtime is implemented locally, disabled by default, and pinned to `pve-8.2` / `pve-vm-runtime-v1`. It supports exactly `vm.create`, `vm.clone`, `vm.update`, `vm.delete`, `vm.power`, `network.attach`, `snapshot.create`, and `snapshot.restore`. LXC mutation and arbitrary PVE request paths, query/header/body fields, scripts, Cloud-Init payloads, IP/MAC fields, hooks, passthrough, QEMU arguments, and credential inputs are rejected.
+
+Provider registration requires an exact HTTPS port-8006 `/api2/json` endpoint, the matching pin pair, and a bounded capability snapshot containing node/storage/bridge/template allowlists, VM-ID and resource bounds, an action allowlist, and explicit destructive flags. The worker owns all fixed PVE paths and request bodies, uses verified TLS with no ambient proxy or redirects, reads credentials only from contained worker-mounted profiles, bounds request/response sizes and task polling, and never exposes raw PVE payloads or credentials.
+
+Planning binds the normalized desired state, provider capability snapshot, active sanitized current-state hash, and verification contract to the exact typed plan. Execution accepts a short-lived one-time HMAC ticket, re-reads current state to reject drift before mutation, performs only fixed QEMU PVE actions, then requires an active readback matching the stated postcondition. Task completion alone is not success. Ambiguous dispatch consumes the ticket and requires reconciliation through a new preview and ChangeSet; none of the eight operations performs automatic rollback.
+
+`vm.delete` and `snapshot.restore` are CRITICAL and require two distinct approvals. The other six operations are HIGH. Delete and restore require exact repeated confirmations and a stopped VM. The runtime is independent of the read-only capacity and inventory collectors and does not implement capacity-backed Cluster Factory lifecycle. VMware Workstation/vSphere, OpenStack, AWS, Azure, GCP, and C11 remain explicitly deferred; Cluster Factory remains existing-host/pre-registered-server only.
+
+This is local/mock test evidence only. Disposable target validation is operator-only and must follow `docs/PROXMOX-VM-RUNTIME-VALIDATION.md`; no real-provider claim may be made before sanitized evidence at the exact pushed SHA.
 
 ### Trusted host observation for unified verification
 

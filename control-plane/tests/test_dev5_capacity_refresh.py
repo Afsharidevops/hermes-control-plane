@@ -142,15 +142,16 @@ def test_capacity_refresh_rejects_unsupported_provider_before_worker(client: Tes
     assert "supported live capacity collector" in response.text
 
 
-def test_cloud_vm_mutation_remains_contract_only(client: TestClient):
+def test_capacity_collector_registration_cannot_authorize_proxmox_vm_mutation(client: TestClient):
     provider = _proxmox_provider(client)
     planned = client.post(
         "/v1/operations-center/intents/plan",
         headers={"Authorization": "Bearer test-bot"},
         json={
             "requested_by": "hermes-bot:capacity", "source_channel": "hermes-bot", "domain": "cloud",
-            "operation": "vm.power", "provider_id": provider["id"], "desired_state": {},
+            "operation": "vm.power", "provider_id": provider["id"],
+            "desired_state": {"vm_id": 100, "node": "node-a", "target_state": "stopped"},
         },
     )
-    assert planned.status_code == 201, planned.text
-    assert planned.json()["operation_plan"]["plan"]["runtime"]["state"] == "CONTRACT_ONLY"
+    assert planned.status_code == 422
+    assert "versions do not match" in planned.text

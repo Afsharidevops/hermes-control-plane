@@ -266,15 +266,16 @@ def test_vm_inventory_refresh_rejects_altered_observation_hash(client: TestClien
     assert "observation hash is invalid" in response.text
 
 
-def test_proxmox_vm_mutation_remains_contract_only(client: TestClient):
+def test_vm_inventory_collector_registration_cannot_authorize_proxmox_vm_mutation(client: TestClient):
     provider = _proxmox_provider(client)
     planned = client.post(
         "/v1/operations-center/intents/plan",
         headers={"Authorization": "Bearer test-bot"},
         json={
             "requested_by": "hermes-bot:inventory", "source_channel": "hermes-bot", "domain": "cloud",
-            "operation": "vm.power", "provider_id": provider["id"], "desired_state": {},
+            "operation": "vm.power", "provider_id": provider["id"],
+            "desired_state": {"vm_id": 100, "node": "node-a", "target_state": "stopped"},
         },
     )
-    assert planned.status_code == 201, planned.text
-    assert planned.json()["operation_plan"]["plan"]["runtime"]["state"] == "CONTRACT_ONLY"
+    assert planned.status_code == 422
+    assert "versions do not match" in planned.text

@@ -42,6 +42,15 @@ spec:
             - {name: HERMES_INFRASTRUCTURE_FIRMWARE_VERIFY_DELAY_SECONDS, value: {{ .Values.nodeAgent.infrastructureFirmwareVerifyDelaySeconds | quote }}}
             - {name: HERMES_INFRASTRUCTURE_PLATFORM_VERIFY_ATTEMPTS, value: {{ .Values.nodeAgent.infrastructurePlatformVerifyAttempts | quote }}}
             - {name: HERMES_INFRASTRUCTURE_PLATFORM_VERIFY_DELAY_SECONDS, value: {{ .Values.nodeAgent.infrastructurePlatformVerifyDelaySeconds | quote }}}
+            - {name: HERMES_PROXMOX_VM_RUNTIME_ENABLED, value: {{ .Values.nodeAgent.proxmoxVmRuntimeEnabled | quote }}}
+            - {name: HERMES_PROXMOX_VM_REQUEST_TIMEOUT_SECONDS, value: {{ .Values.nodeAgent.proxmoxVmRequestTimeoutSeconds | quote }}}
+            - {name: HERMES_PROXMOX_VM_MAX_RESPONSE_BYTES, value: {{ .Values.nodeAgent.proxmoxVmMaxResponseBytes | quote }}}
+            - {name: HERMES_PROXMOX_VM_MAX_REQUEST_BODY_BYTES, value: {{ .Values.nodeAgent.proxmoxVmMaxRequestBodyBytes | quote }}}
+            - {name: HERMES_PROXMOX_VM_MAX_REQUESTS_PER_EXECUTION, value: {{ .Values.nodeAgent.proxmoxVmMaxRequestsPerExecution | quote }}}
+            - {name: HERMES_PROXMOX_VM_TASK_POLL_ATTEMPTS, value: {{ .Values.nodeAgent.proxmoxVmTaskPollAttempts | quote }}}
+            - {name: HERMES_PROXMOX_VM_TASK_POLL_DELAY_SECONDS, value: {{ .Values.nodeAgent.proxmoxVmTaskPollDelaySeconds | quote }}}
+            - {name: HERMES_PROXMOX_VM_VERIFY_ATTEMPTS, value: {{ .Values.nodeAgent.proxmoxVmVerifyAttempts | quote }}}
+            - {name: HERMES_PROXMOX_VM_VERIFY_DELAY_SECONDS, value: {{ .Values.nodeAgent.proxmoxVmVerifyDelaySeconds | quote }}}
             - {name: HERMES_CAPACITY_COLLECTION_ENABLED, value: {{ .Values.nodeAgent.capacityCollectionEnabled | quote }}}
             - {name: HERMES_CAPACITY_REQUEST_TIMEOUT_SECONDS, value: {{ .Values.nodeAgent.capacityRequestTimeoutSeconds | quote }}}
             - {name: HERMES_CAPACITY_MAX_RESPONSE_BYTES, value: {{ .Values.nodeAgent.capacityMaxResponseBytes | quote }}}

@@ -91,6 +91,7 @@ for script in ("apply.sh", "validate.sh", "push.sh"):
     assert "d4eb9b7ab2564301c09b8c0d36a2e9d53b843273" in raw if script != "validate.sh" else True
 
 assert (ROOT / "docs/DEV5-SCOPE-CLOSURE.md").is_file()
+assert (ROOT / "docs/PROXMOX-VM-RUNTIME-VALIDATION.md").is_file()
 assert (ROOT / "control-plane/tests/test_dev5_radar_runtime.py").is_file()
 assert (ROOT / "control-plane/tests/test_dev5_hubble_runtime.py").is_file()
 assert (ROOT / "control-plane/tests/test_dev5_diagnostics_runtime.py").is_file()
@@ -161,6 +162,16 @@ assert services["control-plane"]["environment"]["HERMES_VM_INVENTORY_WORKER_TIME
 assert services["node-agent"]["environment"]["HERMES_VM_INVENTORY_COLLECTION_ENABLED"] == "${HERMES_VM_INVENTORY_COLLECTION_ENABLED:-false}"
 assert services["node-agent"]["environment"]["HERMES_VM_INVENTORY_REQUEST_TIMEOUT_SECONDS"] == "${HERMES_VM_INVENTORY_REQUEST_TIMEOUT_SECONDS:-20}"
 assert services["node-agent"]["environment"]["HERMES_VM_INVENTORY_MAX_RESPONSE_BYTES"] == "${HERMES_VM_INVENTORY_MAX_RESPONSE_BYTES:-1048576}"
+# Proxmox VM mutation runtime settings are disabled by default.
+assert services["node-agent"]["environment"]["HERMES_PROXMOX_VM_RUNTIME_ENABLED"] == "${HERMES_PROXMOX_VM_RUNTIME_ENABLED:-false}"
+assert services["node-agent"]["environment"]["HERMES_PROXMOX_VM_REQUEST_TIMEOUT_SECONDS"] == "${HERMES_PROXMOX_VM_REQUEST_TIMEOUT_SECONDS:-20}"
+assert services["node-agent"]["environment"]["HERMES_PROXMOX_VM_MAX_RESPONSE_BYTES"] == "${HERMES_PROXMOX_VM_MAX_RESPONSE_BYTES:-1048576}"
+assert services["node-agent"]["environment"]["HERMES_PROXMOX_VM_MAX_REQUEST_BODY_BYTES"] == "${HERMES_PROXMOX_VM_MAX_REQUEST_BODY_BYTES:-8192}"
+assert services["node-agent"]["environment"]["HERMES_PROXMOX_VM_MAX_REQUESTS_PER_EXECUTION"] == "${HERMES_PROXMOX_VM_MAX_REQUESTS_PER_EXECUTION:-32}"
+assert services["node-agent"]["environment"]["HERMES_PROXMOX_VM_TASK_POLL_ATTEMPTS"] == "${HERMES_PROXMOX_VM_TASK_POLL_ATTEMPTS:-30}"
+assert services["node-agent"]["environment"]["HERMES_PROXMOX_VM_TASK_POLL_DELAY_SECONDS"] == "${HERMES_PROXMOX_VM_TASK_POLL_DELAY_SECONDS:-2}"
+assert services["node-agent"]["environment"]["HERMES_PROXMOX_VM_VERIFY_ATTEMPTS"] == "${HERMES_PROXMOX_VM_VERIFY_ATTEMPTS:-5}"
+assert services["node-agent"]["environment"]["HERMES_PROXMOX_VM_VERIFY_DELAY_SECONDS"] == "${HERMES_PROXMOX_VM_VERIFY_DELAY_SECONDS:-1}"
 assert "HERMES_EXECUTION_HMAC_KEY" in services["node-agent"]["environment"]
 assert "HERMES_PROVIDER_SSH_PROFILE_ROOT" in services["node-agent"]["environment"]
 assert values["nodeAgent"]["enabled"] is False
@@ -183,6 +194,16 @@ assert values["nodeAgent"]["vmInventoryCollectionEnabled"] is False
 assert values["nodeAgent"]["vmInventoryRequestTimeoutSeconds"] == 20
 assert values["nodeAgent"]["vmInventoryMaxResponseBytes"] == 1048576
 assert values["nodeAgent"]["vmInventoryWorkerTimeoutSeconds"] == 60
+# Proxmox VM mutation runtime Helm values are disabled by default.
+assert values["nodeAgent"]["proxmoxVmRuntimeEnabled"] is False
+assert values["nodeAgent"]["proxmoxVmRequestTimeoutSeconds"] == 20
+assert values["nodeAgent"]["proxmoxVmMaxResponseBytes"] == 1048576
+assert values["nodeAgent"]["proxmoxVmMaxRequestBodyBytes"] == 8192
+assert values["nodeAgent"]["proxmoxVmMaxRequestsPerExecution"] == 32
+assert values["nodeAgent"]["proxmoxVmTaskPollAttempts"] == 30
+assert values["nodeAgent"]["proxmoxVmTaskPollDelaySeconds"] == 2
+assert values["nodeAgent"]["proxmoxVmVerifyAttempts"] == 5
+assert values["nodeAgent"]["proxmoxVmVerifyDelaySeconds"] == 1
 node_agent_template = (ROOT / "charts/hermes-control-plane/templates/node-agent.yaml").read_text()
 for marker in ("runAsNonRoot: true", "runAsUser: 10022", "runAsGroup: 10022", "fsGroup: 10022", "defaultMode: 0440"):
     assert marker in node_agent_template, marker
@@ -196,6 +217,14 @@ for marker in (
     "HERMES_VM_INVENTORY_MAX_RESPONSE_BYTES",
 ):
     assert marker in node_agent_template, marker
+for marker in (
+    "HERMES_PROXMOX_VM_RUNTIME_ENABLED", "HERMES_PROXMOX_VM_REQUEST_TIMEOUT_SECONDS",
+    "HERMES_PROXMOX_VM_MAX_RESPONSE_BYTES", "HERMES_PROXMOX_VM_MAX_REQUEST_BODY_BYTES",
+    "HERMES_PROXMOX_VM_MAX_REQUESTS_PER_EXECUTION", "HERMES_PROXMOX_VM_TASK_POLL_ATTEMPTS",
+    "HERMES_PROXMOX_VM_TASK_POLL_DELAY_SECONDS", "HERMES_PROXMOX_VM_VERIFY_ATTEMPTS",
+    "HERMES_PROXMOX_VM_VERIFY_DELAY_SECONDS",
+):
+    assert marker in node_agent_template, marker
 control_plane_template = (ROOT / "charts/hermes-control-plane/templates/control-plane.yaml").read_text()
 assert "HERMES_CAPACITY_WORKER_TIMEOUT_SECONDS" in control_plane_template
 assert "HERMES_VM_INVENTORY_WORKER_TIMEOUT_SECONDS" in control_plane_template
@@ -205,18 +234,33 @@ for marker in (
     "HERMES_CAPACITY_WORKER_TIMEOUT_SECONDS=60",
     "HERMES_VM_INVENTORY_COLLECTION_ENABLED=false", "HERMES_VM_INVENTORY_REQUEST_TIMEOUT_SECONDS=20",
     "HERMES_VM_INVENTORY_MAX_RESPONSE_BYTES=1048576", "HERMES_VM_INVENTORY_WORKER_TIMEOUT_SECONDS=60",
+    "HERMES_PROXMOX_VM_RUNTIME_ENABLED=false", "HERMES_PROXMOX_VM_REQUEST_TIMEOUT_SECONDS=20",
+    "HERMES_PROXMOX_VM_MAX_RESPONSE_BYTES=1048576", "HERMES_PROXMOX_VM_MAX_REQUEST_BODY_BYTES=8192",
+    "HERMES_PROXMOX_VM_MAX_REQUESTS_PER_EXECUTION=32", "HERMES_PROXMOX_VM_TASK_POLL_ATTEMPTS=30",
+    "HERMES_PROXMOX_VM_TASK_POLL_DELAY_SECONDS=2", "HERMES_PROXMOX_VM_VERIFY_ATTEMPTS=5",
+    "HERMES_PROXMOX_VM_VERIFY_DELAY_SECONDS=1",
 ):
     assert marker in (ROOT / ".env.example").read_text(), marker
 compose_text = (ROOT / "docker-compose.yml").read_text()
 for marker in (
     "HERMES_VM_INVENTORY_COLLECTION_ENABLED", "HERMES_VM_INVENTORY_REQUEST_TIMEOUT_SECONDS",
     "HERMES_VM_INVENTORY_MAX_RESPONSE_BYTES", "HERMES_VM_INVENTORY_WORKER_TIMEOUT_SECONDS",
+    "HERMES_PROXMOX_VM_RUNTIME_ENABLED", "HERMES_PROXMOX_VM_REQUEST_TIMEOUT_SECONDS",
+    "HERMES_PROXMOX_VM_MAX_RESPONSE_BYTES", "HERMES_PROXMOX_VM_MAX_REQUEST_BODY_BYTES",
+    "HERMES_PROXMOX_VM_MAX_REQUESTS_PER_EXECUTION", "HERMES_PROXMOX_VM_TASK_POLL_ATTEMPTS",
+    "HERMES_PROXMOX_VM_TASK_POLL_DELAY_SECONDS", "HERMES_PROXMOX_VM_VERIFY_ATTEMPTS",
+    "HERMES_PROXMOX_VM_VERIFY_DELAY_SECONDS",
 ):
     assert marker in compose_text, marker
 values_text = (ROOT / "charts/hermes-control-plane/values.yaml").read_text()
 for marker in (
     "vmInventoryCollectionEnabled: false", "vmInventoryRequestTimeoutSeconds: 20",
     "vmInventoryMaxResponseBytes: 1048576", "vmInventoryWorkerTimeoutSeconds: 60",
+    "proxmoxVmRuntimeEnabled: false", "proxmoxVmRequestTimeoutSeconds: 20",
+    "proxmoxVmMaxResponseBytes: 1048576", "proxmoxVmMaxRequestBodyBytes: 8192",
+    "proxmoxVmMaxRequestsPerExecution: 32", "proxmoxVmTaskPollAttempts: 30",
+    "proxmoxVmTaskPollDelaySeconds: 2", "proxmoxVmVerifyAttempts: 5",
+    "proxmoxVmVerifyDelaySeconds: 1",
 ):
     assert marker in values_text, marker
 validate_script = (ROOT / "validate.sh").read_text()
@@ -234,6 +278,17 @@ assert (ROOT / "control-plane/tests/test_dev5_capacity_refresh.py").is_file()
 assert (ROOT / "node-agent/src/hermes_node_agent/vm_inventory_runtime.py").is_file()
 assert (ROOT / "node-agent/tests/test_vm_inventory_runtime.py").is_file()
 assert (ROOT / "control-plane/tests/test_dev5_vm_inventory_refresh.py").is_file()
+# Proxmox VM mutation runtime module, tests, and operator runbook are present.
+assert (ROOT / "node-agent/src/hermes_node_agent/proxmox_runtime.py").is_file()
+assert (ROOT / "node-agent/tests/test_proxmox_runtime.py").is_file()
+proxmox_runbook = (ROOT / "docs/PROXMOX-VM-RUNTIME-VALIDATION.md").read_text()
+for marker in (
+    "HERMES_INFRASTRUCTURE_EXECUTION_ENABLED=true",
+    "HERMES_PROXMOX_VM_RUNTIME_ENABLED=true",
+    "vm.create", "vm.clone", "vm.update", "vm.delete", "vm.power", "network.attach", "snapshot.create", "snapshot.restore",
+    "Drift rejection", "Replay rejection", "Redaction", "exact pushed candidate SHA",
+):
+    assert marker in proxmox_runbook, marker
 node_agent_dockerfile = (ROOT / "node-agent/Dockerfile").read_text()
 assert "openssh-client ca-certificates ipmitool" in node_agent_dockerfile
 node_agent_main = (ROOT / "node-agent/src/hermes_node_agent/main.py").read_text()

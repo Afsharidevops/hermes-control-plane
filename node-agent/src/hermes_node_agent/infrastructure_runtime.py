@@ -22,6 +22,8 @@ from urllib.parse import urljoin, urlparse
 
 from fastapi import HTTPException
 
+from . import proxmox_runtime
+
 TOKEN = os.getenv("HERMES_PROVIDER_WORKER_TOKEN", "")
 EXECUTION_KEY = os.getenv("HERMES_EXECUTION_HMAC_KEY", "")
 EXECUTION_ENABLED = os.getenv("HERMES_INFRASTRUCTURE_EXECUTION_ENABLED", "false").lower() == "true"
@@ -47,6 +49,7 @@ RUNTIME_PROVIDER_OPERATIONS = {
     "pxe": {"os.provision", "os.reimage"},
     "host-network": {"interface.configure", "interface.bond", "vlan.configure", "mtu.configure", "address.configure", "network.discover"},
     "network-switch": {"vlan.ensure", "port.configure", "lldp.observe"},
+    "proxmox": proxmox_runtime.OPERATIONS,
 }
 POWER_RESET_TYPES = {
     "on": "On",
@@ -414,7 +417,9 @@ def _validate_desired_state(kind: str, operation: str, desired: dict[str, Any]) 
                     raise HTTPException(422, "network-switch trunk_vlans must be unique")
                 return {"port": port, "mode": mode, "trunk_vlans": sorted(vlan_ids)}
             raise HTTPException(422, "network-switch port mode must be access or trunk")
-    if kind in {"proxmox", "vmware-workstation", "vmware", "openstack", "aws", "azure", "gcp"}:
+    if kind == "proxmox":
+        return proxmox_runtime.validate_desired(operation, desired)
+    if kind in {"vmware-workstation", "vmware", "openstack", "aws", "azure", "gcp"}:
         return desired
     if kind != "redfish":
         raise HTTPException(422, f"trusted runtime is not implemented for provider kind {kind!r}")
@@ -2435,6 +2440,8 @@ def _load_runtime_context(typed: dict[str, Any]) -> tuple[str, str, dict[str, An
     if kind == "network-switch":
         _switch_endpoint(provider)
         _switch_policy(provider, desired, operation)
+    if kind == "proxmox":
+        proxmox_runtime.validate_provider(provider, desired, operation)
     credential_ref = str(provider.get("credential_ref") or "")
     if kind == "host-network":
         credential = {}
@@ -2444,6 +2451,8 @@ def _load_runtime_context(typed: dict[str, Any]) -> tuple[str, str, dict[str, An
         credential = _pxe_credential_profile(credential_ref)
     elif kind == "network-switch":
         credential = _switch_credential_profile(credential_ref)
+    elif kind == "proxmox":
+        credential = proxmox_runtime._credential(provider)
     else:
         credential = _credential_profile(credential_ref)
     return kind, operation, provider, desired, credential
@@ -2760,36 +2769,6 @@ def _host_network_verify(operation: str, current: dict[str, Any], desired: dict[
     if operation == "network.discover":
         return len(current.get("interfaces") or []) > 0
     return False
-    kind, operation = _operation(typed)
-    provider = _provider_target(typed)
-    desired = _validate_desired_state(kind, operation, typed.get("desired_state") or {})
-    if operation == "virtual-media.insert":
-        _virtual_media_image_allowed(provider, desired["image_url"])
-    if operation == "secure-boot.apply":
-        _secure_boot_policy(provider, desired)
-    if operation in {"sriov.apply", "iommu.apply"}:
-        _hardware_feature_policy(provider, operation, desired)
-    if operation == "boot-order.apply":
-        _boot_order_policy(provider, desired)
-    if operation == "bios.apply":
-        _bios_attributes_allowed(provider, desired["attributes"])
-    if operation == "firmware.apply":
-        _firmware_request_allowed(provider, desired)
-    if operation.startswith("storage.volume."):
-        _storage_request_allowed(provider, desired, operation)
-    if kind == "network-switch":
-        _switch_endpoint(provider)
-        _switch_policy(provider, desired, operation)
-    credential_ref = str(provider.get("credential_ref") or "")
-    if kind == "ipmi":
-        credential = _ipmi_credential_profile(credential_ref)
-    elif kind == "pxe":
-        credential = _pxe_credential_profile(credential_ref)
-    elif kind == "network-switch":
-        credential = _switch_credential_profile(credential_ref)
-    else:
-        credential = _credential_profile(credential_ref)
-    return kind, operation, provider, desired, credential
 
 
 def _redfish_current(
@@ -2878,9 +2857,11 @@ def preview(changeset_plan: dict[str, Any]) -> dict[str, Any]:
         _, _, current = _host_network_current(provider, credential, operation, desired)
     elif kind == "network-switch":
         _, _, current = _switch_current(provider, credential, operation, desired)
+    elif kind == "proxmox":
+        current, _ = proxmox_runtime.current(provider, desired, operation, credential)
     else:
         raise HTTPException(422, "trusted runtime preview is not available for this infrastructure provider")
-    diff = _pxe_desired_diff(current, desired, server, supply) if kind == "pxe" else _desired_host_network_diff(current, desired, operation) if kind == "host-network" else _switch_diff(operation, current, desired) if kind == "network-switch" else _desired_diff(operation, current, desired)
+    diff = _pxe_desired_diff(current, desired, server, supply) if kind == "pxe" else _desired_host_network_diff(current, desired, operation) if kind == "host-network" else _switch_diff(operation, current, desired) if kind == "network-switch" else proxmox_runtime.diff(operation, current, desired) if kind == "proxmox" else _desired_diff(operation, current, desired)
     return {
         "kind": "InfrastructureRuntimePreview",
         "provider_kind": kind,
@@ -3072,13 +3053,18 @@ def execute(ticket: dict[str, Any], signature: str) -> dict[str, Any]:
         resource_url, resource, before = _host_network_current(provider, credential, operation, desired)
     elif kind == "network-switch":
         resource_url, resource, before = _switch_current(provider, credential, operation, desired)
-    elif kind in {"proxmox", "vmware-workstation", "vmware", "openstack", "aws", "azure", "gcp"}:
+    elif kind == "proxmox":
+        before, _ = proxmox_runtime.current(provider, desired, operation, credential)
+        resource_url, resource = "", {}
+    elif kind in {"vmware-workstation", "vmware", "openstack", "aws", "azure", "gcp"}:
         raise HTTPException(501, f"trusted {kind} runtime is not implemented; provider remains CONTRACT_ONLY")
     else:
         raise HTTPException(422, "trusted infrastructure runtime is unavailable for this provider kind")
     if sha256_hex(before) != str(runtime_preview.get("current_hash") or ""):
         raise HTTPException(409, "infrastructure state drifted after deterministic preview; re-plan and re-approve")
-    mutation_applied = bool(_desired_host_network_diff(before, desired, operation) if kind == "host-network" else _switch_diff(operation, before, desired) if kind == "network-switch" else _desired_diff(operation, before, desired))
+    if kind == "proxmox":
+        proxmox_runtime.enforce_current_policy(provider, before, desired, operation)
+    mutation_applied = bool(_desired_host_network_diff(before, desired, operation) if kind == "host-network" else _switch_diff(operation, before, desired) if kind == "network-switch" else proxmox_runtime.diff(operation, before, desired) if kind == "proxmox" else _desired_diff(operation, before, desired))
     if mutation_applied:
         if kind == "redfish":
             _apply_redfish(operation, resource_url, resource, desired, credential)
@@ -3086,6 +3072,8 @@ def execute(ticket: dict[str, Any], signature: str) -> dict[str, Any]:
             _apply_host_network(operation, resource_url, resource, desired, credential)
         elif kind == "network-switch":
             _apply_switch(operation, provider, resource_url, resource, desired, credential)
+        elif kind == "proxmox":
+            proxmox_runtime.apply(provider, desired, operation, credential)
         else:
             _apply_ipmi(operation, provider, desired, credential)
 
@@ -3113,6 +3101,8 @@ def execute(ticket: dict[str, Any], signature: str) -> dict[str, Any]:
                 _, _, after = _host_network_current(provider, credential, operation, desired)
             elif kind == "network-switch":
                 _, _, after = _switch_current(provider, credential, operation, desired)
+            elif kind == "proxmox":
+                after, _ = proxmox_runtime.current(provider, desired, operation, credential)
             else:
                 _, _, after = _ipmi_current(provider, credential, operation)
             last_probe_error = ""
@@ -3123,7 +3113,7 @@ def execute(ticket: dict[str, Any], signature: str) -> dict[str, Any]:
                     time.sleep(delay_seconds)
                     continue
             raise
-        matches = _host_network_verify(operation, after, desired) if kind == "host-network" else _switch_verify(operation, after, desired) if kind == "network-switch" else _verification_matches(operation, after, desired, before=before)
+        matches = _host_network_verify(operation, after, desired) if kind == "host-network" else _switch_verify(operation, after, desired) if kind == "network-switch" else proxmox_runtime.verify(after, desired, operation) if kind == "proxmox" else _verification_matches(operation, after, desired, before=before)
         if matches:
             verified = True
             break

@@ -1,12 +1,39 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
+import time
 from unittest.mock import patch
 
 import pytest
 from fastapi import HTTPException
 
 from hermes_node_agent import infrastructure_runtime as runtime
+
+
+def _canonical(value: dict) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+
+def _signed_ticket(typed: dict, key: str):
+    plan = {"parameters": {"typed_plan": typed}}
+    ticket = {
+        "changeset_id": "chg_hostnet000000001",
+        "plan_hash": runtime.sha256_hex(plan),
+        "plan": plan,
+        "preconditions": {
+            "operation_job_id": "opj_hostnet000000001",
+            "operation_plan_id": "opn_hostnet000000001",
+            "executor": "infrastructure-provider-worker",
+            "typed_plan_hash": typed["plan_hash"],
+            "policy_generation": 1,
+        },
+        "issued_at": int(time.time()),
+        "expires_at": int(time.time()) + 120,
+    }
+    signature = hmac.new(key.encode(), _canonical(ticket), hashlib.sha256).hexdigest()
+    return ticket, signature
 
 
 HOST_NETWORK_PROVIDER = {
@@ -193,3 +220,141 @@ def test_address_configure_diff_requires_explicit_address(monkeypatch):
     assert "host.address.address" in fields
     assert "host.address.prefix" in fields
     assert "host.address.gateway" in fields
+
+
+# --- direct _host_network_verify unit tests ---
+
+def test_host_network_verify_interface_configure_true_when_all_keys_match():
+    current = {"interface": {"state": "up", "mtu": 1500, "mac": "aa:bb:cc:dd:ee:01"}}
+    desired = {"state": "up", "mtu": 1500}
+    assert runtime._host_network_verify("interface.configure", current, desired) is True
+
+
+def test_host_network_verify_interface_configure_true_with_str_value_coercion():
+    current = {"interface": {"state": "up", "mtu": "1500"}}
+    desired = {"state": "up", "mtu": 1500}
+    assert runtime._host_network_verify("interface.configure", current, desired) is True
+
+
+def test_host_network_verify_interface_configure_false_when_field_mismatches():
+    current = {"interface": {"state": "down", "mtu": 1500}}
+    desired = {"state": "up", "mtu": 1500}
+    assert runtime._host_network_verify("interface.configure", current, desired) is False
+
+
+def test_host_network_verify_bond_true_when_mode_and_slaves_match():
+    current = {"bond": {"mode": "802.3ad", "slaves": ["eth0", "eth1"]}}
+    desired = {"mode": "802.3ad", "slaves": ["eth1", "eth0"]}
+    assert runtime._host_network_verify("interface.bond", current, desired) is True
+
+
+def test_host_network_verify_bond_false_when_mode_mismatches():
+    current = {"bond": {"mode": "active-backup", "slaves": ["eth0", "eth1"]}}
+    desired = {"mode": "802.3ad", "slaves": ["eth0", "eth1"]}
+    assert runtime._host_network_verify("interface.bond", current, desired) is False
+
+
+def test_host_network_verify_bond_false_when_slaves_mismatch():
+    current = {"bond": {"mode": "802.3ad", "slaves": ["eth0"]}}
+    desired = {"mode": "802.3ad", "slaves": ["eth0", "eth1"]}
+    assert runtime._host_network_verify("interface.bond", current, desired) is False
+
+
+def test_host_network_verify_vlan_true_when_id_matches():
+    current = {"vlan": {"vlan_id": 100}}
+    assert runtime._host_network_verify("vlan.configure", current, {"vlan_id": 100}) is True
+
+
+def test_host_network_verify_vlan_false_when_id_mismatches():
+    current = {"vlan": {"vlan_id": 100}}
+    assert runtime._host_network_verify("vlan.configure", current, {"vlan_id": 200}) is False
+
+
+def test_host_network_verify_vlan_false_when_no_vlan():
+    current = {}
+    assert runtime._host_network_verify("vlan.configure", current, {"vlan_id": 100}) is False
+
+
+def test_host_network_verify_mtu_true_when_match():
+    current = {"interface": {"mtu": 9000}}
+    assert runtime._host_network_verify("mtu.configure", current, {"mtu": 9000}) is True
+
+
+def test_host_network_verify_mtu_false_when_mismatch():
+    current = {"interface": {"mtu": 1500}}
+    assert runtime._host_network_verify("mtu.configure", current, {"mtu": 9000}) is False
+
+
+def test_host_network_verify_address_true_when_found():
+    current = {"interface": {"addresses": [{"address": "10.70.0.10"}, {"address": "10.70.0.11"}]}}
+    assert runtime._host_network_verify("address.configure", current, {"address": "10.70.0.10"}) is True
+
+
+def test_host_network_verify_address_false_when_not_found():
+    current = {"interface": {"addresses": [{"address": "10.70.0.10"}]}}
+    assert runtime._host_network_verify("address.configure", current, {"address": "10.70.0.99"}) is False
+
+
+def test_host_network_verify_address_false_when_no_addresses():
+    current = {"interface": {}}
+    assert runtime._host_network_verify("address.configure", current, {"address": "10.70.0.10"}) is False
+
+
+def test_host_network_verify_discover_true_when_interfaces_present():
+    current = {"interfaces": [{"name": "eth0"}]}
+    assert runtime._host_network_verify("network.discover", current, {}) is True
+
+
+def test_host_network_verify_discover_false_when_no_interfaces():
+    current = {"interfaces": []}
+    assert runtime._host_network_verify("network.discover", current, {}) is False
+
+
+def test_host_network_verify_unknown_operation_returns_false():
+    assert runtime._host_network_verify("unknown.operation", {}, {}) is False
+
+
+# --- execute-level regression test for host-network verify ---
+
+def test_signed_host_network_execution_rejects_drift_and_then_verifies(monkeypatch):
+    before = {"interface": {"name": "eth0", "state": "down", "mtu": 1500}}
+    after = {"interface": {"name": "eth0", "state": "up", "mtu": 1500}}
+    preview = runtime.preview({
+        "parameters": {"typed_plan": _typed({"interface": "eth0", "state": "up"}, "interface.configure")}
+    })
+    preview["current"] = before
+    preview["current_hash"] = runtime.sha256_hex(before)
+    typed = _typed({"interface": "eth0", "state": "up"}, "interface.configure", preview)
+
+    key = "execution-key-0123456789abcdef0123456789abcdef"
+    ticket, signature = _signed_ticket(typed, key)
+    monkeypatch.setattr(runtime, "EXECUTION_ENABLED", True)
+    monkeypatch.setattr(runtime, "EXECUTION_KEY", key)
+    monkeypatch.setattr(runtime, "VERIFY_ATTEMPTS", 1)
+
+    # Drift: current state differs from preview
+    drift = {"interface": {"name": "eth0", "state": "up", "mtu": 9000}}
+    monkeypatch.setattr(runtime, "_host_network_current", lambda provider, credential, operation, desired=None: (
+        "agent://node-agent-01", {}, drift
+    ))
+    applied = []
+    monkeypatch.setattr(runtime, "_apply_host_network", lambda *args: applied.append(args))
+    runtime._USED_TICKETS.clear()
+    with pytest.raises(HTTPException) as exc:
+        runtime.execute(ticket, signature)
+    assert exc.value.status_code == 409
+    assert applied == []
+
+    # Converge: current state matches preview, then verify succeeds
+    ticket, signature = _signed_ticket(typed, key)
+    observations = iter([
+        ("agent://node-agent-01", {}, before),
+        ("agent://node-agent-01", {}, after),
+    ])
+    monkeypatch.setattr(runtime, "_host_network_current", lambda provider, credential, operation, desired=None: next(observations))
+    runtime._USED_TICKETS.clear()
+    result = runtime.execute(ticket, signature)
+    assert result["state"] == "SUCCEEDED"
+    assert result["verification"]["checks"][1]["id"] == "host-network-active-verify"
+    assert result["verification"]["evidence"]["raw_credentials_returned"] is False
+    assert applied and len(applied) == 1

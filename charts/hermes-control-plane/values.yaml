@@ -92,6 +92,15 @@ nodeAgent:
   infrastructureFirmwareVerifyDelaySeconds: 5
   infrastructurePlatformVerifyAttempts: 90
   infrastructurePlatformVerifyDelaySeconds: 5
+  proxmoxVmRuntimeEnabled: false
+  proxmoxVmRequestTimeoutSeconds: 20
+  proxmoxVmMaxResponseBytes: 1048576
+  proxmoxVmMaxRequestBodyBytes: 8192
+  proxmoxVmMaxRequestsPerExecution: 32
+  proxmoxVmTaskPollAttempts: 30
+  proxmoxVmTaskPollDelaySeconds: 2
+  proxmoxVmVerifyAttempts: 5
+  proxmoxVmVerifyDelaySeconds: 1
   capacityCollectionEnabled: false
   capacityRequestTimeoutSeconds: 20
   capacityMaxResponseBytes: 1048576

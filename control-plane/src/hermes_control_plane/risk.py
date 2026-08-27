@@ -10,7 +10,7 @@ _READ_PREFIXES = (
 _CRITICAL_MARKERS = (
     "cluster-admin", "cluster_admin", "rbac.", "namespace.delete", "secret.read", "secret.export",
     "docker.privileged", "host.mount", "host_root", "force-push", "force_push",
-    "restore", "disaster-recovery", "disaster_recovery", "decommission", "storage.volume.delete",
+    "restore", "disaster-recovery", "disaster_recovery", "decommission", "storage.volume.delete", "vm.delete",
 )
 _HIGH_MARKERS = (
     ".delete", ".remove", ".add", ".replace", ".apply", ".install", ".uninstall", ".upgrade", ".rollback", ".scale", ".restart",
@@ -22,6 +22,10 @@ def classify(operation: str) -> Risk:
     op = operation.strip().lower()
     if op.startswith(_READ_PREFIXES):
         return "READ"
+    if op in {"vm.delete", "snapshot.restore"}:
+        return "CRITICAL"
+    if op in {"vm.create", "vm.clone", "vm.update", "vm.power", "network.attach", "snapshot.create"}:
+        return "HIGH"
     if any(marker in op for marker in _CRITICAL_MARKERS):
         return "CRITICAL"
     if any(marker in op for marker in _HIGH_MARKERS):

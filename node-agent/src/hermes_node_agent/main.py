@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from . import capacity_runtime
 from . import infrastructure_runtime
+from . import proxmox_runtime
 from . import provider_runtime
 from . import vm_inventory_runtime
 
@@ -47,7 +48,7 @@ def health() -> dict[str, Any]:
         "mode": "cluster-provider-worker",
         "execution_enabled": provider_runtime.EXECUTION_ENABLED,
         "infrastructure_execution_enabled": infrastructure_runtime.EXECUTION_ENABLED,
-        "capabilities": ["kubespray", "k3s", "rke2", "cluster-day2", "direct-etcd", "offline-artifact-binding", "redfish-runtime", "redfish-virtual-media-runtime", "ipmi-lanplus-runtime", "pxe-unattended-runtime", "host-network-runtime", "openconfig-restconf-v1-vlan-port-lldp-runtime", "proxmox-capacity-collector-v1" if capacity_runtime.COLLECTION_ENABLED else "proxmox-capacity-collector-disabled", "proxmox-vm-inventory-collector-v1" if vm_inventory_runtime.COLLECTION_ENABLED else "proxmox-vm-inventory-collector-disabled", "proxmox-contract-only", "vmware-workstation-contract-only", "vmware-contract-only", "openstack-contract-only", "aws-contract-only", "azure-contract-only", "gcp-contract-only"],
+        "capabilities": ["kubespray", "k3s", "rke2", "cluster-day2", "direct-etcd", "offline-artifact-binding", "redfish-runtime", "redfish-virtual-media-runtime", "ipmi-lanplus-runtime", "pxe-unattended-runtime", "host-network-runtime", "openconfig-restconf-v1-vlan-port-lldp-runtime", "proxmox-capacity-collector-v1" if capacity_runtime.COLLECTION_ENABLED else "proxmox-capacity-collector-disabled", "proxmox-vm-inventory-collector-v1" if vm_inventory_runtime.COLLECTION_ENABLED else "proxmox-vm-inventory-collector-disabled", "proxmox-vm-runtime-v1" if infrastructure_runtime.EXECUTION_ENABLED and proxmox_runtime.RUNTIME_ENABLED else "proxmox-vm-runtime-disabled", "vmware-workstation-contract-only", "vmware-contract-only", "openstack-contract-only", "aws-contract-only", "azure-contract-only", "gcp-contract-only"],
         "arbitrary_shell": False,
         "arbitrary_ssh_command": False,
     }

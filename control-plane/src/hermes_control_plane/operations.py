@@ -112,6 +112,7 @@ INFRASTRUCTURE_RUNTIME_OPERATIONS: dict[str, set[str]] = {
     # instead of emitting a CONTRACT_ONLY plan, so virtualization/cloud kinds stay out.
     "host-network": {"interface.configure", "interface.bond", "vlan.configure", "mtu.configure", "address.configure", "network.discover"},
     "network-switch": {"vlan.ensure", "port.configure", "lldp.observe"},
+    "proxmox": {"vm.create", "vm.clone", "vm.update", "vm.delete", "vm.power", "network.attach", "snapshot.create", "snapshot.restore"},
 }
 REDFISH_POWER_STATES = {"on", "force-off", "graceful-shutdown", "restart", "graceful-restart", "power-cycle"}
 REDFISH_BOOT_TARGETS = {"pxe", "disk", "cd", "none"}
@@ -140,6 +141,11 @@ SWITCH_RESTCONF_API_VERSION = "openconfig-restconf-1.0"
 SWITCH_RESTCONF_IMPLEMENTATION_VERSION = "openconfig-restconf-v1"
 SWITCH_PORT_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]{0,63}$")
 SWITCH_VLAN_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_. -]{0,63}$")
+PROXMOX_VM_API_VERSION = "pve-8.2"
+PROXMOX_VM_IMPLEMENTATION_VERSION = "pve-vm-runtime-v1"
+PROXMOX_VM_OPERATIONS = {"vm.create", "vm.clone", "vm.update", "vm.delete", "vm.power", "network.attach", "snapshot.create", "snapshot.restore"}
+PROXMOX_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$")
+PROXMOX_SNAPSHOT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 
 ARTIFACT_KINDS = ("oci-image", "helm-chart", "package", "git-release", "ansible-collection", "apt-repository", "rpm-repository", "python-repository")
 
@@ -622,8 +628,92 @@ def infrastructure_runtime_operation_capable(provider_kind: str, operation: str)
     return operation in INFRASTRUCTURE_RUNTIME_OPERATIONS.get(provider_kind, set())
 
 
+def _proxmox_integer(value: Any, *, field: str, low: int, high: int) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or not low <= value <= high:
+        raise ValueError(f"Proxmox {field} must be an integer between {low} and {high}")
+    return value
+
+
+def _proxmox_identifier(value: Any, *, field: str) -> str:
+    normalized = str(value or "")
+    if not PROXMOX_ID_RE.fullmatch(normalized):
+        raise ValueError(f"Proxmox {field} is unsafe")
+    return normalized
+
+
+def _validate_proxmox_vm_desired_state(operation: str, desired: dict[str, Any]) -> None:
+    if operation not in PROXMOX_VM_OPERATIONS:
+        raise ValueError("unsupported Proxmox VM runtime operation")
+    if operation == "vm.create":
+        required = {"vm_id", "node", "name", "cpu_cores", "memory_mib", "storage", "disk_gib"}
+        if not required <= set(desired) or set(desired) - (required | {"bridge"}):
+            raise ValueError("Proxmox vm.create requires exact bounded QEMU fields")
+        _proxmox_integer(desired.get("vm_id"), field="vm_id", low=100, high=2_147_483_647)
+        for field in ("node", "name", "storage"):
+            _proxmox_identifier(desired.get(field), field=field)
+        if "bridge" in desired:
+            _proxmox_identifier(desired["bridge"], field="bridge")
+        _proxmox_integer(desired.get("cpu_cores"), field="cpu_cores", low=1, high=128)
+        _proxmox_integer(desired.get("memory_mib"), field="memory_mib", low=512, high=1_048_576)
+        _proxmox_integer(desired.get("disk_gib"), field="disk_gib", low=8, high=65_536)
+        return
+    if operation == "vm.clone":
+        if set(desired) != {"source_vm_id", "source_node", "target_vm_id", "target_node", "storage", "name"}:
+            raise ValueError("Proxmox vm.clone requires exact source/target fields")
+        for field in ("source_node", "target_node", "storage", "name"):
+            _proxmox_identifier(desired.get(field), field=field)
+        for field in ("source_vm_id", "target_vm_id"):
+            _proxmox_integer(desired.get(field), field=field, low=100, high=2_147_483_647)
+        return
+    if operation == "vm.update":
+        if not {"vm_id", "node"} <= set(desired) or set(desired) - {"vm_id", "node", "cpu_cores", "memory_mib", "onboot"} or len(desired) == 2:
+            raise ValueError("Proxmox vm.update requires VM identity plus at least one supported setting")
+        _proxmox_integer(desired.get("vm_id"), field="vm_id", low=100, high=2_147_483_647)
+        _proxmox_identifier(desired.get("node"), field="node")
+        if "cpu_cores" in desired:
+            _proxmox_integer(desired["cpu_cores"], field="cpu_cores", low=1, high=128)
+        if "memory_mib" in desired:
+            _proxmox_integer(desired["memory_mib"], field="memory_mib", low=512, high=1_048_576)
+        if "onboot" in desired and not isinstance(desired["onboot"], bool):
+            raise ValueError("Proxmox onboot must be boolean")
+        return
+    if operation in {"vm.delete", "vm.power"}:
+        expected = {"vm_id", "node", "confirm_vm_id"} if operation == "vm.delete" else {"vm_id", "node", "target_state"}
+        if set(desired) != expected:
+            raise ValueError(f"Proxmox {operation} has unsupported fields")
+        vm_id = _proxmox_integer(desired.get("vm_id"), field="vm_id", low=100, high=2_147_483_647)
+        _proxmox_identifier(desired.get("node"), field="node")
+        if operation == "vm.delete" and desired.get("confirm_vm_id") != vm_id:
+            raise ValueError("Proxmox VM delete confirmation must exactly match vm_id")
+        if operation == "vm.power" and str(desired.get("target_state") or "").lower() not in {"running", "stopped"}:
+            raise ValueError("Proxmox vm.power target_state must be running or stopped")
+        return
+    if operation == "network.attach":
+        if set(desired) != {"vm_id", "node", "slot", "bridge"}:
+            raise ValueError("Proxmox network.attach requires exact VM, slot and bridge fields")
+        _proxmox_integer(desired.get("vm_id"), field="vm_id", low=100, high=2_147_483_647)
+        for field in ("node", "bridge"):
+            _proxmox_identifier(desired.get(field), field=field)
+        if str(desired.get("slot") or "") not in {f"net{index}" for index in range(8)}:
+            raise ValueError("Proxmox network.attach slot must be net0 through net7")
+        return
+    expected = {"vm_id", "node", "snapshot"} if operation == "snapshot.create" else {"vm_id", "node", "snapshot", "confirm_vm_id", "confirm_snapshot"}
+    if set(desired) != expected:
+        raise ValueError(f"Proxmox {operation} has unsupported fields")
+    vm_id = _proxmox_integer(desired.get("vm_id"), field="vm_id", low=100, high=2_147_483_647)
+    _proxmox_identifier(desired.get("node"), field="node")
+    snapshot = str(desired.get("snapshot") or "")
+    if not PROXMOX_SNAPSHOT_RE.fullmatch(snapshot):
+        raise ValueError("Proxmox snapshot name is unsafe")
+    if operation == "snapshot.restore" and (desired.get("confirm_vm_id") != vm_id or desired.get("confirm_snapshot") != snapshot):
+        raise ValueError("Proxmox snapshot restore confirmations must exactly match vm_id and snapshot")
+
+
 def validate_infrastructure_desired_state(provider_kind: str, operation: str, desired_state: dict[str, Any]) -> None:
     if not infrastructure_runtime_operation_capable(provider_kind, operation):
+        return
+    if provider_kind == "proxmox":
+        _validate_proxmox_vm_desired_state(operation, desired_state)
         return
     if provider_kind == "ipmi":
         if operation == "power.set":
@@ -1038,6 +1128,79 @@ def validate_network_switch_provider(provider: dict[str, Any], desired_state: di
             raise ValueError("network-switch VLAN is not allowlisted by provider capabilities: " + ", ".join(str(item) for item in denied))
 
 
+def validate_proxmox_vm_provider(provider: dict[str, Any], desired_state: dict[str, Any] | None = None, operation: str | None = None) -> None:
+    endpoint = str(provider.get("endpoint") or "")
+    parsed = urlparse(endpoint)
+    if (
+        parsed.scheme != "https" or not parsed.hostname or parsed.username is not None or parsed.password is not None
+        or parsed.query or parsed.fragment or parsed.port != 8006 or parsed.path.rstrip("/") != "/api2/json"
+    ):
+        raise ValueError("Proxmox VM runtime endpoint must be credential-free HTTPS on port 8006 with /api2/json root")
+    if (str(provider.get("api_version") or ""), str(provider.get("implementation_version") or "")) != (PROXMOX_VM_API_VERSION, PROXMOX_VM_IMPLEMENTATION_VERSION):
+        raise ValueError("Proxmox provider versions do not match the supported VM runtime profile")
+    caps = provider.get("capabilities") if isinstance(provider.get("capabilities"), dict) else {}
+    allowed = {"profile", "node_allowlist", "storage_allowlist", "bridge_allowlist", "template_allowlist", "vm_id_min", "vm_id_max", "max_cpu_cores", "max_memory_mib", "max_disk_gib", "max_nics", "max_snapshots", "action_allowlist", "allow_vm_delete", "allow_snapshot_restore"}
+    if set(caps) - allowed or caps.get("profile") != PROXMOX_VM_IMPLEMENTATION_VERSION:
+        raise ValueError("Proxmox VM runtime capabilities do not match the pinned profile")
+    def ids(field: str, *, required: bool) -> set[str]:
+        values = caps.get(field)
+        if not isinstance(values, list) or (required and not values) or len(values) > 128:
+            raise ValueError(f"Proxmox {field} must be a bounded allowlist")
+        normalized = [str(item) for item in values]
+        if len(set(normalized)) != len(normalized) or any(not PROXMOX_ID_RE.fullmatch(item) for item in normalized):
+            raise ValueError(f"Proxmox {field} contains unsafe or duplicate entries")
+        return set(normalized)
+    nodes = ids("node_allowlist", required=True)
+    storage = ids("storage_allowlist", required=True)
+    bridges = ids("bridge_allowlist", required=False)
+    actions = caps.get("action_allowlist")
+    if not isinstance(actions, list) or not actions or len(actions) > len(PROXMOX_VM_OPERATIONS) or set(actions) - PROXMOX_VM_OPERATIONS or len(set(actions)) != len(actions):
+        raise ValueError("Proxmox action_allowlist is invalid")
+    low = _proxmox_integer(caps.get("vm_id_min"), field="vm_id_min", low=100, high=2_147_483_647)
+    high = _proxmox_integer(caps.get("vm_id_max"), field="vm_id_max", low=low, high=2_147_483_647)
+    for field in ("max_cpu_cores", "max_memory_mib", "max_disk_gib"):
+        _proxmox_integer(caps.get(field), field=field, low=1, high=1_048_576)
+    _proxmox_integer(caps.get("max_nics"), field="max_nics", low=1, high=8)
+    _proxmox_integer(caps.get("max_snapshots"), field="max_snapshots", low=1, high=128)
+    templates = caps.get("template_allowlist")
+    if not isinstance(templates, list) or len(templates) > 128:
+        raise ValueError("Proxmox template_allowlist must be bounded")
+    template_ids: set[tuple[str, int]] = set()
+    for item in templates:
+        if not isinstance(item, dict) or set(item) != {"node", "vm_id"}:
+            raise ValueError("Proxmox template_allowlist entries must contain only node and vm_id")
+        node = _proxmox_identifier(item.get("node"), field="template node")
+        vm_id = _proxmox_integer(item.get("vm_id"), field="template vm_id", low=100, high=2_147_483_647)
+        template_ids.add((node, vm_id))
+    if len(template_ids) != len(templates):
+        raise ValueError("Proxmox template_allowlist must not contain duplicates")
+    if not isinstance(caps.get("allow_vm_delete"), bool) or not isinstance(caps.get("allow_snapshot_restore"), bool):
+        raise ValueError("Proxmox destructive capability flags must be boolean")
+    if desired_state is None or operation is None:
+        return
+    if operation not in set(actions):
+        raise ValueError("Proxmox operation is disabled by provider action_allowlist")
+    for field in ("node", "source_node", "target_node"):
+        if field in desired_state and desired_state[field] not in nodes:
+            raise ValueError("Proxmox node is not allowlisted by provider capabilities")
+    if "storage" in desired_state and desired_state["storage"] not in storage:
+        raise ValueError("Proxmox storage is not allowlisted by provider capabilities")
+    if "bridge" in desired_state and desired_state["bridge"] not in bridges:
+        raise ValueError("Proxmox bridge is not allowlisted by provider capabilities")
+    for field in ("vm_id", "target_vm_id"):
+        if field in desired_state and not low <= desired_state[field] <= high:
+            raise ValueError("Proxmox VM ID is outside the provider policy range")
+    if operation == "vm.clone" and (desired_state["source_node"], desired_state["source_vm_id"]) not in template_ids:
+        raise ValueError("Proxmox clone source is not an allowlisted template")
+    if operation == "vm.delete" and caps["allow_vm_delete"] is not True:
+        raise ValueError("Proxmox VM deletion is disabled by provider capabilities")
+    if operation == "snapshot.restore" and caps["allow_snapshot_restore"] is not True:
+        raise ValueError("Proxmox snapshot restore is disabled by provider capabilities")
+    for field, limit in (("cpu_cores", "max_cpu_cores"), ("memory_mib", "max_memory_mib"), ("disk_gib", "max_disk_gib")):
+        if field in desired_state and desired_state[field] > caps[limit]:
+            raise ValueError(f"Proxmox {field} exceeds the provider policy limit")
+
+
 def infrastructure_runtime_capable(plan: dict[str, Any]) -> bool:
     provider = plan.get("provider") if isinstance(plan.get("provider"), dict) else {}
     preview = plan.get("runtime_preview") if isinstance(plan.get("runtime_preview"), dict) else {}
@@ -1087,6 +1250,8 @@ def infrastructure_plan(
     validate_infrastructure_desired_state(provider_kind, operation, desired_state)
     if provider_kind == "network-switch":
         validate_network_switch_provider(provider, desired_state, operation)
+    if provider_kind == "proxmox":
+        validate_proxmox_vm_provider(provider, desired_state, operation)
     runtime_operation = infrastructure_runtime_operation_capable(provider_kind, operation)
     if runtime_preview is not None:
         if not runtime_operation:

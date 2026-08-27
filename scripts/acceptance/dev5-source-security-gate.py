@@ -695,10 +695,16 @@ assert 'openstack-contract-only' in provider_agent_main
 assert 'aws-contract-only' in provider_agent_main
 assert 'azure-contract-only' in provider_agent_main
 assert 'gcp-contract-only' in provider_agent_main
-assert 'proxmox-contract-only' in provider_agent_main
-# C10/C11 mutation operations must remain CONTRACT_ONLY — none enter INFRASTRUCTURE_RUNTIME_OPERATIONS.
+assert 'proxmox-vm-runtime-v1' in provider_agent_main
+assert 'proxmox-vm-runtime-disabled' in provider_agent_main
+# Proxmox VM mutation runtime is enabled in INFRASTRUCTURE_RUNTIME_OPERATIONS with exactly 8 operations.
 infra_runtime = operations.split('INFRASTRUCTURE_RUNTIME_OPERATIONS: dict[str, set[str]] = {', 1)[1].split('\n}\n', 1)[0]
-for forbidden in ('"proxmox"', '"vmware-workstation"', '"vmware"', '"openstack"', '"aws"', '"azure"', '"gcp"'):
+assert '"proxmox"' in infra_runtime
+proxmox_infra = infra_runtime.split('"proxmox"', 1)[1].split('"network.switch"', 1)[0] if '"network.switch"' in infra_runtime else infra_runtime.split('"proxmox"', 1)[1]
+# All 8 approved Proxmox operations must be registered.
+for op in ("vm.create", "vm.clone", "vm.update", "vm.delete", "vm.power", "network.attach", "snapshot.create", "snapshot.restore"):
+    assert f'"{op}"' in proxmox_infra, f'proxmox operation {op} missing from INFRASTRUCTURE_RUNTIME_OPERATIONS'
+for forbidden in ('"vmware-workstation"', '"vmware"', '"openstack"', '"aws"', '"azure"', '"gcp"'):
     assert forbidden not in infra_runtime, f'{forbidden} must not be in INFRASTRUCTURE_RUNTIME_OPERATIONS'
 
 print("0.5.11-dev.5-source-security: PASS")
