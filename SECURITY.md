@@ -1,6 +1,6 @@
-# Security Policy — Hermes Control Plane 0.5.10
+# Security Policy — Hermes Control Plane 0.5.11
 
-Hermes Control Plane 0.5.10 keeps planning/LLM services separate from privileged infrastructure execution. Mutation execution is disabled by default and must pass the ChangeSet, policy, approval and broker boundaries.
+Hermes Control Plane 0.5.11 keeps planning/LLM services separate from privileged infrastructure execution. Mutation execution is disabled by default and must pass ChangeSet, policy, approval, ticket, and scoped broker/worker boundaries. Start with the [Operator Guide](docs/guide/README.md), especially [feature status](docs/guide/feature-status.md), [configuration](docs/guide/configuration.md), and [governance](docs/guide/governance-and-changes.md).
 
 ## Stable security boundaries
 
@@ -15,11 +15,11 @@ Hermes Control Plane 0.5.10 keeps planning/LLM services separate from privileged
 - Execution tickets are short-lived, HMAC-signed, exact-plan-bound and broker replay protected.
 - Agent enrollment tokens are one-use and expiry-bound; agent heartbeat nonces are replay protected; identities can be revoked immediately.
 - Audit can be exported as NDJSON with a SHA-256 digest and retention pruning is audited.
-- SQLite backup/restore performs integrity checks. The supported 0.5.10 HA model is single-active failover; active-active SQLite replicas are unsupported.
+- SQLite backup/restore performs integrity checks. The supported 0.5.11 HA model is single-active failover; active-active SQLite replicas are unsupported.
 
 ## Credential backends
 
-0.5.10 uses a credential-administration boundary that stores only redacted references. A reference can point to locally protected kubeconfig material or an externally managed backend such as Kubernetes Secret/External Secrets or Vault-compatible storage. Secret material must be provisioned/migrated in that backend independently of the Control Plane database.
+0.5.11 uses a credential-administration boundary that stores only redacted references. A reference can point to locally protected kubeconfig material or an externally managed backend such as Kubernetes Secret/External Secrets or Vault-compatible storage. Secret material must be provisioned/migrated in that backend independently of the Control Plane database.
 
 ## Approval and execution keys
 
@@ -49,4 +49,4 @@ Do not expose the Control Plane admin API, Kubernetes Broker, router management 
 - deny by default for critical/destructive actions;
 - both Control Plane and Kubernetes execution gates default disabled.
 
-The stable runtime acceptance procedure is documented in `docs/STABLE-0.5.10-ACCEPTANCE.md`.
+The stable runtime acceptance procedure is documented in `docs/RC1-RELEASE-ACCEPTANCE.md`.

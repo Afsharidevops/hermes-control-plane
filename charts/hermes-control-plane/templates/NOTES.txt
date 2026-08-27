@@ -1,14 +1,34 @@
 Hermes Control Plane {{ .Chart.AppVersion }} installed.
 
-Alpha.2 provides the management and safety core: environment/integration/target registries,
-credential references, ChangeSet hashing/risk/approval binding, audit, and a starter Operations UI.
-Privileged DevOps execution remains disabled by design until beta adapter work lands.
-
-Smart Router service:
-  {{ include "hermes.fullname" . }}-smart-router:{{ .Values.smartRouter.service.port }}
-
-Control Plane API / Operations UI:
+Control Plane API / Operator Center (ClusterIP unless you configured ingress):
   {{ include "hermes.fullname" . }}-control-plane:{{ .Values.controlPlane.service.port }}
   /ui
 
+Smart Router service / Operations Center:
+  {{ include "hermes.fullname" . }}-smart-router:{{ .Values.smartRouter.service.port }}
+  /control
+
+Router Gateway service:
+  {{ include "hermes.fullname" . }}-router-gateway:{{ .Values.routerGateway.service.port }}
+
 Active router: {{ .Values.router.activeProvider }}
+
+Safety posture:
+  - Control Plane execution enabled: {{ .Values.controlPlane.executionEnabled }}
+  - Kubernetes Broker execution enabled: {{ .Values.kubernetesBroker.executionEnabled }}
+  - Node Agent enabled: {{ .Values.nodeAgent.enabled }}
+  - Infrastructure execution enabled: {{ .Values.nodeAgent.infrastructureExecutionEnabled }}
+  - Ingress enabled: {{ .Values.ingress.enabled }}
+
+Use an externally managed Secret through secrets.existingSecret before production.
+Do not expose the Control Plane, Smart Router control UI, Router Gateway management API,
+Kubernetes Broker, or Credential Service directly to the Internet. Configure TLS,
+authentication, private network access, persistence, and a backup procedure first.
+
+For a source checkout, read the complete Helm deployment guide:
+  docs/guide/deployment-kubernetes.md
+For a source checkout, read the feature/evidence matrix before enabling gates:
+  docs/guide/feature-status.md
+
+Packaged charts do not include the repository documentation tree. Obtain the matching
+source/release documentation before enabling any execution or collection gate.
