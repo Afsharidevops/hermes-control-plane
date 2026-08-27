@@ -1,6 +1,17 @@
-# Hermes Control Plane 0.5.11-dev.5 release status
+# Hermes Control Plane 0.5.11 release status
 
-Status: **IN PROGRESS — NOT TAGGED / NOT PUBLISHED**
+Status: **RELEASED — TAGGED `v0.5.11` / PUBLISHED**
+
+Release boundary:
+
+- commit: `237900c2a0d37f0d46383a67d3aea7f99e341a96`
+- tag: `v0.5.11`
+- branch: `dev/0.5.11`
+- exact-SHA `validate` CI: success
+- Docker Hub images: published as `:0.5.11` and `:latest` (six images, `Build and Publish Docker Images` workflow success)
+- GitHub Release: https://github.com/Afsharidevops/hermes-control-plane/releases/tag/v0.5.11
+
+This release went straight from dev.5 scope closure to the stable `v0.5.11` tag; no separate `v0.5.11-dev.5` tag was created. The scope-closure work recorded below is the content that shipped in `v0.5.11`.
 
 Frozen parent boundary:
 
@@ -8,7 +19,7 @@ Frozen parent boundary:
 - tag: `v0.5.11-dev.4`
 - branch: `dev/0.5.11`
 
-Do not amend, reset, squash, force-push, move or recreate the frozen dev.4 tag.
+Do not amend, reset, squash, force-push, move or recreate the frozen dev.4 tag, or the released `v0.5.11` tag.
 
 ## Completed dev.5 runtime slices
 
@@ -67,8 +78,9 @@ Do not amend, reset, squash, force-push, move or recreate the frozen dev.4 tag.
 - disposable real-target repeatability/evidence where available; never convert local integration into invented real-target evidence
 - final full scope-conformance re-audit and dev.5 release gate
 
-`v0.5.11-dev.5` must not be created until the full dev.5 closure scope is complete,
-local validation passes, and branch CI succeeds on the exact intended tag SHA.
+`v0.5.11` was created only after the full dev.5 closure scope above was complete,
+local validation (`./validate.sh`) passed, and branch CI succeeded on the exact
+tagged SHA `237900c2a0d37f0d46383a67d3aea7f99e341a96`.
 
 - Batch C5a/C5b adds constrained IPMI LAN+ power/boot fallback plus private-offline PXE/iPXE unattended provisioning with exact artifact/callback/state-machine binding and active host-readiness verification.
 - Batch C6 adds allowlisted Redfish disk/RAID volume create/delete with exact physical-drive identity/topology preview binding, CRITICAL destructive-delete governance and active post-change verification.

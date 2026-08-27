@@ -19,7 +19,16 @@
 - Dev.5 native diagnostics runtime slice: executable broker-owned read-only checks for node/pod/workload/OOM/metrics/storage/events, Cilium/Hubble/DNS/ingress/NetworkPolicy, RBAC/workload security, Argo CD and rollout health with target-scope enforcement and bounded typed evidence.
 - Dev.5 Hubble runtime slice: trusted Kubernetes Broker collector, pinned Hubble CLI, namespace authorization, typed redaction/aggregation, bounded history, SSE, and Hermes-native Network Live batch UI.
 
-## 0.5.11-dev.5 (in progress)
+## 0.5.11
+
+- add a disabled-by-default, worker-only Proxmox QEMU VM mutation runtime pinned to `pve-8.2` / `pve-vm-runtime-v1`, supporting exactly `vm.create`, `vm.clone`, `vm.update`, `vm.delete`, `vm.power`, `network.attach`, `snapshot.create`, and `snapshot.restore` through the existing ChangeSet/approval/exact-hash/ticket pipeline; `vm.delete` and `snapshot.restore` are CRITICAL (two approvals), the other six are HIGH (one approval)
+- add read-only Proxmox capacity (`pve-capacity-v1`) and VM-inventory (`pve-vm-inventory-v1`) collectors as separate disabled-by-default provider registrations, independent of the mutation-runtime pin
+- add the operator-only Proxmox VM runtime validation runbook (`docs/PROXMOX-VM-RUNTIME-VALIDATION.md`)
+- update dev.5 source-security and config-static gates to assert the exact eight-operation Proxmox allowlist, required config parity, and runbook presence
+- explicitly defer VMware Workstation/vSphere, OpenStack, AWS, Azure, and GCP mutation/capacity runtime, and capacity-backed Cluster Factory lifecycle (C11), to a future release
+- tag `v0.5.11` at commit `237900c2a0d37f0d46383a67d3aea7f99e341a96` after exact-SHA `validate` CI success; publish all six Docker Hub images as `:0.5.11` and `:latest`
+
+## 0.5.11-dev.5 (scope-closure work, shipped in v0.5.11)
 
 - begin scope-closure work on top of frozen `v0.5.11-dev.4` without rewriting frozen history
 - add a real HTTP MCP Radar read adapter with initialization/session handling and a fixed allowlist for dashboard, issues, resource list/detail, search, topology and neighborhood
