@@ -16,10 +16,10 @@ def load_yaml(path: str):
 
 chart = load_yaml("charts/hermes-control-plane/Chart.yaml")
 values = load_yaml("charts/hermes-control-plane/values.yaml")
-assert chart["version"] == "0.5.11-dev.5"
-assert str(chart["appVersion"]) == "0.5.11-dev.5"
-assert str(values["imageTag"]) == "0.5.11-dev.5"
-assert "VERSION=0.5.11-dev.5" in (ROOT / ".env.example").read_text()
+assert chart["version"] == "0.5.11"
+assert str(chart["appVersion"]) == "0.5.11"
+assert str(values["imageTag"]) == "0.5.11"
+assert "VERSION=0.5.11" in (ROOT / ".env.example").read_text()
 
 compose = load_yaml("docker-compose.yml")
 assert isinstance(compose, dict) and isinstance(compose.get("services"), dict)
@@ -50,13 +50,13 @@ assert "PRAGMA user_version = 11" in db
 main = (ROOT / "control-plane/src/hermes_control_plane/main.py").read_text()
 models = (ROOT / "control-plane/src/hermes_control_plane/models.py").read_text()
 radar = (ROOT / "control-plane/src/hermes_control_plane/radar.py").read_text()
-assert 'VERSION = "0.5.11-dev.5"' in main
+assert 'VERSION = "0.5.11"' in main
 assert 'class RadarIntelligenceQuery' in models
 assert '"tools/call"' in radar
 assert 'MCP_PROTOCOL_VERSION' in radar
 
 ui = (ROOT / "control-plane/src/hermes_control_plane/static/index.html").read_text()
-assert "0.5.11-dev.5" in ui
+assert "0.5.11" in ui
 assert "Query live intelligence" in ui
 assert "radar-mode" in ui
 assert "/intelligence/query" in ui
@@ -76,7 +76,7 @@ assert "runtime/provider state" in ui
 for workflow_path in (".github/workflows/validate.yml", ".github/workflows/publish-images.yml"):
     load_yaml(workflow_path)
 validate_workflow = (ROOT / ".github/workflows/validate.yml").read_text()
-assert "0.5.11-dev.5)" in validate_workflow
+assert "0.5.11)" in validate_workflow
 assert "'dev/**'" in validate_workflow
 assert "'dev/**'" not in publish
 assert "pull_request:" not in publish
@@ -87,7 +87,7 @@ assert "scripts/acceptance/dev5-config-static-gate.py" in validate_workflow
 for script in ("apply.sh", "validate.sh", "push.sh"):
     raw = (ROOT / script).read_text()
     assert "<<<<<<<" not in raw and ">>>>>>>" not in raw
-    assert "0.5.11-dev.5" in raw
+    assert "0.5.11" in raw
     assert "d4eb9b7ab2564301c09b8c0d36a2e9d53b843273" in raw if script != "validate.sh" else True
 
 assert (ROOT / "docs/DEV5-SCOPE-CLOSURE.md").is_file()
@@ -364,4 +364,4 @@ for rel, expected in manifest_entries.items():
     actual = hashlib.sha256((ROOT / rel).read_bytes()).hexdigest()
     assert actual == expected, f"manifest digest mismatch: {rel}"
 
-print("0.5.11-dev.5-config-static: PASS")
+print("0.5.11-config-static: PASS")

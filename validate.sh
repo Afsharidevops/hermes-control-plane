@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT="${HERMES_REPO:-${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}}"
 cd "$ROOT"
 
-[[ "$(cat VERSION)" == "0.5.11-dev.5" ]] || { echo "VERSION is not 0.5.11-dev.5" >&2; exit 2; }
+[[ "$(cat VERSION)" == "0.5.11" ]] || { echo "VERSION is not 0.5.11" >&2; exit 2; }
 
 # Prefer an explicitly selected interpreter, then an existing project virtualenv,
 # then the ambient python3. The validator requires pytest; do not silently use a
@@ -98,8 +98,8 @@ fi
 if [[ "${HERMES_VALIDATE_LOCAL_IMAGES:-0}" == "1" ]]; then
   command -v docker >/dev/null 2>&1 || { echo "docker is required for HERMES_VALIDATE_LOCAL_IMAGES=1" >&2; exit 6; }
   for context in control-plane credential-service router-gateway smart-router execution-broker kubernetes-broker node-agent; do
-    docker build --pull=false -t "hermes-validation/${context}:0.5.11-dev.5" "$context"
+    docker build --pull=false -t "hermes-validation/${context}:0.5.11" "$context"
   done
 fi
 
-echo "Hermes 0.5.11-dev.5 validation: PASS"
+echo "Hermes 0.5.11 validation: PASS"

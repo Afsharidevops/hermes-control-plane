@@ -234,7 +234,7 @@ async def query(
                 "params": {
                     "protocolVersion": MCP_PROTOCOL_VERSION,
                     "capabilities": {},
-                    "clientInfo": {"name": "hermes-control-plane", "version": "0.5.11-dev.5"},
+                    "clientInfo": {"name": "hermes-control-plane", "version": "0.5.11"},
                 },
             },
             base_headers,
@@ -302,7 +302,7 @@ async def health(
                 "params": {
                     "protocolVersion": MCP_PROTOCOL_VERSION,
                     "capabilities": {},
-                    "clientInfo": {"name": "hermes-control-plane-health", "version": "0.5.11-dev.5"},
+                    "clientInfo": {"name": "hermes-control-plane-health", "version": "0.5.11"},
                 },
             },
             headers,

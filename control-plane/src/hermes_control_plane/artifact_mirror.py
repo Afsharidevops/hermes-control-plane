@@ -1119,7 +1119,7 @@ def _copy_stream(source: BinaryIO, destination: BinaryIO, *, max_bytes: int) -> 
 def _open_https(uri: str):  # noqa: ANN202
     _validate_https_source(uri)
     opener = urllib.request.build_opener(_NoRedirect())
-    headers = {"User-Agent": "Hermes-Artifact-Mirror/0.5.11-dev.5"}
+    headers = {"User-Agent": "Hermes-Artifact-Mirror/0.5.11"}
     authorization = _https_authorization_header(uri)
     if authorization is not None:
         headers["Authorization"] = authorization

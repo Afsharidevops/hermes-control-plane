@@ -41,7 +41,7 @@ The plugin has the Hermes Bot token only. It has no broker signing key, kubeconf
 
 ## Smart Router
 
-**Runtime-complete:** Smart Router is an authenticated OpenAI-compatible proxy and Operations Center. Its source package reports `0.5.9`; this repository/release context is `0.5.11-dev.5`. Router Gateway source reports `0.5.11-dev.1`. Treat the deployed image tag and endpoint health as authoritative rather than assuming all internal modules share a version.
+**Runtime-complete:** Smart Router is an authenticated OpenAI-compatible proxy and Operations Center. Its source package reports `0.5.9`; this repository/release context is `0.5.11`. Router Gateway source reports `0.5.11-dev.1`. Treat the deployed image tag and endpoint health as authoritative rather than assuming all internal modules share a version.
 
 ### Public endpoints
 

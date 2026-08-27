@@ -11,7 +11,7 @@ from pydantic import BaseModel, ConfigDict
 
 from . import host_observation
 
-VERSION = "0.5.11-dev.5"
+VERSION = "0.5.11"
 IDENTITY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{2,119}$")
 HOST_SYS_NET_ROOT = Path("/host-sys/class/net")
 HOST_VLAN_CONFIG_PATH = Path("/host-proc/net/vlan/config")

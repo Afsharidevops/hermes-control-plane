@@ -13,7 +13,7 @@ from . import proxmox_runtime
 from . import provider_runtime
 from . import vm_inventory_runtime
 
-VERSION = "0.5.11-dev.5"
+VERSION = "0.5.11"
 app = FastAPI(title="Hermes Node Agent / Cluster Provider Worker", version=VERSION)
 
 
