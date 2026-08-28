@@ -45,9 +45,19 @@ Examples:
 USAGE
 }
 
-fail() { echo "ERROR: $*" >&2; exit 1; }
-info() { echo "==> $*"; }
-warn() { echo "WARN: $*" >&2; }
+# Colored status lines (disabled when output is not a terminal or NO_COLOR=1).
+if [[ -t 2 ]] && [[ "${NO_COLOR:-}" != 1 ]]; then
+  C_INFO=$'\033[1;34m'; C_OK=$'\033[1;32m'; C_WARN=$'\033[1;33m'
+  C_FAIL=$'\033[1;31m'; C_BOLD=$'\033[1m'; C_RESET=$'\033[0m'
+else
+  C_INFO=; C_OK=; C_WARN=; C_FAIL=; C_BOLD=; C_RESET=
+fi
+
+info() { printf '%s[INFO]%s %s\n' "$C_INFO" "$C_RESET" "$*"; }
+ok() { printf '%s[ OK ]%s %s\n' "$C_OK" "$C_RESET" "$*"; }
+warn() { printf '%s[WARN]%s %s\n' "$C_WARN" "$C_RESET" "$*" >&2; }
+fail() { printf '%s[FAIL]%s %s\n' "$C_FAIL" "$C_RESET" "$*" >&2; exit 1; }
+abort() { printf '%s[ABORT]%s %s\n' "$C_WARN" "$C_RESET" "$*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || fail "required command not found: $1"; }
 
 randhex() { openssl rand -hex "${1:-32}"; }
@@ -59,6 +69,126 @@ run() {
   else
     "$@"
   fi
+}
+
+# ask_text <label> [default]  -- prints the answer on stdout, prompts on stderr.
+ask_text() {
+  local label="$1" default="${2:-}" answer
+  if [[ -n "$default" ]]; then
+    printf '%s [%s]: ' "$label" "$default" >&2
+  else
+    printf '%s: ' "$label" >&2
+  fi
+  IFS= read -r answer || true
+  printf '%s' "${answer:-$default}"
+}
+
+# ask_secret <label>  -- hidden input, never empty; prints the value on stdout.
+ask_secret() {
+  local label="$1" answer
+  while true; do
+    printf '%s: ' "$label" >&2
+    IFS= read -rs answer || { printf '\n' >&2; abort "no input provided"; }
+    printf '\n' >&2
+    [[ -n "$answer" ]] && { printf '%s' "$answer"; return 0; }
+    warn "A value is required."
+  done
+}
+
+# ask_yes_no <label> [default y|n]  -- returns 0 on yes.
+ask_yes_no() {
+  local label="$1" default="${2:-n}" answer suffix
+  if [[ "$default" == y ]]; then suffix="Y/n"; else suffix="y/N"; fi
+  printf '%s [%s]: ' "$label" "$suffix" >&2
+  IFS= read -r answer || true
+  answer="${answer:-$default}"
+  case "$answer" in
+    y | Y | yes | YES) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# menu <title> <default-index> <option...>  -- prints the chosen option on stdout.
+menu() {
+  local title="$1" default="${2:-1}" answer
+  shift 2
+  local -a opts=("$@")
+  local i=1
+  printf '\n%s\n' "$title" >&2
+  for opt in "${opts[@]}"; do
+    printf '  %d) %s\n' "$i" "$opt" >&2
+    i=$((i + 1))
+  done
+  while true; do
+    printf 'Choice [%s]: ' "$default" >&2
+    IFS= read -r answer || true
+    answer="${answer:-$default}"
+    case "$answer" in
+      q | Q) abort "installation cancelled" ;;
+    esac
+    if [[ "$answer" =~ ^[0-9]+$ ]] && ((answer >= 1 && answer <= ${#opts[@]})); then
+      printf '%s' "${opts[$((answer - 1))]}"
+      return 0
+    fi
+    warn "Choose a number from 1 to ${#opts[@]}, or q to cancel."
+  done
+}
+
+# ask_port <label> <default>  -- prints a valid TCP port on stdout.
+ask_port() {
+  local label="$1" default="$2" value
+  while true; do
+    value="$(ask_text "$label" "$default")"
+    if [[ "$value" =~ ^[0-9]+$ ]] && ((1 <= 10#$value && 10#$value <= 65535)); then
+      printf '%s' "$value"
+      return 0
+    fi
+    warn "Enter a numeric port from 1 to 65535."
+  done
+}
+
+validate_project_name() {
+  local name="$1"
+  [[ "$name" =~ ^[a-z0-9][a-z0-9_-]*$ ]] || fail "invalid Compose project name: '$name' (use a-z 0-9 _ -)"
+}
+
+preflight() {
+  local ok=1 tool
+  for tool in git python3 openssl docker; do
+    if command -v "$tool" >/dev/null 2>&1; then
+      ok "  $tool"
+    else
+      warn "  $tool (missing)"
+      ok=0
+    fi
+  done
+  if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+    ok "  docker compose"
+  else
+    warn "  docker compose plugin (missing)"
+    ok=0
+  fi
+  if command -v curl >/dev/null 2>&1; then
+    ok "  curl"
+  else
+    warn "  curl (health checks will be skipped)"
+  fi
+  [[ "$ok" == "1" ]] || fail "install the missing requirements and rerun"
+  [[ -f "$ROOT/docker-compose.yml" ]] || fail "docker-compose.yml not found in $ROOT"
+  [[ -f "$ROOT/.env.example" ]] || fail ".env.example not found in $ROOT"
+}
+
+# file_env_value <file> <key> [default]  -- read one value from an env file.
+file_env_value() {
+  local file="$1" key="$2" default="${3:-}" v
+  [[ -f "$file" ]] || { printf '%s' "$default"; return 0; }
+  v="$(grep -E "^${key}=" "$file" 2>/dev/null | head -1 | cut -d= -f2-)"
+  printf '%s' "${v:-$default}"
+}
+
+# env_value <key> [default]  -- read one value from $ENV_FILE.
+env_value() {
+  file_env_value "$ENV_FILE" "$1" "${2:-}"
 }
 
 # set_env <key> <value>  -- in-place edit of $ENV_FILE (same semantics as hermesctl).
@@ -85,94 +215,6 @@ p.write_text('\n'.join(out) + '\n')
 PY
 }
 
-# env_value <key> <default>  -- read one value from $ENV_FILE (fallback to default).
-env_value() {
-  local key="$1" default="${2:-}" v
-  if [[ -f "$ENV_FILE" ]]; then
-    v="$(grep -E "^${key}=" "$ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2-)"
-    [[ -n "$v" ]] && printf '%s' "$v" && return 0
-  fi
-  printf '%s' "$default"
-}
-
-# ask_choice <title> <option...>  -- prints the selected option text on stdout.
-ask_choice() {
-  local title="$1"; shift
-  local -a opts=("$@")
-  local i=1 answer
-  echo "--- $title ---" >&2
-  for opt in "${opts[@]}"; do
-    printf '  %d) %s\n' "$i" "$opt" >&2
-    i=$((i + 1))
-  done
-  printf 'Choice [1]: ' >&2
-  IFS= read -r answer || true
-  answer="${answer:-1}"
-  if [[ ! "$answer" =~ ^[0-9]+$ ]] || ((answer < 1 || answer > ${#opts[@]})); then
-    echo "ERROR: invalid choice '$answer'" >&2
-    exit 1
-  fi
-  printf '%s' "${opts[$((answer - 1))]}"
-}
-
-# ask_yes_no <question> <default y|n>  -- returns 0 on yes.
-ask_yes_no() {
-  local question="$1" default="${2:-n}" answer
-  printf '%s [%s]: ' "$question" "$default" >&2
-  IFS= read -r answer || true
-  answer="${answer:-$default}"
-  case "$answer" in
-    y | Y | yes | YES) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
-# ask_text <label> <default>  -- prints the answer on stdout.
-ask_text() {
-  local label="$1" default="${2:-}" answer
-  if [[ -n "$default" ]]; then
-    printf '%s [%s]: ' "$label" "$default" >&2
-  else
-    printf '%s: ' "$label" >&2
-  fi
-  IFS= read -r answer || true
-  printf '%s' "${answer:-$default}"
-}
-
-validate_project_name() {
-  local name="$1"
-  [[ "$name" =~ ^[a-z0-9][a-z0-9_-]*$ ]] || fail "invalid Compose project name: '$name' (use a-z 0-9 _ -)"
-}
-
-preflight() {
-  echo "Hermes setup wizard"
-  echo "-------------------"
-  local ok=1 tool
-  for tool in git python3 openssl docker; do
-    if command -v "$tool" >/dev/null 2>&1; then
-      echo "  [ok] $tool"
-    else
-      echo "  [MISSING] $tool" >&2
-      ok=0
-    fi
-  done
-  if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
-    echo "  [ok] docker compose"
-  else
-    echo "  [MISSING] docker compose plugin" >&2
-    ok=0
-  fi
-  if command -v curl >/dev/null 2>&1; then
-    echo "  [ok] curl"
-  else
-    echo "  [warn] curl (health checks will be skipped)" >&2
-  fi
-  [[ "$ok" == "1" ]] || fail "install the missing requirements and rerun"
-  [[ -f "$ROOT/docker-compose.yml" ]] || fail "docker-compose.yml not found in $ROOT"
-  [[ -f "$ROOT/.env.example" ]] || fail ".env.example not found in $ROOT"
-  echo
-}
-
 # Generate all missing secrets into $ENV_FILE using the same key names, sizes,
 # and Fernet master-key format as hermesctl init_env.
 generate_missing_secrets() {
@@ -197,6 +239,7 @@ generate_missing_secrets() {
     HERMES_CREDENTIAL_ADMIN_TOKEN:32
     HERMES_CREDENTIAL_SERVICE_TOKEN:32
     HERMES_KUBERNETES_BROKER_TOKEN:32
+    HERMES_PROVIDER_WORKER_TOKEN:32
     HERMES_EXECUTION_HMAC_KEY:32
     ROUTER_GATEWAY_ADMIN_TOKEN:32
     SMART_ROUTER_HMAC_SECRET:32
@@ -238,15 +281,6 @@ PYKEY
   fi
 }
 
-prepare_env_file() {
-  if [[ ! -f "$ENV_FILE" ]]; then
-    run cp "$ROOT/.env.example" "$ENV_FILE"
-    run chmod 600 "$ENV_FILE"
-  fi
-  generate_missing_secrets
-  info "generated missing local secrets in $ENV_FILE"
-}
-
 # Keep a secret-bearing env file ignored by git via the shared .git/info/exclude
 # (never touches the tracked .gitignore).
 exclude_secret_from_git() {
@@ -258,16 +292,43 @@ exclude_secret_from_git() {
   fi
 }
 
+backup_env_file() {
+  [[ "$DRY_RUN" == "1" ]] && return 0
+  [[ -f "$ENV_FILE" ]] || return 0
+  local stamp backup
+  stamp="$(date +%Y%m%d-%H%M%S)"
+  backup="$ENV_FILE.backup-$stamp"
+  cp -p "$ENV_FILE" "$backup"
+  info "Backed up the existing configuration to $backup"
+}
+
+prepare_env_file() {
+  if [[ ! -f "$ENV_FILE" ]]; then
+    run cp "$ROOT/.env.example" "$ENV_FILE"
+    run chmod 600 "$ENV_FILE"
+  else
+    info "Existing configuration found at $ENV_FILE; secrets and previous choices are preserved."
+    backup_env_file
+  fi
+  generate_missing_secrets
+  # Always pin VERSION to this release's default so a copied or stale .env can
+  # never pull older image tags (e.g. a carried-over VERSION=0.5.10).
+  local version
+  version="$(file_env_value "$ROOT/.env.example" VERSION 0.5.11)"
+  set_env VERSION "$version"
+  ok "Configuration ready (VERSION=$version)."
+}
+
 wait_for_health() {
   local port="$1" tries="${2:-60}" i
   if ! command -v curl >/dev/null 2>&1; then
     warn "curl not available; skipping health wait"
     return 0
   fi
-  echo "==> waiting for Control Plane health on http://127.0.0.1:${port}/health ..."
+  info "Waiting for Control Plane health on http://127.0.0.1:${port}/health ..."
   for ((i = 1; i <= tries; i++)); do
     if curl -fsS "http://127.0.0.1:${port}/health" >/dev/null 2>&1; then
-      echo "==> Control Plane is healthy."
+      ok "Control Plane is healthy."
       return 0
     fi
     sleep 2
@@ -276,11 +337,27 @@ wait_for_health() {
   return 1
 }
 
+print_docs_links() {
+  cat <<'DOCS'
+
+  Deployment:
+    Self-hosted (Docker Compose)  docs/guide/deployment-docker.md
+    Kubernetes (Helm chart)       docs/guide/deployment-kubernetes.md
+    Getting started               docs/guide/getting-started.md
+DOCS
+}
+
 print_sandbox_summary() {
   local workdir="$1" port="$2" project="$3"
+  local teardown_line
+  if [[ "$workdir" == "$ROOT" ]]; then
+    teardown_line="rm -f \"$workdir/.env.sandbox\"   # sandbox env file (secrets)"
+  else
+    teardown_line="git -C \"$ROOT\" worktree remove \"$workdir\""
+  fi
   cat <<EOF
 
-Sandbox ready.
+${C_BOLD}Sandbox ready.${C_RESET}
   Worktree/root:   $workdir
   Env file:        $workdir/.env.sandbox (mode 0600, git-ignored)
   Compose project: $project
@@ -295,13 +372,34 @@ Sandbox ready.
 
   Teardown:
     docker compose --project-directory "$workdir" --env-file "$workdir/.env.sandbox" -p "$project" down -v --remove-orphans
-    git -C "$ROOT" worktree remove "$workdir"
+    $teardown_line
 EOF
+  print_docs_links
+}
+
+print_install_summary() {
+  local provider="$1"
+  cat <<EOF
+
+${C_BOLD}Install ready.${C_RESET}
+  Control Plane UI      http://127.0.0.1:$(env_value CONTROL_PLANE_PORT 8800)
+  Control Plane API     http://127.0.0.1:$(env_value CONTROL_PLANE_PORT 8800)/docs
+  Credential Service    http://127.0.0.1:$(env_value CREDENTIAL_SERVICE_PORT 8789)
+  Kubernetes Broker     http://127.0.0.1:$(env_value KUBERNETES_BROKER_PORT 8830)
+  Node Agent            http://127.0.0.1:8810
+  Router provider       $provider
+
+  Commands:
+    ./hermesctl status        # service status
+    ./hermesctl logs          # follow service logs
+    ./hermesctl bot status    # Hermes bot state (never prints tokens)
+EOF
+  print_docs_links
 }
 
 flow_sandbox() {
-  echo "--- Safe sandbox (isolated test environment) ---"
-  local isolation branch workdir cp_port newport
+  info "Safe sandbox (isolated test environment)"
+  local isolation branch workdir cp_port
   if [[ -n "$TARGET_DIR" ]]; then
     workdir="$TARGET_DIR"
     if [[ ! -d "$workdir" ]]; then
@@ -310,8 +408,8 @@ flow_sandbox() {
       run git -C "$ROOT" worktree add --detach "$workdir" "$branch"
     fi
   else
-    isolation="$(ask_choice "Isolation mode" \
-      "New git worktree (recommended)" \
+    isolation="$(menu "Isolation mode" 1 \
+      "New git worktree [recommended]" \
       "Current directory")"
     if [[ "$isolation" == Current* ]]; then
       workdir="$ROOT"
@@ -323,7 +421,7 @@ flow_sandbox() {
       if [[ ! -d "$workdir" ]]; then
         run git -C "$ROOT" worktree add --detach "$workdir" "$branch"
       elif git -C "$workdir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-        info "using existing worktree $workdir"
+        info "Using existing worktree $workdir"
       else
         fail "$workdir exists and is not a git worktree"
       fi
@@ -362,32 +460,35 @@ flow_sandbox() {
   if ask_yes_no "Keep the default Control Plane port (${cp_port})?" y; then
     :
   else
-    newport="$(ask_text "Control Plane port" "$cp_port")"
-    [[ "$newport" =~ ^[0-9]+$ ]] || fail "invalid port: $newport"
-    set_env CONTROL_PLANE_PORT "$newport"
-    cp_port="$newport"
+    cp_port="$(ask_port "Control Plane port" "$cp_port")"
+    set_env CONTROL_PLANE_PORT "$cp_port"
   fi
 
   local -a compose_cmd=(docker compose --project-directory "$workdir" --env-file "$ENV_FILE" -p "$PROJECT")
 
   if [[ "$NO_START" == "1" || "$DRY_RUN" == "1" ]]; then
-    echo "==> Configuration ready (no services started)."
+    info "Configuration ready (no services started)."
     print_sandbox_summary "$workdir" "$cp_port" "$PROJECT"
     echo "Start it yourself with:"
     printf '  %s up -d control-plane credential-service kubernetes-broker node-agent\n' "${compose_cmd[*]}"
     return 0
   fi
 
-  echo "==> Starting safe core services (no router, no Hermes bot, no Telegram)..."
-  run "${compose_cmd[@]}" up -d control-plane credential-service kubernetes-broker node-agent
-  wait_for_health "$cp_port"
+  if ask_yes_no "Start the sandbox now?" y; then
+    info "Starting safe core services (no router, no Hermes bot, no Telegram)..."
+    run "${compose_cmd[@]}" up -d control-plane credential-service kubernetes-broker node-agent
+    wait_for_health "$cp_port"
+  else
+    info "Nothing was started. Start it later with:"
+    printf '  %s up -d control-plane credential-service kubernetes-broker node-agent\n' "${compose_cmd[*]}"
+  fi
   print_sandbox_summary "$workdir" "$cp_port" "$PROJECT"
 }
 
 flow_install() {
-  echo "--- Normal local install (full stack) ---"
+  info "Normal local install (full stack)"
   local provider with_hermes
-  provider="$(ask_choice "Router provider" "nine-router" "omniroute")"
+  provider="$(menu "Router provider" 1 "nine-router [recommended]" "omniroute")"
   if ask_yes_no "Enable the Hermes bot profile? (needs TELEGRAM_BOT_TOKEN later via ./hermesctl bot telegram)" n; then
     with_hermes=1
   else
@@ -406,24 +507,28 @@ flow_install() {
   [[ "$with_hermes" == "1" ]] && profile_flags+=(--profile hermes)
 
   if [[ "$NO_START" == "1" || "$DRY_RUN" == "1" ]]; then
-    echo "==> Install configuration ready (no services started)."
+    info "Install configuration ready (no services started)."
     echo "Start it yourself with:"
     printf '  %s %s up -d\n' "${compose_cmd[*]}" "${profile_flags[*]}"
+    print_install_summary "$provider"
     return 0
   fi
 
-  echo "==> Starting full stack ($provider profile)..."
+  echo
+  ok "About to install and start:"
+  printf '  - Router profile:     %s\n' "$provider"
+  printf '  - Hermes bot profile: %s\n' "$([[ "$with_hermes" == 1 ]] && printf 'enabled' || printf 'off')"
+  if ! ask_yes_no "Start now?" y; then
+    info "Nothing was started. Start it later with:"
+    printf '  %s %s up -d\n' "${compose_cmd[*]}" "${profile_flags[*]}"
+    print_install_summary "$provider"
+    return 0
+  fi
+
+  info "Starting full stack ($provider profile)..."
   run "${compose_cmd[@]}" "${profile_flags[@]}" up -d
   wait_for_health "$(env_value CONTROL_PLANE_PORT 8800)"
-
-  cat <<EOF
-
-Install ready.
-  Control Plane UI   http://127.0.0.1:$(env_value CONTROL_PLANE_PORT 8800)
-  Control Plane API  http://127.0.0.1:$(env_value CONTROL_PLANE_PORT 8800)/docs
-  Router provider    $provider
-  Hint: ./hermesctl bot status   (never prints tokens)
-EOF
+  print_install_summary "$provider"
 }
 
 main() {
@@ -446,11 +551,15 @@ main() {
     *) echo "ERROR: invalid --flow '$FLOW' (use sandbox or install)" >&2; exit 2 ;;
   esac
 
+  local release
+  release="$(file_env_value "$ROOT/.env.example" VERSION 0.5.11)"
+  printf '\n%sHermes Control Plane v%s setup wizard%s\n' "$C_BOLD" "$release" "$C_RESET"
+  printf '%s\n' '=============================================='
   preflight
 
   if [[ -z "$FLOW" ]]; then
     local flow_label
-    flow_label="$(ask_choice "What do you want to set up?" \
+    flow_label="$(menu "What do you want to set up?" 1 \
       "Safe sandbox (isolated test environment) [recommended]" \
       "Normal local install (full stack)")"
     case "$flow_label" in

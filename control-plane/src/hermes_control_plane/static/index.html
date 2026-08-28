@@ -20,6 +20,16 @@
   <div class="nav"><button class="active" onclick="showTab('overview',this)">Overview</button><button onclick="showTab('operator-center',this);refreshOperatorCenter()">Operator Center</button><button onclick="showTab('infrastructure',this)">Infrastructure</button><button onclick="showTab('cluster-factory',this);refreshClusterFactory()">Cluster Factory</button><button onclick="showTab('operations-center',this);refreshOperationsCenter()">Operations Center</button><button onclick="showTab('changes',this)">Changes</button><button onclick="showTab('audit-tab',this)">Audit</button></div>
 
   <section id="overview" class="tab">
+    <div class="card">
+      <h2>Getting started</h2>
+      <ol class="muted small">
+        <li>Paste your admin token above — <code>HERMES_CONTROL_ADMIN_TOKEN</code> from the generated <code>.env</code> (or <code>.env.sandbox</code>). Until then this panel is read-only.</li>
+        <li>Create an <b>Environment</b> under Infrastructure — every target and integration belongs to one.</li>
+        <li>Register <b>integrations</b> and <b>kubeconfig references</b>, then add a <b>Kubernetes target</b> (Infrastructure tab).</li>
+        <li>Connect the <b>Hermes Bot</b> for governed changes (<code>./hermesctl bot telegram</code>) — mutations are bot-only; this panel observes, approves and inspects.</li>
+        <li>Deploying elsewhere: <code>docs/guide/deployment-docker.md</code> (self-hosted Compose) or <code>docs/guide/deployment-kubernetes.md</code> (Helm chart).</li>
+      </ol>
+    </div>
     <div class="card"><h2>System</h2><div id="kpis" class="kpis"></div><pre id="system" class="result muted">Loading…</pre></div>
   </section>
 

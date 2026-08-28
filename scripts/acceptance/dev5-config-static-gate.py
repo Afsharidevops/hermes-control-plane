@@ -327,7 +327,7 @@ for line in manifest_path.read_text().splitlines():
 
 LOCAL_ONLY_TOP_LEVEL = {".git", "backups", "htmlcov", "node_modules"}
 LOCAL_ONLY_ANYWHERE = {"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"}
-LOCAL_ONLY_ROOT_FILES = {".env", ".coverage"}
+LOCAL_ONLY_ROOT_FILES = {".env", ".env.sandbox", ".coverage"}
 
 
 def is_managed_inventory_file(path: Path) -> bool:
@@ -342,6 +342,9 @@ def is_managed_inventory_file(path: Path) -> bool:
     if any(part in LOCAL_ONLY_ANYWHERE for part in parts):
         return False
     if rel.as_posix() in LOCAL_ONLY_ROOT_FILES:
+        return False
+    # Wizard-generated secret backups (existing .env backup, sandbox env + its backup).
+    if rel.as_posix().startswith(".env.backup-") or rel.as_posix().startswith(".env.sandbox."):
         return False
     if parts[0] == "data" and path.name != ".gitkeep":
         return False
