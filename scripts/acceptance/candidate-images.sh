@@ -2,7 +2,7 @@
 set -euo pipefail
 TAG="${1:-}"
 NAMESPACE="${IMAGE_NAMESPACE:-afsharidevops}"
-[[ "$TAG" =~ ^0\.5\.10(-rc\.[0-9]+)?-candidate\.[0-9a-f]{7,40}$ ]] || { echo "usage: $0 0.5.10-candidate.<git-sha>" >&2; exit 2; }
+[[ "$TAG" =~ ^0\.5\.11(-rc\.[0-9]+)?-candidate\.[0-9a-f]{7,40}$ ]] || { echo "usage: $0 0.5.11-candidate.<git-sha>" >&2; exit 2; }
 command -v docker >/dev/null || { echo "docker/buildx is required" >&2; exit 3; }
 images=(
   hermes-control-plane-api
