@@ -15,6 +15,8 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Mount, Route
 
 from . import __version__
+from . import anthropic as anthropic_mod
+from . import responses as responses_mod
 from .budget import BudgetResult, enforce_budget, propose_budget
 from .config import Settings
 from .control_plane import ControlPlane
@@ -44,6 +46,7 @@ from .observations import ObservationWriter
 from .privacy import session_identity
 from .proxy import forward_headers, proxy_buffered, proxy_streaming, response_header_pairs
 from .routing import AUTO_ALIASES, Decision, build_policy_runtime, decide, tier_satisfies_capabilities
+from .tools_registry import ToolsRegistryError, load_tools
 
 logger = logging.getLogger("smart-router")
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -208,6 +211,11 @@ def create_app(
                         payload.setdefault("data", []).append(
                             {"id": alias, "object": "model", "owned_by": "smart-router"}
                         )
+                if request.headers.get("anthropic-version") or request.headers.get(
+                    "x-api-key"
+                ):
+                    # Claude Code lists models through the Anthropic API shape.
+                    payload = _anthropic_models_payload(payload)
                 response = JSONResponse(payload, status_code=upstream.status_code)
                 response.raw_headers = [
                     (name, value)
@@ -238,11 +246,6 @@ def create_app(
             return _openai_error("invalid JSON body", "invalid_json", 400)
         if not isinstance(body, dict) or not isinstance(body.get("model"), str):
             return _openai_error("model is required", "invalid_model", 400)
-        v51_error = control_plane.begin_request(request, body)
-        if v51_error:
-            return v51_error
-        requested_model = body["model"]
-        stream = body.get("stream") is True
         try:
             headers = _forward_headers(request, settings)
         except ValueError as error:
@@ -250,11 +253,39 @@ def create_app(
         url = settings.upstream_base_url + "/chat/completions"
         if request.scope["query_string"]:
             url += "?" + request.scope["query_string"].decode("ascii")
+        return await _route_chat_body(request, body, raw, headers, url, started)
+
+    async def _route_chat_body(
+        request: Request,
+        body: dict,
+        raw: bytes,
+        headers: list[tuple[bytes, bytes]],
+        url: str,
+        started: float,
+        *,
+        transform=None,
+        request_kind: str = "chat",
+    ) -> Response:
+        """Route one Chat Completions body and dispatch it upstream.
+
+        Shared by ``/v1/chat/completions``, ``/v1/responses`` and
+        ``/v1/messages``: the API-specific endpoints only translate their own
+        request and response formats, while tiering, budget enforcement, sticky
+        sessions, and telemetry stay in this one path.
+        """
+        v51_error = control_plane.begin_request(request, body)
+        if v51_error:
+            return v51_error
+        requested_model = body["model"]
+        stream = body.get("stream") is True
 
         # Explicit model requests remain byte-transparent and bypass Smart Router policy.
         if requested_model not in AUTO_ALIASES:
             control_plane.trace(request, "selected_route", "explicit", {"model": requested_model, "automatic_routing": False})
-            response = await _dispatch(request, raw, headers, url, stream, settings.mode, "explicit", started)
+            response = await _dispatch(
+                request, raw, headers, url, stream, settings.mode, "explicit", started,
+                transform=transform,
+            )
             control_plane.trace(request, "result", "ok" if response.status_code < 400 else "error", {"status_code": response.status_code, "explicit_model": requested_model})
             return response
 
@@ -377,7 +408,8 @@ def create_app(
             settings.mode,
         )
         response = await _dispatch(
-            request, outbound, headers, url, stream, settings.mode, "auto", started
+            request, outbound, headers, url, stream, settings.mode, "auto", started,
+            transform=transform,
         )
         try:
             cost_ledger.record_response(
@@ -395,6 +427,34 @@ def create_app(
         except Exception as error:
             logger.error(json.dumps({"event": "v51_control_telemetry_error", "reason": type(error).__name__}))
         return response
+
+    async def tools(request: Request) -> Response:
+        """Serve the shared tool registry entries the router may call."""
+        auth_error = _client_auth_error(request, settings)
+        if auth_error:
+            return auth_error
+        try:
+            entries = load_tools(settings.tools_registry)
+        except ToolsRegistryError as error:
+            return JSONResponse(
+                {
+                    "data": [],
+                    "error": {
+                        "message": str(error),
+                        "type": "smart_router_error",
+                        "code": "tools_registry_invalid",
+                    },
+                },
+                status_code=500,
+                headers={"Cache-Control": "no-store"},
+            )
+        return JSONResponse(
+            {
+                "data": [tool.to_dict() for tool in entries],
+                "registry": settings.tools_registry or "",
+            },
+            headers={"Cache-Control": "no-store"},
+        )
 
     async def router_info(_: Request) -> Response:
         return JSONResponse({
@@ -419,7 +479,15 @@ def create_app(
         Route("/dashboard/api/traces/{request_id:str}", dashboard_trace, methods=["GET"]),
         Mount("/control", app=control_plane.app),
         Route("/v1/models", models, methods=["GET"]),
+        Route("/v1/tools", tools, methods=["GET"]),
         Route("/v1/chat/completions", completions, methods=["POST"]),
+        Route("/v1/responses", responses_mod.handle, methods=["POST"]),
+        Route("/v1/messages", anthropic_mod.handle, methods=["POST"]),
+        Route(
+            "/v1/messages/count_tokens",
+            anthropic_mod.count_tokens,
+            methods=["POST"],
+        ),
     ]
     app = Starlette(routes=routes, lifespan=lifespan)
     app.state.settings = settings
@@ -427,6 +495,7 @@ def create_app(
     app.state.policy_runtime = policy_runtime
     app.state.cost_ledger = cost_ledger
     app.state.control_plane = control_plane
+    app.state.route_chat = _route_chat_body
     return app
 
 
@@ -439,6 +508,7 @@ async def _dispatch(
     mode: str,
     request_kind: str,
     started: float,
+    transform=None,
 ) -> Response:
     try:
         if stream:
@@ -495,6 +565,10 @@ async def _dispatch(
         UPSTREAM_ERRORS.labels(_status_class(response.status_code)).inc()
     if not stream:
         _record_request("chat", mode, request_kind, False, response.status_code, started)
+    if transform is not None:
+        # API translation happens last, so telemetry still sees the upstream
+        # status and usage while the client receives its own protocol.
+        response = await transform(response)
     return response
 
 
@@ -677,6 +751,31 @@ def _openai_error(message: str, code: str, status: int) -> JSONResponse:
         {"error": {"message": message, "type": "smart_router_error", "code": code}},
         status_code=status,
     )
+
+
+def _anthropic_models_payload(payload: dict) -> dict:
+    """Render an OpenAI model list in the Anthropic ``/v1/models`` shape."""
+    data = []
+    for item in payload.get("data") or []:
+        if not isinstance(item, dict):
+            continue
+        model_id = str(item.get("id") or "")
+        if not model_id:
+            continue
+        data.append(
+            {
+                "id": model_id,
+                "type": "model",
+                "display_name": model_id,
+                "created_at": "2024-01-01T00:00:00Z",
+            }
+        )
+    return {
+        "data": data,
+        "has_more": False,
+        "first_id": data[0]["id"] if data else None,
+        "last_id": data[-1]["id"] if data else None,
+    }
 
 
 def run() -> None:
