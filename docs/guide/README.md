@@ -36,6 +36,7 @@ Start at [Feature status](feature-status.md) before enabling any non-read-only c
 | Install into Kubernetes | [Helm deployment](deployment-kubernetes.md) |
 | Configure all environment settings | [Configuration reference](configuration.md) |
 | Navigate every UI panel | [Operator Center](operator-center.md) and [ChatOps and routing](chatops-and-routing.md) |
+| Use the Smart Router panel and client API | [Smart Router complete user guide](../SMART-ROUTER-USER-GUIDE.md) |
 | Manage governed change | [Governance and ChangeSets](governance-and-changes.md) |
 | Configure credentials, servers, agents, integrations | [Credentials, agents, integrations](credentials-agents-integrations.md) |
 | Operate Kubernetes | [Kubernetes operations](kubernetes-operations.md) |
